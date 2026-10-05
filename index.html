@@ -1544,12 +1544,27 @@ float coastShelter(vec2 p,out float derivative){float t=clamp((p.y-3.5)/6.,0.,1.
 // The reef curve bends shoreward and meets the breakwater near |x|=17. The walls
 // (|x|>5.5, z 4.5-6.5) stop the breaker; only the entrance gap passes it.
 float breakwaterPass(vec2 p){return 1.-smoothstep(4.5,6.5,p.y)*smoothstep(4.7,5.6,abs(p.x));}
-vec4 coastWave(vec2 p,float depth){
+// Rescue-coast bed, the same function as rescueTerrain on the CPU.
+float rescueTerrainGL(vec2 p){float x=p.x,z=p.y,h=-5.+.18*sin(x*.31)*cos(z*.43),reef=-5.8+.038*x*x,q=(z-reef)/3.9;h+=exp(-q*q)*(3.25+.24*sin(x*.5));
+ float wall=smoothstep(4.7,5.6,abs(x))*(1.-smoothstep(.75,1.35,abs(z-5.5)));h=max(h,-5.+8.1*wall);
+ float side=smoothstep(19.8,21.3,abs(x))*smoothstep(4.,8.,z),back=smoothstep(21.5,23.2,z);return max(h,max(-4.5+8.*side,-4.5+8.*back));}
+// Reef depth: transported water inside the basin, the coast bed under the ocean level outside it.
+// The transport grid stops at |p|=26, where fluid() reports 10 m and the reef used to step up to full height.
+float coastDepthAt(vec2 p){return any(greaterThan(abs(p),vec2(26.)))?max(0.,uOcean-rescueTerrainGL(p)):fluid(p).y;}
+// coastalSample on the CPU is the same function at footprint 0. Returns height, gradient x/z and vertical velocity.
+vec4 coastWave(vec2 p,float depth,float footprint){
  float x=p.x,z=p.y,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.2831853/uReefPeriod;
  float zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-b*b*1.6),ex=env*3.2*b*.076*x/uReefWidth,ez=-env*3.2*b/uReefWidth;
- float phase=k*(z-.038*x*x)-uCoastPhase,sp=sin(phase),cp=cos(phase),shape=sp-.32*cos(2.*phase),grad=cp+.64*sin(2.*phase);
- float depthFade=smoothstep(.08,.65,depth)*breakwaterPass(p),a=uReefHeight*depthFade;
- return a*vec4(env*shape,ex*shape+env*grad*(-.076*x*k),ez*shape+env*grad*k,-env*grad*w);
+ // Crest lines tighten along x; fade each harmonic with the mesh footprint before the outer rings alias it.
+ float ke=k*length(vec2(.076*x,1.)),l1=1.-smoothstep(.6,3.,ke*footprint),l2=1.-smoothstep(.6,3.,2.*ke*footprint);
+ float phase=k*(z-.038*x*x)-uCoastPhase,sp=sin(phase),cp=cos(phase),shape=sp*l1-.25*cos(2.*phase)*l2,grad=cp*l1+.5*sin(2.*phase)*l2;
+ if(any(greaterThan(abs(p),vec2(26.))))depth=coastDepthAt(p);
+ // Amplitude H·fade(depth)·pass(p). Its gradient joins the slope where the fade is changing.
+ float sz=smoothstep(4.5,6.5,z),sx=smoothstep(4.7,5.6,abs(x)),pass=1.-sz*sx,fade=smoothstep(.08,.65,depth),a=uReefHeight*fade*pass;
+ float tz=clamp((z-4.5)/2.,0.,1.),tx=clamp((abs(x)-4.7)/.9,0.,1.);vec2 da=-fade*vec2(sz*6.*tx*(1.-tx)/.9*sign(x),6.*tz*(1.-tz)/2.*sx);
+ if(depth>.08&&depth<.65){float t=(depth-.08)/.57;vec2 dd=vec2(coastDepthAt(p+vec2(.25,0.))-coastDepthAt(p-vec2(.25,0.)),coastDepthAt(p+vec2(0.,.25))-coastDepthAt(p-vec2(0.,.25)))*2.;da+=6.*t*(1.-t)/.57*dd*pass;}
+ da*=uReefHeight*env*shape;
+ return vec4(a*env*shape,a*(ex*shape+env*grad*(-.076*x*k))+da.x,a*(ez*shape+env*grad*k)+da.y,-a*env*grad*w);
 }
 
 struct Sea {vec3 d;vec3 n;vec3 velocity;float compression;vec2 gradient;};
@@ -1558,7 +1573,7 @@ Sea seaRaw(vec2 p,float depth,float footprint){Sea s;vec2 shift=vec2(0.),gradien
  shift+=q*cs*w.xy;height+=a*sn;gradient+=a*w.z*cs*w.xy;mxx-=derivative*w.x*w.x;mxz-=derivative*w.x*w.y;mzz-=derivative*w.y*w.y;velocityXZ+=q*w.w*sn*w.xy;vy-=a*w.w*cs;}
  if(uRogueHeight>0.){float a=(dot(p,uWave[0].xy)-uRogueCenter)/uRogueWidth,e=exp(-.5*a*a),d=uRogueHeight*fade*e*(a*a*a-3.*a)/uRogueWidth;height+=uRogueHeight*fade*e*(1.-a*a);gradient+=d*uWave[0].xy;vy-=d*uRogueSpeed;}
  vec4 sp=spectralAt(p)*fade;float bandLOD=1.-smoothstep(.25,1.5,footprint);height+=sp.x*bandLOD;gradient+=sp.yz*bandLOD;vy+=sp.w*bandLOD;
- if(uCoastOn>.5){float ds,shelter=coastShelter(p,ds);vec4 cv=coastWave(p,depth);float oldh=height;vec2 oldshift=shift;
+ if(uCoastOn>.5){float ds,shelter=coastShelter(p,ds);vec4 cv=coastWave(p,depth,footprint);float oldh=height;vec2 oldshift=shift;
  height=height*shelter+cv.x;gradient=gradient*shelter+vec2(cv.y,oldh*ds+cv.z);mxx=1.+(mxx-1.)*shelter;mxz=mxz*shelter+oldshift.x*ds;mzz=1.+(mzz-1.)*shelter+oldshift.y*ds;shift*=shelter;velocityXZ*=shelter;vy=vy*shelter+cv.w;}
  float determinant=mxx*mzz-mxz*mxz;vec2 grad=vec2(gradient.x*mzz-gradient.y*mxz,gradient.y*mxx-gradient.x*mxz)/max(.003,determinant);
  s.d=vec3(shift.x,height,shift.y);s.n=normalize(vec3(-grad.x,1.,-grad.y));s.gradient=grad;s.velocity=vec3(velocityXZ.x,vy-dot(grad,velocityXZ),velocityXZ.y);s.compression=determinant;return s;
@@ -1784,7 +1799,7 @@ void main(){vec2 p=vUV*52.-26.;vec4 f=fluid(p);if(f.y<.015){outColor=vec4(0.);re
  if(uPathWakes>.5){
   for(int i=0;i<2;i++){vec4 a=uWakeSegment[i],w=uWakeInfo[i];float d=segmentDistance(p,a.xy,a.zw);born+=exp(-d*d/max(.012,w.x*w.x))*w.y*uWakeFoam;}
  }else{vec2 d=p-uBoat.xy;float bs=sin(uBoat.z),bc=cos(uBoat.z);vec2 local=vec2(bc*d.x-bs*d.y,bs*d.x+bc*d.y);float wake=exp(-abs(abs(local.x)-local.y*.36)*5.)*smoothstep(.2,1.2,local.y)*(1.-smoothstep(1.7,7.,local.y))*clamp(uBoat.w*.2,0.,1.);born+=wake*uWakeFoam*.8;}
- if(uCoastOn>.5){vec4 cw=coastWave(p,f.y);born+=smoothstep(.20,.85,cw.x)*smoothstep(.12,.65,abs(cw.z))*.8;}
+ if(uCoastOn>.5){vec4 cw=coastWave(p,f.y,0.);born+=smoothstep(.20,.85,cw.x)*smoothstep(.12,.65,abs(cw.z))*.8;}
  float deposited=born*uStep*uFoamBirth,density=previous*exp(-uStep/uFoamLife)+deposited;
  young=young*exp(-uStep/max(.1,uFreshLife))+deposited;
  // Structure travels with density. It has no independent time-scrolling pattern.
@@ -2057,7 +2072,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.frameSet({uTime:this.water.time,uGrid:N,uDX:DX,uLevel:this.water.level,
    uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
    uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
-   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness});
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:oceanSurface(this.water.time),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness});
   this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(this.water.time),o.uMode);
   this.farSeaTable(f.subarray(o.uFarSeaTable,o.uFarSeaTable+16),f.subarray(o.uWave),f.subarray(o.uMode));
   f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
@@ -2970,11 +2985,21 @@ function zipStore(files){const chunks=[],central=[];let offset=0;for(const file 
    This is an engineering-inspired game model, not a certified simulator.
    ======================================================================== */
 const coastRead=new Float64Array(6);
+// Ocean level outside the basin; the renderer sends the same value as uOcean.
+function oceanSurface(t){return (C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(t*C.oceanRate);}
+// Reef depth: transported water inside the basin, the coast bed under the ocean level outside (coastDepthAt).
+function coastDepthAt(x,z,t){return Math.abs(x)>26||Math.abs(z)>26?Math.max(0,oceanSurface(t)-rescueTerrain(x,z)):water?water.bilerp(water.h,x,z):0;}
+// The GPU coastWave at footprint 0. out: shelter, its z derivative, height, gradient x/z, vertical velocity.
 function coastalSample(x,z,t,depth,out=coastRead){
  const u=clamp((z-3.5)/6,0,1),shelter=1-(1-C.harbourShelter)*u*u*(3-2*u),ds=-(1-C.harbourShelter)*u*(1-u);
  const k=TAU/(C.reefPeriod*C.reefSpeed),w=TAU/C.reefPeriod,zb=-5.8+.038*x*x,b=(z-zb)/C.reefWidth,env=Math.exp(-1.6*b*b),ex=env*3.2*b*.076*x/C.reefWidth,ez=-env*3.2*b/C.reefWidth;
- const phase=k*(z-.038*x*x)-t*w,shape=Math.sin(phase)-.32*Math.cos(2*phase),grad=Math.cos(phase)+.64*Math.sin(2*phase),a=C.reefHeight*sstep(.08,.65,depth)*(1-sstep(4.5,6.5,z)*sstep(4.7,5.6,Math.abs(x)))*(C.waves?1:0);
- out[0]=shelter;out[1]=ds;out[2]=a*env*shape;out[3]=a*(ex*shape+env*grad*(-.076*x*k));out[4]=a*(ez*shape+env*grad*k);out[5]=-a*env*grad*w;return out;
+ const phase=k*(z-.038*x*x)-t*w,shape=Math.sin(phase)-.25*Math.cos(2*phase),grad=Math.cos(phase)+.5*Math.sin(2*phase);
+ if(Math.abs(x)>26||Math.abs(z)>26)depth=coastDepthAt(x,z,t);
+ const sz=sstep(4.5,6.5,z),sx=sstep(4.7,5.6,Math.abs(x)),pass=1-sz*sx,fade=sstep(.08,.65,depth),H=C.reefHeight*(C.waves?1:0),a=H*fade*pass;
+ const tz=clamp((z-4.5)/2,0,1),tx=clamp((Math.abs(x)-4.7)/.9,0,1);let dax=-fade*sz*6*tx*(1-tx)/.9*Math.sign(x),daz=-fade*6*tz*(1-tz)/2*sx;
+ if(depth>.08&&depth<.65){const q=(depth-.08)/.57,d=6*q*(1-q)/.57*pass*2;dax+=d*(coastDepthAt(x+.25,z,t)-coastDepthAt(x-.25,z,t));daz+=d*(coastDepthAt(x,z+.25,t)-coastDepthAt(x,z-.25,t));}
+ const m=H*env*shape;
+ out[0]=shelter;out[1]=ds;out[2]=a*env*shape;out[3]=a*(ex*shape+env*grad*(-.076*x*k))+dax*m;out[4]=a*(ez*shape+env*grad*k)+daz*m;out[5]=-a*env*grad*w;return out;
 }
 function rescueTerrain(x,z){
  let h=-5.0+.18*Math.sin(x*.31)*Math.cos(z*.43);
@@ -3102,7 +3127,7 @@ layout(location=0) in vec2 aUV;uniform mat4 uVP;uniform float uCrestIndex,uCurlR
 out vec3 vP;out vec3 vN;out vec2 vAnchor;out float vFade;out float vLip;
 void main(){float x=aUV.x*36.-18.,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.2831853/uReefPeriod;
  float z=(1.5707963+uCoastPhase+uCrestIndex*6.2831853)/k+.038*x*x,zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-1.6*b*b);
- vec2 p=vec2(x,z);vec4 f=fluid(p);Sea s=sea(p,f.y);float shallow=smoothstep(.2,1.2,f.y)*breakwaterPass(p),radius=uCurlRadius*env*shallow*min(1.,uReefHeight);
+ vec2 p=vec2(x,z);vec4 f=fluid(p);Sea s=sea(p,f.y);float shallow=smoothstep(.08,.65,coastDepthAt(p))*breakwaterPass(p),radius=uCurlRadius*env*shallow*min(1.,uReefHeight);
  // The wave travels along the crest normal. The sheet rises from the back of the
  // crest, crosses the top, and the lip falls ahead of the face.
  vec2 ahead=normalize(vec2(-.076*x,1.));float angle=-1.5707963+aUV.y*4.15,c=-cos(angle),sn=sin(angle);
@@ -3122,11 +3147,25 @@ void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?v
  else{float fog=airFog(length(uEye-vP));if(fog>0.)color=mix(color,skyColor(normalize(vP-uEye)),fog);}
  float cover=max(mix(.38,.9,fr),lip*1.1);outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,1.)*clamp(cover,0.,.96));
 }`;
+// Test probe: the GPU coastWave at up to 8 points [x, z, footprint], with the Frame block of the
+// last rendered frame. Returns [height, gradient x, gradient z, vertical velocity] per point.
+const coastProbeFS=`#version 300 es
+${sharedGLSL}
+uniform vec4 uProbe[8];out vec4 outColor;
+void main(){vec4 q=uProbe[int(gl_FragCoord.x)];outColor=coastWave(q.xy,fluid(q.xy).y,q.z);}`;
+Renderer.prototype.probeCoast=function(points){const gl=this.gl;if(!this.hdr||points.length>8)return null;
+ if(!this.coastProbe){const color=this.texture(gl.RGBA32F,8,1,gl.RGBA,gl.FLOAT,gl.NEAREST),fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);this.coastProbe={program:this.program(fullVS,coastProbeFS),color,fbo};}
+ const q=this.coastProbe,p=q.program,data=new Float32Array(32),out=new Float32Array(32);points.forEach((v,i)=>data.set([v[0],v[1],v[2]||0,0],i*4));
+ gl.bindFramebuffer(gl.FRAMEBUFFER,q.fbo);gl.viewport(0,0,8,1);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,null);gl.uniform4fv(p.name('uProbe[0]'),data);this.full(p);
+ gl.readPixels(0,0,8,1,gl.RGBA,gl.FLOAT,out);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.enable(gl.DEPTH_TEST);return points.map((_,i)=>Array.from(out.subarray(i*4,i*4+4)));
+};
 Renderer.prototype.drawCrests=function(game){if(C.environment!==3||!C.coastalWaves||!C.curlSheet||!C.waterVisible||!C.waves||C.curlStrength<=0||C.reefHeight<=0)return;const gl=this.gl;
  if(!this.crestProgram){this.crestProgram=this.program(crestVS,crestFS);const v=[],nx=96,ny=14;for(let i=0;i<nx;i++)for(let j=0;j<ny;j++)for(const [x,y]of [[i,j],[i+1,j],[i,j+1],[i,j+1],[i+1,j],[i+1,j+1]])v.push(x/nx,y/ny);this.crestCount=v.length/2;this.crestBytes=v.length*4;this.crestVAO=gl.createVertexArray();gl.bindVertexArray(this.crestVAO);this.crestBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,this.crestBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,8,0);}
- const p=this.crestProgram;this.common(p,this.vp,this.eye,game);gl.uniform1f(p.name('uCurlRadius'),C.curlStrength);gl.bindVertexArray(this.crestVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(true);
+ const p=this.crestProgram;this.common(p,this.vp,this.eye,game);gl.uniform1f(p.name('uCurlRadius'),C.curlStrength);gl.bindVertexArray(this.crestVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+ // A translucent sheet: it tests depth but does not write it, so the face behind it and later passes still show.
+ gl.depthMask(false);
  const k=TAU/(C.reefPeriod*C.reefSpeed),w=TAU/C.reefPeriod,centre=Math.round((-5.8*k-Math.PI*.5-TAU*((water.time/C.reefPeriod)%1))/TAU);
- for(let i=-1;i<=1;i++){gl.uniform1f(p.name('uCrestIndex'),centre+i);gl.drawArrays(gl.TRIANGLES,0,this.crestCount);profiler?.draw(this.crestCount/3,0);}gl.disable(gl.BLEND);
+ for(let i=-1;i<=1;i++){gl.uniform1f(p.name('uCrestIndex'),centre+i);gl.drawArrays(gl.TRIANGLES,0,this.crestCount);profiler?.draw(this.crestCount/3,0);}gl.disable(gl.BLEND);gl.depthMask(true);
 };
 
 // Three fixed starting conditions. Original BEACON fixtures remain unchanged.
