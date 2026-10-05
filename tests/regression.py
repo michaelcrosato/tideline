@@ -74,6 +74,7 @@ async def main(args):
    const t=r.surfaceWetTargets[r.surfaceWetRead],gl=r.gl,p=new Uint8Array(4),px=Math.floor((-7+26)/52*t.w),py=Math.floor((15+26)/52*t.h);gl.bindFramebuffer(gl.FRAMEBUFFER,t.fbo);gl.readPixels(px,py,1,1,gl.RGBA,gl.UNSIGNED_BYTE,p);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
    const dec=(a,b)=>(a*256+b)/65535*48-16,film=dec(p[0],p[1]),damp=dec(p[2],p[3]);return {ok:film>1.7&&damp>=film&&damp<=2.03,film,damp};
    }finally{Object.assign(C,save);w.h.set(h);w.level=lev;D.storm.sync();r.clearSurfaceHistory();}''')
+  await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
    return {ok:airAfterEntry===0&&maxUp<1.1&&g.physics.stats.faults===0,maxUp,airAfterEntry,entries:g.physics.stats.entries,finalVy:g.boat.vy};''')
@@ -82,7 +83,7 @@ async def main(args):
   await check('Memory accounting includes the added maps','const m=D.profiler.memory();return {ok:m.gpuTargetBytes>2*128*128*4&&m.ownedArrayBytes>0,extraMapBytes:2*128*128*4};')
   record('No JavaScript exceptions',not errors,errors)
   record('No external runtime requests',not [u for u in network if u.startswith('http')],network)
-  result={'build':'TL-SURFACE-20261004.1','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
+  result={'build':'TL-SURFACE-20261005.1','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
   Path(args.output).write_text(json.dumps(result,indent=2))
   print(json.dumps({k:result[k] for k in ['passed','total','seconds']},indent=2))
   if not args.cdp:await browser.close()

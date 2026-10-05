@@ -1034,6 +1034,9 @@ const ACTIVE_STRUCTURE={grid:C.grid,worldSeed:C.worldSeed,basinDepth:C.basinDept
 let profiler=null,lab=null;
 
 const TAU=Math.PI*2, N=ACTIVE_STRUCTURE.grid, COUNT=N*N, SIZE=52, HALF=26, DX=SIZE/(N-1);let DT=1/C.simHz;
+// Pipe coefficient per metre of head. Fixed at the default grid's DX so the transport
+// wave speed, sqrt(acceleration*PIPE_AREA), and fill times do not change with grid size.
+const PIPE_AREA=.25;
 // One packed table drives the GPU and CPU; no asynchronous height readback.
 // Layout per mode: dx, dz, k, omega, amplitude, phase, horizontal amplitude.
 /* Two-band Phillips-like spectrum. Radix-2 inverse FFT, with two real fields
@@ -1081,7 +1084,7 @@ class OceanSpectrum {
   if(tick!==this.tick||force){for(const b of this.bands){if(tick===this.tick+1&&!force){const old=b.a;b.a=b.b;b.b=old;}else this.build(b,tick/C.fftHz,b.a);this.build(b,(tick+1)/C.fftHz,b.b);}this.tick=tick;this.pack();this.version++;}
   if(profiler?.active){profiler.add('spectrumCPU',performance.now()-t0);if(profiler.current)profiler.current.fftUpdates=this.updates;}
  }
- pack(){const n=this.n,W=n*2;for(let c=0;c<2;c++){const b=this.bands[c];for(let z=0;z<n;z++){this.atlas.set(b.a.subarray(z*n*4,(z+1)*n*4),((z+c*n)*W)*4);this.atlas.set(b.b.subarray(z*n*4,(z+1)*n*4),((z+c*n)*W+n)*4);}}}
+ pack(){const n=this.n,W=n*2;this.peak=this.peak||[0,0];for(let c=0;c<2;c++){const b=this.bands[c];let peak=0;for(let k=0;k<b.a.length;k+=4)peak=Math.max(peak,Math.abs(b.a[k]),Math.abs(b.b[k]));this.peak[c]=peak;for(let z=0;z<n;z++){this.atlas.set(b.a.subarray(z*n*4,(z+1)*n*4),((z+c*n)*W)*4);this.atlas.set(b.b.subarray(z*n*4,(z+1)*n*4),((z+c*n)*W+n)*4);}}}
  sample(x,z,out=this.scratch){out.fill(0);if(!C.spectral||!C.waves||!this.n)return out;const n=this.n,mask=n-1;
   for(let c=0;c<2;c++){const b=this.bands[c],gx=x/b.length*n,gz=z/b.length*n,ix=Math.floor(gx),iz=Math.floor(gz),fx=gx-ix,fz=gz-iz,k00=((iz&mask)*n+(ix&mask))*4,k10=((iz&mask)*n+((ix+1)&mask))*4,k01=(((iz+1)&mask)*n+(ix&mask))*4,k11=(((iz+1)&mask)*n+((ix+1)&mask))*4,amp=C.fftHeight*(c?C.fftShort:1);
    for(let k=0;k<4;k++){const a=lerp(lerp(b.a[k00+k],b.a[k10+k],fx),lerp(b.a[k01+k],b.a[k11+k],fx),fz),v=lerp(lerp(b.b[k00+k],b.b[k10+k],fx),lerp(b.b[k01+k],b.b[k11+k],fx),fz);out[k]+=lerp(a,v,this.alpha)*amp;}
@@ -1091,12 +1094,22 @@ class OceanSpectrum {
  validate(){this.configure();const n=this.n,nn=n*n,re=new Float64Array(nn),im=new Float64Array(nn);re[1]=re[n-1]=nn*.5;this.inverse(re,im);let error=0;for(let z=0;z<n;z++)for(let x=0;x<n;x++)error=Math.max(error,Math.abs(re[z*n+x]-Math.cos(TAU*x/n)),Math.abs(im[z*n+x]));return{test:'2D inverse FFT single cosine',size:n,maxError:error,pass:error<1e-9};}
 }
 const spectrum=new OceanSpectrum(); // Large fields initialize at L20, after platform checks.
+// An upper bound on vertical wave displacement, plus a margin for horizontal
+// shift. Scenery farther than this from the water level skips the surface solve.
+function waveReach(){let a=.6;if(!C.waves)return a;for(let i=0;i<storm.count;i++)a+=Math.abs(storm.table[i*7+4]);
+ if(C.rogueEnabled)a+=C.rogueHeight;if(C.spectral&&spectrum.peak)a+=C.fftHeight*(spectrum.peak[0]+C.fftShort*spectrum.peak[1]);if(C.environment===3&&C.coastalWaves)a+=1.35*C.reefHeight;return a;}
 
+const STORM_KEYS=['waves','waveCount','waveScale','waveSpeed','windYaw','choppiness'];for(let i=0;i<30;i++)for(const k of ['X','Z','K','T','A','Phase'])STORM_KEYS.push('wave'+i+k);
 class Storm {
+ // Phases are wrapped in double precision. A float32 uTime*omega drifted from the
+ // CPU wave sum, and quantized the animation, in long sessions.
+ phases(t){const a=this.gpuMode||(this.gpuMode=new Float32Array(90));for(let i=0;i<30;i++){const o=i*7;a[i*3]=this.table[o+4];a[i*3+1]=(this.table[o+5]-t*this.table[o+3])%TAU;a[i*3+2]=this.table[o+6];}return a;}
  constructor(){this.table=new Float64Array(30*7);this.gpuW=new Float32Array(30*4);this.gpuA=new Float32Array(30*3);this.signature='';this.count=30;this.qScale=0;this.scratch=new Float64Array(14);this.sync();}
- sync(){const values=[C.waves,C.waveCount,C.waveScale,C.waveSpeed,C.windYaw,C.choppiness];for(let i=0;i<30;i++)for(const k of ['X','Z','K','T','A','Phase'])values.push(C['wave'+i+k]);const signature=values.join(',');if(signature===this.signature)return;this.signature=signature;this.count=Math.round(C.waveCount);let sum=0,a=C.windYaw*Math.PI/180,cs=Math.cos(a),sn=Math.sin(a);
+ sync(){const keys=STORM_KEYS,last=this.lastValues||(this.lastValues=[]);let changed=last.length!==keys.length;for(let i=0;i<keys.length;i++){const v=C[keys[i]];if(v!==last[i]){last[i]=v;changed=true;}}if(!changed)return;this.signature=last.join(',');this.count=Math.round(C.waveCount);let sum=0,a=C.windYaw*Math.PI/180,cs=Math.cos(a),sn=Math.sin(a);
   for(let i=0;i<30;i++){const p='wave'+i,o=i*7,x=C[p+'X'],z=C[p+'Z'],len=Math.hypot(x,z)||1;this.table[o]=(x*cs-z*sn)/len;this.table[o+1]=(x*sn+z*cs)/len;this.table[o+2]=C[p+'K'];this.table[o+3]=C[p+'T']*C.waveSpeed;this.table[o+4]=C.waves?C[p+'A']*C.waveScale:0;this.table[o+5]=C[p+'Phase'];if(i<this.count)sum+=this.table[o+4]*this.table[o+2];}
-  this.qScale=sum>1e-8?C.choppiness/sum:0;
+  // Horizontal motion never exceeds the vertical amplitude (a trochoid), so calm
+  // water does not slide sideways with almost no height.
+  this.qScale=sum>1e-8?Math.min(C.choppiness/sum,1):0;
   for(let i=0;i<30;i++){const o=i*7;this.table[o+6]=this.table[o+4]*this.qScale;this.gpuW.set(this.table.subarray(o,o+4),i*4);this.gpuA.set([this.table[o+4],this.table[o+5],this.table[o+6]],i*3);}
  }
  center(t,offset=0){const period=C.roguePeriod;return (((t+offset)%period+period)%period-period*.5)*C.rogueSpeed;}
@@ -1116,6 +1129,7 @@ const storm=new Storm();
 
 let seed=C.worldSeed;function rand(){seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;}
 const length3=a=>Math.hypot(...a), norm=a=>{const l=length3(a)||1;return a.map(x=>x/l);}, cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const ZERO4=new Float32Array(4);
 const Mat={
  identity:()=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]),
  mul:(a,b)=>{let r=new Float32Array(16);for(let c=0;c<4;c++)for(let i=0;i<4;i++)r[c*4+i]=a[i]*b[c*4]+a[4+i]*b[c*4+1]+a[8+i]*b[c*4+2]+a[12+i]*b[c*4+3];return r;},
@@ -1123,10 +1137,9 @@ const Mat={
  look:(eye,target,up=[0,1,0])=>{let z=norm(eye.map((v,i)=>v-target[i])),x=norm(cross(up,z)),y=cross(z,x);return new Float32Array([x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,-dot(x,eye),-dot(y,eye),-dot(z,eye),1]);},
  model:(x,y,z,sx=1,sy=1,sz=1,yaw=0,pitch=0,roll=0)=>{
   const c=Math.cos(yaw),s=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),cr=Math.cos(roll),sr=Math.sin(roll);
-  let ry=new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1]);
-  let rx=new Float32Array([1,0,0,0,0,cp,sp,0,0,-sp,cp,0,0,0,0,1]);
-  let rz=new Float32Array([cr,sr,0,0,-sr,cr,0,0,0,0,1,0,0,0,0,1]);
-  let m=Mat.mul(Mat.mul(ry,rx),rz);for(let j=0;j<3;j++){m[j]*=sx;m[4+j]*=sy;m[8+j]*=sz;}m[12]=x;m[13]=y;m[14]=z;return m;
+  // Ry*Rx*Rz scaled per column, written out directly.
+  const m=new Float32Array(16);
+  m[0]=(c*cr+s*sp*sr)*sx;m[1]=cp*sr*sx;m[2]=(c*sp*sr-s*cr)*sx;m[4]=(s*sp*cr-c*sr)*sy;m[5]=cp*cr*sy;m[6]=(s*sr+c*sp*cr)*sy;m[8]=s*cp*sz;m[9]=-sp*sz;m[10]=c*cp*sz;m[12]=x;m[13]=y;m[14]=z;m[15]=1;return m;
  },
  transform:(m,p)=>{let x=p[0],y=p[1],z=p[2],w=m[3]*x+m[7]*y+m[11]*z+m[15];return[(m[0]*x+m[4]*y+m[8]*z+m[12])/w,(m[1]*x+m[5]*y+m[9]*z+m[13])/w,(m[2]*x+m[6]*y+m[10]*z+m[14])/w];}
 };
@@ -1212,7 +1225,7 @@ class Water{
   this.bed=new Float32Array(COUNT);this.h=new Float32Array(COUNT);this.next=new Float32Array(COUNT);
   this.pressure=new Float32Array(COUNT);this.flux=new Float32Array(COUNT*4);this.ux=new Float32Array(COUNT);this.uz=new Float32Array(COUNT);
   this.ripple=new Float32Array(COUNT);this.rv=new Float32Array(COUNT);this.rnext=new Float32Array(COUNT);
-  this.wet=new Uint8Array(COUNT);this.wetAge=new Float32Array(COUNT);this.tex=new Float32Array(COUNT*4);
+  this.wet=new Uint8Array(COUNT);this.wetAge=new Float32Array(COUNT);this.tex=new Float32Array(COUNT*4);this.eta=new Float32Array(COUNT);
   this.neighbors=new Int32Array(COUNT*4);this.edgeGate=new Int8Array(COUNT*4);this.edgeGate.fill(-1);
   this.gates=[{x:-7,z:-16.25,width:4.2,value:0,target:0},{x:6,z:12.25,width:4.3,value:1,target:1}];
   this.time=0;this.level=.35;this.previousLevel=.35;this.boundaryVolume=0;this.rogueOffset=0;this.epoch=0;
@@ -1222,7 +1235,7 @@ class Water{
    for(let d=0;d<4;d++){
     this.neighbors[k*4+d]=n[d];if(n[d]<0)continue;
     const zj=Math.floor(n[d]/N)*DX-HALF;
-    for(let g=0;g<2;g++){let gate=this.gates[g];if(Math.abs(x-gate.x)<=gate.width/2&&((z<gate.z&&zj>gate.z)||(z>gate.z&&zj<gate.z)))this.edgeGate[k*4+d]=g;}
+    for(let g=0;g<2;g++){let gate=this.gates[g];if(Math.abs(x-gate.x)<=gate.width/2&&((z<gate.z&&zj>=gate.z)||(z>=gate.z&&zj<gate.z)))this.edgeGate[k*4+d]=g;}
    }
   }
   this.layoutCache=new Map();this.worldId=-1;this.head=new Float64Array(COUNT);this.boundaryRegion=new Uint8Array(COUNT);this.basinMask=new Uint8Array(COUNT);this.setWorld(C.environment);this.reset();
@@ -1234,13 +1247,13 @@ class Water{
    for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i,x=i*DX-HALF,z=j*DX-HALF;bed[k]=terrainHeight(x,z,id);
     basin[k]=+(x>-13&&x<13&&z>-12&&z<9&&bed[k]<-.3);
     boundary[k]=id===0?(z<-19.5&&z>-23.2&&Math.abs(x)<15.6?1:z>15?2:0):((id===1||id===3)?(i===0||j===0||i===N-1||j===N-1?3:0):(j===N-1?3:0));
-    if(id===0)for(let d=0;d<4;d++){const n=this.neighbors[k*4+d];if(n<0)continue;const zj=Math.floor(n/N)*DX-HALF;for(let g=0;g<2;g++){const gate=this.gates[g];if(Math.abs(x-gate.x)<=gate.width/2&&((z<gate.z&&zj>gate.z)||(z>gate.z&&zj<gate.z)))edgeGate[k*4+d]=g;}}
+    if(id===0)for(let d=0;d<4;d++){const n=this.neighbors[k*4+d];if(n<0)continue;const zj=Math.floor(n/N)*DX-HALF;for(let g=0;g<2;g++){const gate=this.gates[g];if(Math.abs(x-gate.x)<=gate.width/2&&((z<gate.z&&zj>=gate.z)||(z>=gate.z&&zj<gate.z)))edgeGate[k*4+d]=g;}}
    }cached={bed,edgeGate,boundary,basin};this.layoutCache.set(id,cached);
   }
   this.bed.set(cached.bed);this.edgeGate.set(cached.edgeGate);this.boundaryRegion.set(cached.boundary);this.basinMask.set(cached.basin);this.worldId=id;
  }
  reset(){
-  this.setWorld(C.environment);this.pressure.fill(0);this.epoch++;this.rogueOffset=0;this.time=0;this.flux.fill(0);this.ux.fill(0);this.uz.fill(0);this.ripple.fill(0);this.rv.fill(0);this.wet.fill(0);this.wetAge.fill(0);
+  this.setWorld(C.environment);this.pressure.fill(0);this.epoch++;this.rogueOffset=0;this.time=0;this.flux.fill(0);this.ux.fill(0);this.uz.fill(0);this.ripple.fill(0);this.rnext.fill(0);this.rv.fill(0);this.wet.fill(0);this.wetAge.fill(0);
   this.gates[0].value=this.gates[0].target=0;this.gates[1].value=this.gates[1].target=1;
   for(let j=0;j<N;j++)for(let i=0;i<N;i++){let k=j*N+i,z=j*DX-HALF,x=i*DX-HALF;
    let eta=z<-16.25?C.reservoirLevel:(z>12.25?C.oceanLevel:.35);if(Math.abs(x)>22||z<-24.7)eta=C.oceanLevel;
@@ -1250,7 +1263,7 @@ class Water{
  }
  step(dt,closedSystem=false){
   const p0=profiler?.active?performance.now():0;this.time+=dt;for(const g of this.gates)g.value+=clamp(g.target-g.value,-dt*C.gateRate,dt*C.gateRate);
-  const h=this.h,b=this.bed,f=this.flux,nei=this.neighbors,eg=this.edgeGate,headField=this.head,area=DX*DX,retention=Math.pow(C.flowRetention,dt*60),rippleDecay=Math.exp(-dt*C.rippleDamping),accel=dt*C.acceleration*area/DX,dry=C.dryRate*dt,minDepth=C.minFlowDepth,maxCurrent=C.maxCurrent,rippleCoeff=C.rippleCoeff,rippleLimit=C.rippleLimit;
+  const h=this.h,b=this.bed,f=this.flux,nei=this.neighbors,eg=this.edgeGate,headField=this.head,area=DX*DX,retention=Math.pow(C.flowRetention,dt*60),rippleDecay=Math.exp(-dt*C.rippleDamping),accel=dt*C.acceleration*PIPE_AREA,dry=C.dryRate*dt,minDepth=C.minFlowDepth,maxCurrent=C.maxCurrent,rippleCoeff=C.rippleCoeff,rippleLimit=C.rippleLimit;
   const north=C.reservoirLevel+C.reservoirTide*Math.sin(this.time*C.reservoirRate),south=C.oceanLevel+C.oceanTide*Math.sin(this.time*C.oceanRate),open=WORLD_DEFS[this.worldId].level+C.oceanTide*Math.sin(this.time*C.oceanRate);
   for(let k=0;k<COUNT;k++)headField[k]=b[k]+h[k]+this.pressure[k];
   // Four outgoing, nonnegative virtual pipes per cell. Donor limiting is applied
@@ -1263,7 +1276,7 @@ class Water{
     // Tuned hydraulic acceleration, not a calibrated Earth-gravity model.
     let q=Math.max(0,(f[id]+accel*(head-headField[n]))*retention);
     // Both directions are shut together; no phantom transfer across a closed gate.
-    if(permeability<.999)q*=permeability;
+    if(permeability<.999)q*=Math.pow(permeability,dt*60);
     if(h[k]<.00001)q=0;f[id]=q;sum+=q;
    }
    const limit=Math.min(1,h[k]*area/(dt*sum+1e-12));
@@ -1288,7 +1301,7 @@ class Water{
    if(v>.018){this.wetAge[k]=1;this.wet[k]=255;}else{this.wetAge[k]=Math.max(0,this.wetAge[k]-dry);this.wet[k]=this.wetAge[k]*255;}
    if(this.basinMask[k]){total+=b[k]+v;count++;}
   }
-  [this.h,this.next]=[this.next,this.h];this.previousLevel=this.level;this.level=total/Math.max(1,count);
+  {const t=this.h;this.h=this.next;this.next=t;}this.previousLevel=this.level;this.level=total/Math.max(1,count);
   // Damped, small-amplitude wave equation: cosmetic displacement, never volume.
   const p1=profiler?.active?performance.now():0;if(p0)profiler.add('hydraulics',p1-p0);if(C.wallWaves){this.stepWallWaves(dt);if(p1)profiler.add('ripples',performance.now()-p1);return;}const r=this.ripple,rv=this.rv;if(!C.ripples){r.fill(0);rv.fill(0);this.rnext.fill(0);return;}
   for(let j=1;j<N-1;j++)for(let i=1;i<N-1;i++){
@@ -1296,7 +1309,7 @@ class Water{
    const lap=(r[k-1]+r[k+1]+r[k-N]+r[k+N]-4*r[k])/(DX*DX);
    rv[k]=(rv[k]+dt*rippleCoeff*lap)*rippleDecay;this.rnext[k]=clamp(r[k]+rv[k]*dt,-rippleLimit,rippleLimit);
   }
-  [this.ripple,this.rnext]=[this.rnext,this.ripple];if(p1)profiler.add('ripples',performance.now()-p1);
+  {const t=this.ripple;this.ripple=this.rnext;this.rnext=t;}if(p1)profiler.add('ripples',performance.now()-p1);
  }
 
  hullHead(boat){const t0=performance.now();this.pressure.fill(0);if(C.hullPressure){const r=C.pressureRadius,c=Math.cos(boat.yaw),s=Math.sin(boat.yaw),wet=clamp(boat.wetFraction||0,0,1),rad=r*2.5,ix0=Math.max(1,Math.floor((boat.x-rad+HALF)/DX)),ix1=Math.min(N-2,Math.ceil((boat.x+rad+HALF)/DX)),iz0=Math.max(1,Math.floor((boat.z-rad+HALF)/DX)),iz1=Math.min(N-2,Math.ceil((boat.z+rad+HALF)/DX));
@@ -1313,18 +1326,34 @@ class Water{
  sample(x,z){let depth=this.bilerp(this.h,x,z),bed=this.bilerp(this.bed,x,z);return{bed,depth,height:bed+depth,x:this.bilerp(this.ux,x,z),z:this.bilerp(this.uz,x,z)};}
  wave(x,z,time=this.time,depth=null){return storm.evaluate(x,z,time,depth===null?this.bilerp(this.h,x,z):depth,storm.scratch,storm.count,this.rogueOffset)[1];}
  motion(x,z,out=new Float64Array(14)){
-  const depth=this.bilerp(this.h,x,z);let px=x,pz=z;
+  let px=x,pz=z,converged=false;
   // Invert horizontal displacement with a bounded Newton solve. The hull uses
   // the displaced surface, not a different sine wave or flat mean water plane.
-  for(let i=0;i<5;i++){storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);const ex=px+out[0]-x,ez=pz+out[2]-z,det=Math.max(.003,out[11]);if(Math.abs(ex)+Math.abs(ez)<.0001)break;px-=clamp((out[5]*ex-out[4]*ez)/det,-1.5,1.5);pz-=clamp((out[3]*ez-out[4]*ex)/det,-1.5,1.5);}
-  storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);
+  for(let i=0;i<5;i++){storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);const ex=px+out[0]-x,ez=pz+out[2]-z,det=Math.max(.003,out[11]);if(Math.abs(ex)+Math.abs(ez)<.0001){converged=true;break;}px-=clamp((out[5]*ex-out[4]*ez)/det,-1.5,1.5);pz-=clamp((out[3]*ez-out[4]*ex)/det,-1.5,1.5);}
+  if(!converged)storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);
   const gx=out[9],gz=out[10],det=Math.max(.003,out[11]);out[9]=(gx*out[5]-gz*out[4])/det;out[10]=(gz*out[3]-gx*out[4])/det;
-  out[7]-=out[9]*out[6]+out[10]*out[8];out[1]+=this.bilerp(this.bed,px,pz)+this.bilerp(this.h,px,pz)+this.bilerp(this.ripple,px,pz);out[12]=px;out[13]=pz;return out;
+  out[7]-=out[9]*out[6]+out[10]*out[8];out[1]+=this.bilerp(this.eta,px,pz);out[12]=px;out[13]=pz;return out;
  }
  surface(x,z){return this.motion(x,z,storm.scratch)[1];}
- fastSurface(x,z){const d=this.bilerp(this.h,x,z);return this.bilerp(this.bed,x,z)+d+storm.evaluate(x,z,this.time,d,storm.scratch,Math.min(6,storm.count),this.rogueOffset)[1];}
- impulse(x,z,amount=.75,radius=.7){if(!C.ripples)return;let gx=Math.round((x+HALF)/DX),gz=Math.round((z+HALF)/DX),rr=Math.ceil(radius/DX);for(let j=gz-rr;j<=gz+rr;j++)for(let i=gx-rr;i<=gx+rr;i++){if(i<1||j<1||i>=N-1||j>=N-1)continue;let k=j*N+i,d=Math.hypot(i*DX-HALF-x,j*DX-HALF-z);if(d<radius&&this.h[k]>.05)this.rv[k]+=amount*(1-d/radius);}}
- pack(){for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=this.bed[k]+this.h[k]+this.ripple[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
+ fastSurface(x,z){const d=this.bilerp(this.h,x,z);return this.bilerp(this.eta,x,z)+storm.evaluate(x,z,this.time,d,storm.scratch,Math.min(6,storm.count),this.rogueOffset)[1];}
+ // A splash pushes surrounding water down as the centre rises. Its net source is
+ // zero, so the wall-wave field cannot accumulate a permanent height offset.
+ impulse(x,z,amount=.75,radius=.7){if(!C.ripples)return;const reach=radius*1.6,gx=Math.round((x+HALF)/DX),gz=Math.round((z+HALF)/DX),rr=Math.ceil(reach/DX);let sum=0,n=0;
+  for(let pass=0;pass<2;pass++){const mean=n?sum/n:0;for(let j=gz-rr;j<=gz+rr;j++)for(let i=gx-rr;i<=gx+rr;i++){if(i<1||j<1||i>=N-1||j>=N-1)continue;const k=j*N+i,d=Math.hypot(i*DX-HALF-x,j*DX-HALF-z);if(d>=reach||this.h[k]<=.05)continue;const v=d<radius?amount*(1-d/radius):0;if(pass)this.rv[k]+=v-mean;else{sum+=v;n++;}}}}
+ // Dry cells near water carry the lowest neighbouring free surface, two cells into
+ // the bank. Interpolating toward the bed raised a translucent water ramp, false wet
+ // marks and phantom buoyancy up walls; a level edge ends hidden inside the solid.
+ // Dry edge cells meet the open water drawn beyond the grid at its level.
+ refreshSurface(){const h=this.h,b=this.bed,r=this.ripple,e=this.eta,ring=this.surfaceRing||(this.surfaceRing=new Uint8Array(COUNT)),wet=.012,ocean=(this.worldId===0?C.oceanLevel:WORLD_DEFS[this.worldId].level)+C.oceanTide*Math.sin(this.time*C.oceanRate);
+  for(let k=0;k<COUNT;k++){e[k]=b[k]+h[k]+r[k];ring[k]=h[k]>wet?0:255;}
+  for(let pass=1;pass<=2;pass++)for(let j=0;j<N;j++){const j0=j>0?-N:0,j1=j<N-1?N:0;for(let i=0;i<N;i++){const k=j*N+i;if(ring[k]<255)continue;const i0=i>0?-1:0,i1=i<N-1?1:0;let low=Infinity;
+   for(let dj=j0;dj<=j1;dj+=N)for(let di=i0;di<=i1;di++){const q=k+dj+di;if(ring[q]<pass&&e[q]<low)low=e[q];}
+   if(pass===1&&low===Infinity&&(i0===0||j0===0||i1===0||j1===0))low=ocean;
+   if(low<Infinity){ring[k]=pass;if(low<e[k])e[k]=low;}}}
+  this.etaTime=this.time;this.etaEpoch=this.epoch;return e;
+ }
+ // The game step refreshes the surface; rendering reuses it unless the water was edited directly.
+ pack(force=false){const e=force||this.etaTime!==this.time||this.etaEpoch!==this.epoch?this.refreshSurface():this.eta;for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=e[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
  volume(){let v=0;for(const h of this.h)v+=h*DX*DX;return v;}
 }
 /* --------------------------------------------------------------------------
@@ -1473,20 +1502,23 @@ float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 vec2 hash2(vec2 p){return fract(sin(vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))))*43758.5453);}
 float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+1.),f.x),f.y);}
 float fbm(vec2 p){float sum=0.,weight=.5;for(int i=0;i<5;i++){sum+=noise(p)*weight;p=mat2(1.6,-1.2,1.2,1.6)*p+3.7;weight*=.5;}return sum;}
-uniform float uCoastOn,uReefHeight,uReefPeriod,uReefSpeed,uHarbourShelter,uReefWidth;
+uniform float uCoastOn,uReefHeight,uReefPeriod,uReefSpeed,uHarbourShelter,uReefWidth,uCoastPhase;
 uniform float uFoamAging,uFreshLife,uWaveShadow,uWaveShadowStrength;
 float coastShelter(vec2 p,out float derivative){float t=clamp((p.y-3.5)/6.,0.,1.);derivative=-(1.-uHarbourShelter)*6.*t*(1.-t)/6.;return 1.-(1.-uHarbourShelter)*t*t*(3.-2.*t);}
+// The reef curve bends shoreward and meets the breakwater near |x|=17. The walls
+// (|x|>5.5, z 4.5-6.5) stop the breaker; only the entrance gap passes it.
+float breakwaterPass(vec2 p){return 1.-smoothstep(4.5,6.5,p.y)*smoothstep(4.7,5.6,abs(p.x));}
 vec4 coastWave(vec2 p,float depth){
  float x=p.x,z=p.y,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.2831853/uReefPeriod;
  float zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-b*b*1.6),ex=env*3.2*b*.076*x/uReefWidth,ez=-env*3.2*b/uReefWidth;
- float phase=k*(z-.038*x*x)-uTime*w,sp=sin(phase),cp=cos(phase),shape=sp-.32*cos(2.*phase),grad=cp+.64*sin(2.*phase);
- float depthFade=smoothstep(.08,.65,depth),a=uReefHeight*depthFade;
+ float phase=k*(z-.038*x*x)-uCoastPhase,sp=sin(phase),cp=cos(phase),shape=sp-.32*cos(2.*phase),grad=cp+.64*sin(2.*phase);
+ float depthFade=smoothstep(.08,.65,depth)*breakwaterPass(p),a=uReefHeight*depthFade;
  return a*vec4(env*shape,ex*shape+env*grad*(-.076*x*k),ez*shape+env*grad*k,-env*grad*w);
 }
 
 struct Sea {vec3 d;vec3 n;vec3 velocity;float compression;vec2 gradient;};
 Sea seaRaw(vec2 p,float depth,float footprint){Sea s;vec2 shift=vec2(0.),gradient=vec2(0.),velocityXZ=vec2(0.);float height=0.,vy=0.,mxx=1.,mxz=0.,mzz=1.;float fade=smoothstep(0.,uDepthFade,max(0.,depth));
- for(int i=0;i<30;i++){if(i>=uWaveCount)break;vec4 w=uWave[i];vec3 mode=uMode[i];float lod=1.-smoothstep(.6,3.,w.z*footprint),a=mode.x*fade*lod,q=mode.z*fade*lod,phase=dot(p,w.xy)*w.z-uTime*w.w+mode.y,sn=sin(phase),cs=cos(phase),derivative=q*w.z*sn;
+ for(int i=0;i<30;i++){if(i>=uWaveCount)break;vec4 w=uWave[i];vec3 mode=uMode[i];float lod=1.-smoothstep(.6,3.,w.z*footprint),a=mode.x*fade*lod,q=mode.z*fade*lod,phase=dot(p,w.xy)*w.z+mode.y,sn=sin(phase),cs=cos(phase),derivative=q*w.z*sn;
  shift+=q*cs*w.xy;height+=a*sn;gradient+=a*w.z*cs*w.xy;mxx-=derivative*w.x*w.x;mxz-=derivative*w.x*w.y;mzz-=derivative*w.y*w.y;velocityXZ+=q*w.w*sn*w.xy;vy-=a*w.w*cs;}
  if(uRogueHeight>0.){float a=(dot(p,uWave[0].xy)-uRogueCenter)/uRogueWidth,e=exp(-.5*a*a),d=uRogueHeight*fade*e*(a*a*a-3.*a)/uRogueWidth;height+=uRogueHeight*fade*e*(1.-a*a);gradient+=d*uWave[0].xy;vy-=d*uRogueSpeed;}
  vec4 sp=spectralAt(p)*fade;float bandLOD=1.-smoothstep(.25,1.5,footprint);height+=sp.x*bandLOD;gradient+=sp.yz*bandLOD;vy+=sp.w*bandLOD;
@@ -1503,7 +1535,7 @@ Sea seaFiltered(vec2 p,float depth,float footprint){
 
 Sea sea(vec2 p,float depth){return seaFiltered(p,depth,0.);}
 vec3 skyRaw(vec3 r){r=normalize(r);float y=clamp(r.y,0.,1.);float sunset=exp(-pow((uSolar.y+.02)/.27,2.));vec3 night=mix(vec3(.009,.016,.04),vec3(.001,.003,.012),pow(y,.35));vec3 day=mix(vec3(.52,.63,.71),vec3(.055,.23,.43),pow(y,.5));
- vec3 sky=mix(night,day,uDaylight);float horizon=pow(1.-y,5.);sky+=vec3(.35,.075,.032)*horizon*sunset*(.25+.75*pow(max(0.,dot(normalize(vec3(r.x,0.,r.z)),normalize(vec3(uSolar.x,.001,uSolar.z)))),3.));
+ vec3 sky=mix(night,day,uDaylight);float horizon=pow(1.-y,5.);sky+=vec3(.35,.075,.032)*horizon*sunset*(.25+.75*pow(max(0.,dot(normalize(vec3(r.x,1e-5,r.z)),normalize(vec3(uSolar.x,.001,uSolar.z)))),3.));
  vec2 p=r.xz/(max(.0,r.y)+.26)*2.2+vec2(uTime*.012,uTime*.004);float cloud=fbm(p),mask=smoothstep(.60-uCloud*.40,.83-uCloud*.33,cloud);float lit=fbm(p-normalize(uSun).xz*.28);
  vec3 cloudCol=mix(vec3(.006,.009,.022),mix(vec3(.19,.26,.34),vec3(.78,.77,.72),smoothstep(.35,.68,lit)),uDaylight);cloudCol+=sunset*horizon*vec3(.32,.055,.033);sky=mix(sky,cloudCol,mask*.95*smoothstep(-.05,.08,r.y));
  vec2 stars=vec2(atan(r.z,r.x)*70.,asin(clamp(r.y,-1.,1.))*90.);vec2 cell=floor(stars),q=fract(stars)-hash2(cell);float star=pow(max(0.,1.-length(q)*5.),4.)*step(.98,hash(cell+17.));sky+=star*vec3(.50,.62,.85)*uStars*(1.-uDaylight)*(1.-mask)*smoothstep(.01,.25,r.y);
@@ -1519,7 +1551,7 @@ vec4 packFoam(float density,float birth){float v=floor(clamp(density,0.,1.)*6553
 `;
 const surfaceGLSL=`
 uniform float uNaturalFoam,uFoamBreakup,uWaveWetness,uWetReady,uWetGloss;
-uniform float uFilteredHighlights,uHighlightVariance,uPathWakes,uPropWash;
+uniform float uFilteredHighlights,uHighlightVariance,uPathWakes,uPropWash,uWaveReach;
 uniform sampler2D uWetHistory;
 // Column heights use two independent 16-bit UNORM values, valid without HDR targets.
 float wetHeightDecode(vec2 c){return dot(c,vec2(256.,1.))*255./65535.*48.-16.;}
@@ -1550,12 +1582,13 @@ ${surfaceGLSL}
 uniform sampler2D uWet;uniform vec3 uEye,uEmissiveTint;uniform float uUnder,uReflect,uClipLevel,uGlow,uTerrain,uAirCapture,uObjectWet;
 in vec3 vP;in vec3 vN;in vec3 vC;in vec2 vBodyWet;out vec4 outColor;
 void main(){vec4 f=fluid(vP.xz);float surface=f.x;
- if(uWaveWetness>.5||uAirCapture>.5)surface=surfaceWorld(vP.xz+normalize(vN).xz*.20).y;
+ // Waves cannot reach scenery farther than uWaveReach from the local water level.
+ if((uWaveWetness>.5||uAirCapture>.5)&&abs(vP.y-f.x)<uWaveReach)surface=surfaceWorld(vP.xz+normalize(vN).xz*.20).y;
  if(uAirCapture>.5&&vP.y<surface-.06)discard;
  if(uAirCapture<.5&&uReflect>.5&&vP.y<uClipLevel-.05)discard;
  vec3 n=normalize(vN),sun=normalize(uSun),view=normalize(uEye-vP);
  float shadow=sunVisibility(vP+n*.025),nl=max(0.,dot(n,sun))*shadow;
- float depth=max(0.,surface-vP.y),wet=texture(uWet,clamp((vP.xz+26.)/52.,0.,1.)).r;
+ float depth=max(0.,surface-vP.y),wet=texture(uWet,clamp(((vP.xz+26.)/uDX+.5)/uGrid,0.,1.)).r;
  float film=0.,damp=0.;
  if(uWaveWetness>.5){
   float immersion=1.-smoothstep(-.04,.05,vP.y-surface);
@@ -1573,11 +1606,11 @@ void main(){vec4 f=fluid(vP.xz);float surface=f.x;
  if(depth>.025&&uCaustics>.5){vec2 p=vP.xz-sun.xz*depth/max(.1,sun.y);float ca=uFocusOn>.5&&all(lessThan(abs(vP.xz),vec2(25.8)))?texture(uFocusMap,(vP.xz+26.)/52.).r*uFocusStrength:causticNet(p)+.38*causticNet(p*1.62+3.);col+=vec3(.12,.30,.27)*ca*uCausticStrength*exp(-depth*.10)*max(.06,n.y)*shadow;}
  if(uTerrain>.5)col*=.87+noise(vP.xz*8.+vP.y*.4)*.19;
  // Restrained clear-film highlights. Emissive lamp geometry is not made brighter.
- if(uWaveWetness>.5&&film>.01&&uGlow<.01){float wr=mix(.30,.16,film),nh=max(0.,dot(n,normalize(sun+view))),a2=pow(wr,4.),den=nh*nh*(a2-1.)+1.;float sp=a2/(3.14159265*den*den+1e-5);
+ if(uWaveWetness>.5&&film>.01&&uGlow<.01&&depth<.05){float wr=mix(.30,.16,film),nh=max(0.,dot(n,normalize(sun+view))),a2=pow(wr,4.),den=nh*nh*(a2-1.)+1.;float sp=a2/(3.14159265*den*den+1e-5);
   col+=film*uWetGloss*(localWater(vP,n,view,wr)*.24+uSunTint*uSunStrength*min(20.,sp)*nl*.02);
  }
  col+=uEmissiveTint*uGlow;
- float dist=length(vP-uEye);if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);col=col*tr+uHaze*(1.-tr);}else col=mix(col,skyColor(normalize(vP-uEye)),1.-exp(-max(0.,dist-28.)*uFog));outColor=vec4(col,1.);
+ float dist=length(vP-uEye);if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);col=col*tr+uHaze*(1.-tr);}else if(dist>28.)col=mix(col,skyColor(normalize(vP-uEye)),1.-exp(-(dist-28.)*uFog));outColor=vec4(col,1.);
 }`;
 const waterVS=`#version 300 es
 ${sharedGLSL}
@@ -1604,7 +1637,7 @@ vec3 airRadiance(vec3 p,vec3 ray){
 }
 `;
 
-const waterNormalGLSL='\nvec3 waterNormalAt(vec2 anchor,vec3 surfaceNormal){\n vec4 f=fluid(anchor);\n vec2 bg=vec2(fluid(anchor+vec2(.3,0)).x-fluid(anchor-vec2(.3,0)).x,fluid(anchor+vec2(0,.3)).x-fluid(anchor-vec2(0,.3)).x)/.6;\n vec2 grad=-surfaceNormal.xz/max(.025,surfaceNormal.y)+clamp(bg,vec2(-2.),vec2(2.));\n // Continuous wave phase avoids the old six-second normal reset.\n vec2 q=anchor;float mt=uTime*uMicroSpeed;\n for(int i=0;i<8;i++){float fi=float(i),freq=5.2+fi*2.1,ang=fi*2.399;vec2 dir=vec2(cos(ang),sin(ang));float guard=1.-smoothstep(.8,2.8,length(fwidth(q))*freq);grad+=dir*cos(dot(q,dir)*freq-mt*(1.8+fi*.33)+sin(q.y*.7+fi))*(.044/(1.+fi*.25))*guard*uMicro;}\n return normalize(vec3(-grad.x,1.,-grad.y));\n}\n';
+const waterNormalGLSL='\nvec3 waterNormalAt(vec2 anchor,vec3 surfaceNormal){\n vec2 bg=vec2(fluid(anchor+vec2(.3,0)).x-fluid(anchor-vec2(.3,0)).x,fluid(anchor+vec2(0,.3)).x-fluid(anchor-vec2(0,.3)).x)/.6;\n vec2 grad=-surfaceNormal.xz/max(.025,surfaceNormal.y)+clamp(bg,vec2(-2.),vec2(2.));\n // Continuous wave phase avoids the old six-second normal reset.\n vec2 q=anchor;float mt=uTime*uMicroSpeed;\n for(int i=0;i<8;i++){float fi=float(i),freq=5.2+fi*2.1,ang=fi*2.399;vec2 dir=vec2(cos(ang),sin(ang));float guard=1.-smoothstep(.8,2.8,length(fwidth(q))*freq);grad+=dir*cos(dot(q,dir)*freq-mt*(1.8+fi*.33)+sin(q.y*.7+fi))*(.044/(1.+fi*.25))*guard*uMicro;}\n return normalize(vec3(-grad.x,1.,-grad.y));\n}\n';
 const waterFS=`#version 300 es
 ${sharedGLSL}
 ${surfaceGLSL}
@@ -1625,17 +1658,13 @@ float linearDepth(float d){return 100./(500.1-(d*2.-1.)*499.9);}
 float bubbles(vec2 p){vec2 cell=floor(p),f=fract(p);float first=9.,second=9.;for(int j=-1;j<=1;j++)for(int i=-1;i<=1;i++){vec2 g=vec2(i,j),r=g+hash2(cell+g)-f;float d=dot(r,r);if(d<first){second=first;first=d;}else second=min(second,d);}float border=second-first;return 1.-smoothstep(.015,.11,border);}
 vec4 traceReflection(vec3 pos,vec3 ray){vec3 prev=pos;float oldGap=-1.;for(int i=0;i<64;i++){if(i>=uSSRSteps)break;float f=(float(i)+1.)/float(uSSRSteps),distance=.18+pow(f,1.65)*uSSRDistance;vec3 point=pos+ray*distance;vec4 clip=uVP*vec4(point,1.);if(clip.w<=0.)break;vec2 uv=clip.xy/clip.w*.5+.5;if(any(lessThan(uv,vec2(.002)))||any(greaterThan(uv,vec2(.998))))break;float sceneZ=linearDepth(texture(uDepth,uv).r),gap=clip.w-sceneZ;
  if(gap>0.&&gap<uSSRThickness+length(point-prev)*1.1&&oldGap<0.&&point.y>uLevel-.2){vec3 lo=prev,hi=point;vec2 hit=uv;for(int j=0;j<4;j++){vec3 mid=(lo+hi)*.5;vec4 cp=uVP*vec4(mid,1.);hit=cp.xy/cp.w*.5+.5;if(cp.w>linearDepth(texture(uDepth,hit).r))hi=mid;else lo=mid;}float edge=smoothstep(0.,.08,min(min(hit.x,hit.y),min(1.-hit.x,1.-hit.y)));return vec4(texture(uScene,hit).rgb,edge*(1.-f*.5));}oldGap=gap;prev=point;}return vec4(0.);}
-void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;if(wetDepth<.012)discard;
- vec3 n=waterNormalAt(vAnchor,vN),v=normalize(uEye-vP),sun=normalize(uSun);vec2 grad=-n.xz/max(.025,n.y);
+void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;
+ // Derivatives (normal guard, highlight filtering) come before discard, so quads stay complete.
+ vec3 n=waterNormalAt(vAnchor,vN);float rough=filteredWaterRoughness(vAnchor,n,max(.045,uRoughness*sqrt(260./max(10.,uSpecPower))));
+ if(wetDepth<.012)discard;
+ vec3 v=normalize(uEye-vP),sun=normalize(uSun);vec2 grad=-n.xz/max(.025,n.y);
  vec2 uv=gl_FragCoord.xy/uResolution;float surfaceZ=linearDepth(gl_FragCoord.z);
- vec2 refrUV=clamp(uv+n.xz*uRefraction*clamp(wetDepth*.25,.15,1.),vec2(.001),vec2(.999));float sceneZ=linearDepth(texture(uDepth,refrUV).r);if(sceneZ<surfaceZ+.025){refrUV=uv;sceneZ=linearDepth(texture(uDepth,uv).r);}float thick=clamp(sceneZ-surfaceZ,.02,40.);vec3 trans=exp(-uAbsorb*thick);vec3 col=texture(uScene,refrUV).rgb*trans+uBody*(1.-trans);
- vec3 r=reflect(-v,n);vec3 reflected=skyColor(r);if(uReflectionWeight>0.){vec3 planar=texture(uReflection,clamp(uv+n.xz*uReflectionDistortion,vec2(.001),vec2(.999))).rgb;reflected=mix(reflected,planar,uReflectionWeight*.72);}
- if(uSSR>.5&&uUnder<.5){vec4 hit=uTraceReady>.5?readStableReflection(uv,n,surfaceZ):traceReflection(vP+n*.05,r);reflected=mix(reflected,hit.rgb,hit.a*uSSRWeight);}
- float fresnel=uFresnel+(1.-uFresnel)*pow(1.-clamp(dot(n,v),0.,1.),uFresnelPower);col=mix(col,reflected,clamp(fresnel,.02,.96));
- float sharedWaterShade=sunVisibility(vP+n*.04)*waterShadow(vP+n*.12,sun);vec3 halfway=normalize(sun+v);float nh=max(0.,dot(n,halfway)),rough=filteredWaterRoughness(vAnchor,n,max(.045,uRoughness*sqrt(260./max(10.,uSpecPower)))),a2=rough*rough*rough*rough,denom=nh*nh*(a2-1.)+1.;float spec=a2/(3.14159265*denom*denom+1e-5);col+=uSunTint*min(32.,spec)*max(0.,dot(n,sun))*.075*uSpecStrength*uSunStrength*sharedWaterShade;
- // Thin, raised crests transmit more backlight than the troughs.
- float crest=smoothstep(.1,2.8,vSea.y),back=pow(max(0.,dot(v,-sun+n*.24)),3.);col+=vec3(.025,.58,.42)*uSunTint*(crest*(.12+back)*uSSS)*uSunStrength*(1.-fresnel);
- float lightVisibility=sharedWaterShade;col*=mix(.72,1.,lightVisibility);float foam=0.;if(uFoam>.5){float history=0.,fresh=0.,detail=.5;if(uHistory>.5&&all(lessThan(abs(vAnchor),vec2(26.)))){vec4 fh=texture(uFoamMap,(vAnchor+26.)/52.);history=unpackFoam(fh);fresh=fh.b;detail=fh.a;}float breaker=(1.-smoothstep(.52,.88,vSea.x))*smoothstep(-.3,.6,vSea.y);float slopeFoam=smoothstep(.8,1.8,length(grad))*smoothstep(.4,1.7,vSea.y)*.45;
+ float foam=0.;if(uFoam>.5){float history=0.,fresh=0.,detail=.5;if(uHistory>.5&&all(lessThan(abs(vAnchor),vec2(26.)))){vec4 fh=texture(uFoamMap,(vAnchor+26.)/52.);history=unpackFoam(fh);fresh=fh.b;detail=fh.a;}float breaker=(1.-smoothstep(.52,.88,vSea.x))*smoothstep(-.3,.6,vSea.y);float slopeFoam=smoothstep(.8,1.8,length(grad))*smoothstep(.4,1.7,vSea.y)*.45;
  float textureFoam=0.,noisy=noise2(vAnchor*4.)*.5+.5,ageMix=clamp(fresh/max(.001,history),0.,1.);
  if(uNaturalFoam>.5){
   float structure=mix(1.,smoothstep(.17,.74,detail),uFoamBreakup*(1.-ageMix*.8));
@@ -1648,9 +1677,23 @@ void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;if(wetDepth<.012)dis
   foam=max(history*(uFoamAging>.5?mix(oldMask,.78+.22*textureFoam,ageMix):(.52+.48*textureFoam)),max(breaker,slopeFoam)*(.65+.35*textureFoam));foam=max(foam,(1.-smoothstep(.03,uFoamWidth,wetDepth))*(.3+noisy*.5));foam+=smoothstep(1.,4.,length(f.zw))*uFlowFoam*noisy*.22;
  }
  if(uPathWakes<.5){vec2 bp=vP.xz-uBoat.xy;float bs=sin(uBoat.z),bc=cos(uBoat.z);vec2 local=vec2(bc*bp.x-bs*bp.y,bs*bp.x+bc*bp.y);float wake=exp(-abs(abs(local.x)-local.y*.39)*5.)*smoothstep(.4,1.5,local.y)*(1.-smoothstep(2.,10.,local.y))*clamp(uBoat.w*.18,0.,1.);foam=max(foam,wake*uWakeFoam*(.3+.4*textureFoam));}}
- vec3 lampDiffuse=localDiffuse(vP,n);vec3 foamCol=vec3(.73,.88,.91)*(uAmbient*.48+.4*max(0.,dot(n,sun))*uSunStrength*uSunTint+lampDiffuse*.65);col=mix(col,foamCol,clamp(foam,0.,uFoamOpacity));
- col+=localWater(vP,n,v,rough)*(1.-clamp(foam,0.,.8));float wakeRadius=length(vP.xz-uBoat.xy);col+=vec3(.006,.28,.63)*uBio*clamp(foam,0.,1.)*(.18+exp(-wakeRadius*.15)*clamp(uBoat.w*.3,0.,1.));
- if(uUnder>.5){
+ vec3 col;
+ // The underwater view replaces all above-water shading, so it is not evaluated there.
+ if(uUnder<.5){
+  vec2 refrUV=clamp(uv+n.xz*uRefraction*clamp(wetDepth*.25,.15,1.),vec2(.001),vec2(.999));float sceneZ=linearDepth(texture(uDepth,refrUV).r);if(sceneZ<surfaceZ+.025){refrUV=uv;sceneZ=linearDepth(texture(uDepth,uv).r);}float thick=clamp(sceneZ-surfaceZ,.02,40.);vec3 trans=exp(-uAbsorb*thick);col=texture(uScene,refrUV).rgb*trans+uBody*(1.-trans);
+  vec3 r=reflect(-v,n);vec3 reflected=skyColor(r);if(uReflectionWeight>0.){vec3 planar=texture(uReflection,clamp(uv+n.xz*uReflectionDistortion,vec2(.001),vec2(.999))).rgb;reflected=mix(reflected,planar,uReflectionWeight*.72);}
+  if(uSSR>.5){vec4 hit=uTraceReady>.5?readStableReflection(uv,n,surfaceZ):traceReflection(vP+n*.05,r);reflected=mix(reflected,hit.rgb,hit.a*uSSRWeight);}
+  float fresnel=uFresnel+(1.-uFresnel)*pow(1.-clamp(dot(n,v),0.,1.),uFresnelPower);col=mix(col,reflected,clamp(fresnel,.02,.96));
+  float lightVisibility=sunVisibility(vP+n*.04);if(lightVisibility>0.)lightVisibility*=waterShadow(vP+n*.12,sun);
+  vec3 halfway=normalize(sun+v);float nh=max(0.,dot(n,halfway)),a2=rough*rough*rough*rough,denom=nh*nh*(a2-1.)+1.;float spec=a2/(3.14159265*denom*denom+1e-5);col+=uSunTint*min(32.,spec)*max(0.,dot(n,sun))*.075*uSpecStrength*uSunStrength*lightVisibility;
+  // Thin, raised crests transmit more backlight than the troughs. Shaded crests receive none.
+  float crest=smoothstep(.1,2.8,vSea.y),back=pow(max(0.,dot(v,-sun+n*.24)),3.);col+=vec3(.025,.58,.42)*uSunTint*(crest*(.12+back)*uSSS)*uSunStrength*(1.-fresnel)*lightVisibility;
+  col*=mix(.72,1.,lightVisibility);
+  vec3 lampDiffuse=foam>.001?localDiffuse(vP,n):vec3(0.);vec3 foamCol=vec3(.73,.88,.91)*(uAmbient*.48+.4*max(0.,dot(n,sun))*uSunStrength*uSunTint*lightVisibility+lampDiffuse*.65);col=mix(col,foamCol,clamp(foam,0.,uFoamOpacity));
+  col+=localWater(vP,n,v,rough)*(1.-clamp(foam,0.,.8));float wakeRadius=length(vP.xz-uBoat.xy);col+=vec3(.006,.28,.63)*uBio*clamp(foam,0.,1.)*(.18+exp(-wakeRadius*.15)*clamp(uBoat.w*.3,0.,1.));
+  float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);if(fog>0.)col=mix(col,skyColor(normalize(vP-uEye)),fog);
+  if(uOpticsDebug>.5&&uTraceReady>.5){vec4 dr=readStableReflection(uv,n,surfaceZ);if(uOpticsDebug<1.5)col=mix(vec3(.08,.012,.025),vec3(.12,.8,.62),dr.a);else if(uOpticsDebug<2.5)col=mix(vec3(.3,.04,.02),vec3(.04,.85,.65),clamp((length(texture(uStableGeometry,uv).xyz)-1.)/.68,0.,1.));else col=texture(uStableReflection,uv).rgb;}
+ }else{
   vec3 I=-v,N=-n;float ci=clamp(dot(-I,N),0.,1.),sint2=uWaterIOR*uWaterIOR*(1.-ci*ci),tir=step(1.,sint2);
   float ct=sqrt(max(0.,1.-sint2));float rs=(uWaterIOR*ci-ct)/max(.0001,uWaterIOR*ci+ct),rp=(ci-uWaterIOR*ct)/max(.0001,ci+uWaterIOR*ct);float F=tir>.5?1.:clamp((rs*rs+rp*rp)*.5,0.,1.);
   vec3 refracted=refract(I,N,uWaterIOR),ceiling=uHaze;
@@ -1661,7 +1704,7 @@ void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;if(wetDepth<.012)dis
   col=mix(ceiling,underReflection,F);col+=vec3(.04,.14,.14)*foam*(uAmbient+uSunStrength*.3);vec3 tr=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));col=col*tr+uHaze*(1.-tr);
   if(uWindowDebug>.5&&uWindowDebug<1.5)col=mix(vec3(.08,.65,.36),vec3(.9,.22,.08),F);else if(uWindowDebug>1.5)col=ceiling;
  }
- float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);col=mix(col,skyColor(normalize(vP-uEye)),fog*(1.-uUnder));if(uOpticsDebug>.5&&uUnder<.5&&uTraceReady>.5){vec4 dr=readStableReflection(uv,n,surfaceZ);if(uOpticsDebug<1.5)col=mix(vec3(.08,.012,.025),vec3(.12,.8,.62),dr.a);else if(uOpticsDebug<2.5)col=mix(vec3(.3,.04,.02),vec3(.04,.85,.65),clamp((length(texture(uStableGeometry,uv).xyz)-1.)/.68,0.,1.));else col=texture(uStableReflection,uv).rgb;}outColor=vec4(max(col,0.),1.);
+ outColor=vec4(max(col,0.),1.);
 }`;
 const pointVS=`#version 300 es
 ${sharedGLSL}
@@ -1701,7 +1744,10 @@ void main(){vec2 p=vUV*52.-26.;vec4 f=fluid(p);if(f.y<.015){outColor=vec4(0.);re
  float seed=noise(p*3.5)*.65+noise(p*11.)*.35;
  detail=mix(detail,seed,clamp(deposited/max(.001,previous+deposited),0.,1.));
  detail=mix(detail,smoothstep(.08,.92,detail),clamp(uStep*.35,0.,.1));
- outColor=packFoam(density,clamp(young,0.,1.));outColor.a=clamp(detail,0.,1.);
+ // The age byte rounds to nearest, so small decays used to round back up and thin
+ // old foam stayed young. Stochastic rounding keeps the expected decay at any rate.
+ uint q=uint(gl_FragCoord.x)*1973u+uint(gl_FragCoord.y)*9277u+uint(uTime*240.)*26699u;q^=q>>16;q*=0x7feb352du;q^=q>>15;q*=0x846ca68bu;q^=q>>16;float dither=float(q>>8)/16777216.;
+ outColor=packFoam(density,min(255.,floor(clamp(young,0.,1.)*255.+dither))/255.);outColor.a=clamp(detail,0.,1.);
 }`;
 const surfaceWetFS=`#version 300 es
 ${sharedGLSL}
@@ -1821,8 +1867,8 @@ vec4 traceBounded(vec3 pos,vec3 ray,out float cost){
  }
  return vec4(0.);
 }
-void main(){vec4 f=fluid(vAnchor);if(f.y+vSea.y<.012)discard;vec2 uv=gl_FragCoord.xy/uTraceResolution;float z=eyeDepth(gl_FragCoord.z);if(z>eyeDepth(texture(uDepth,uv).r)+.015)discard;
- vec3 n=waterNormalAt(vAnchor,vN),v=normalize(uEye-vP);float cost;reflectionOut=traceBounded(vP+n*.07,reflect(-v,n),cost);geometryOut=vec4(n,z);
+void main(){vec4 f=fluid(vAnchor);vec3 n=waterNormalAt(vAnchor,vN);if(f.y+vSea.y<.012)discard;vec2 uv=gl_FragCoord.xy/uTraceResolution;float z=eyeDepth(gl_FragCoord.z);if(z>eyeDepth(texture(uDepth,uv).r)+.015)discard;
+ vec3 v=normalize(uEye-vP);float cost;reflectionOut=traceBounded(vP+n*.07,reflect(-v,n),cost);geometryOut=vec4(n,z);
  // A debug pass uses the same traversal, not an unrelated synthetic cost image.
  if(uDebugTrace==1)reflectionOut=vec4(mix(vec3(.02,.09,.2),vec3(1.,.24,.02),cost),1.);
 }
@@ -1950,8 +1996,8 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  makeTarget(w,h,hdr=false){let gl=this.gl,color=this.texture(hdr&&this.hdr?gl.RGBA16F:gl.RGBA8,w,h,gl.RGBA,hdr&&this.hdr?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,gl.LINEAR),depth=this.texture(gl.DEPTH_COMPONENT24,w,h,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,gl.NEAREST),fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,depth,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('The graphics device could not create the water render targets.');gl.bindFramebuffer(gl.FRAMEBUFFER,null);return{fbo,color,depth,w,h,bytesPerPixel:hdr&&this.hdr?12:8};}
  deleteTarget(t){if(!t)return;let gl=this.gl;gl.deleteFramebuffer(t.fbo);gl.deleteTexture(t.color);gl.deleteTexture(t.depth);}
  resize(){const gl=this.gl;let ratio=Math.min(devicePixelRatio||1,C.maxDPR)*C.renderScale,w=this.canvas.getBoundingClientRect().width||innerWidth,h=this.canvas.getBoundingClientRect().height||innerHeight;ratio=Math.min(ratio,Math.sqrt(C.maxPixels/(w*h)),this.maxDimension/Math.max(w,h));w=Math.max(2,Math.round(w*ratio));h=Math.max(2,Math.round(h*ratio));const rw=Math.max(2,Math.floor(w*C.reflectionScale)),rh=Math.max(2,Math.floor(h*C.reflectionScale));if(w===this.size[0]&&h===this.size[1]&&this.reflect?.w===rw&&this.reflect?.h===rh)return;this.canvas.width=w;this.canvas.height=h;this.size=[w,h];this.deleteTarget(this.scene);this.deleteTarget(this.reflect);this.deleteTarget(this.final);this.deleteTarget(this.bloom);this.scene=this.makeTarget(w,h,true);this.reflect=this.makeTarget(rw,rh,true);this.final=this.makeTarget(w,h,true);this.bloom=this.makeTarget(Math.max(2,w>>2),Math.max(2,h>>2),true);this.reflectionValid=false;}
- settings(p){this.bindAbyss(p);this.bindBeacon(p);const gl=this.gl;gl.uniform1f(p.name('uGrid'),N);gl.uniform1f(p.name('uDX'),DX);gl.uniform1f(p.name('uLevel'),this.water.level);gl.uniform1i(p.name('uWaveCount'),storm.count);gl.uniform4fv(p.name('uWave[0]'),storm.gpuW);gl.uniform3fv(p.name('uMode[0]'),storm.gpuA);
-  const singles={uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness};for(const k in singles)gl.uniform1f(p.name(k),singles[k]);
+ settings(p){this.bindAbyss(p);this.bindBeacon(p);const gl=this.gl;gl.uniform1f(p.name('uGrid'),N);gl.uniform1f(p.name('uDX'),DX);gl.uniform1f(p.name('uLevel'),this.water.level);gl.uniform1i(p.name('uWaveCount'),storm.count);gl.uniform4fv(p.name('uWave[0]'),storm.gpuW);gl.uniform3fv(p.name('uMode[0]'),storm.phases(this.water.time));
+  const singles={uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach()};for(const k in singles)gl.uniform1f(p.name(k),singles[k]);
   gl.uniform3fv(p.name('uSun'),lights.sun);const clarityScale=Math.pow(4,1-C.waterClarity/50);gl.uniform3f(p.name('uAbsorb'),C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale);const amb=.035+.965*lights.day;gl.uniform3f(p.name('uBody'),C.bodyR*amb,C.bodyG*amb,C.bodyB*amb);gl.uniform3f(p.name('uUnderAbsorb'),C.underR,C.underG,C.underB);gl.uniform3f(p.name('uHaze'),C.hazeR*amb,C.hazeG*amb,C.hazeB*amb);
  }
  makeWaterGrid(){const gl=this.gl,n=Math.round(C.visualGrid);if(n===this.waterGridSetting)return;
@@ -1981,7 +2027,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  saveEffects(){if(!this.foamTargets)return null;const gl=this.gl,t=this.foamTargets[this.foamRead];this.deleteTarget(this.foamSaved);this.foamSaved=this.colorTarget(t.w,t.h);gl.bindFramebuffer(gl.READ_FRAMEBUFFER,t.fbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,this.foamSaved.fbo);gl.blitFramebuffer(0,0,t.w,t.h,0,0,t.w,t.h,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.bindFramebuffer(gl.FRAMEBUFFER,null);return {time:this.foamTime,epoch:this.foamEpoch,lens:this.lensWet};}
  restoreEffects(state){if(!state||!this.foamSaved){this.resetEffects();return;}this.ensureFoam();const gl=this.gl,s=this.foamSaved,t=this.foamTargets[0];gl.bindFramebuffer(gl.READ_FRAMEBUFFER,s.fbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,t.fbo);gl.blitFramebuffer(0,0,s.w,s.h,0,0,t.w,t.h,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.bindFramebuffer(gl.FRAMEBUFFER,null);this.foamRead=0;this.foamTime=state.time;this.foamEpoch=state.epoch;this.lensWet=state.lens;this.deleteTarget(this.foamSaved);this.foamSaved=null;}
  full(p){const gl=this.gl;gl.bindVertexArray(this.copyVAO);gl.drawArrays(gl.TRIANGLES,0,3);profiler?.draw(1,0);}
- drawSky(vp,eye,game,reflection=0){const gl=this.gl,p=this.skyProgram;this.common(p,vp,eye,game,reflection);gl.uniformMatrix4fv(p.name('uInverseVP'),false,this.inverse(vp));gl.disable(gl.DEPTH_TEST);gl.depthMask(false);this.full(p);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);}
+ drawSky(vp,eye,game,reflection=0){const gl=this.gl,p=this.skyProgram;this.common(p,vp,eye,game,reflection);gl.uniformMatrix4fv(p.name('uInverseVP'),false,vp===this.vp&&this.invVP?this.invVP:this.inverse(vp));gl.disable(gl.DEPTH_TEST);gl.depthMask(false);this.full(p);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);}
  updateFoam(game){this.ensureFoam();if(this.water.epoch!==this.foamEpoch||this.water.time<this.foamTime)this.resetEffects();const elapsed=Math.max(0,this.water.time-this.foamTime);this.foamTime=this.water.time;if(!C.persistentFoam||!C.foam||elapsed<=0)return;
   const gl=this.gl,p=this.foamProgram,t=this.foamTargets[1-this.foamRead],dt=Math.min(elapsed,.12);if(profiler.current)profiler.current.foamClampedMs=Math.max(0,elapsed-dt)*1000;
   gl.bindFramebuffer(gl.FRAMEBUFFER,t.fbo);gl.viewport(0,0,t.w,t.h);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);gl.uniform1i(p.name('uHistoryMap'),5);this.texAt(this.foamTargets[this.foamRead].color,5);gl.uniform1f(p.name('uStep'),dt);gl.uniform1f(p.name('uFoamLife'),C.foamLifetime);gl.uniform1f(p.name('uFoamBirth'),C.foamBirth);gl.uniform1f(p.name('uFoamDrift'),C.foamDrift);gl.uniform4f(p.name('uBoat'),game.boat.x,game.boat.z,game.boat.yaw,Math.hypot(game.boat.vx,game.boat.vz));this.bindWakeSources(p,game);this.full(p);this.foamRead=1-this.foamRead;gl.enable(gl.DEPTH_TEST);
@@ -1999,7 +2045,9 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   let effectiveFov=C.fov;if(MOBILE_BRANCH&&C.mobileAdaptive&&aspect<1)effectiveFov=Math.min(90,Math.max(C.fov,Math.atan(Math.tan(C.mobileMinHFov*Math.PI/360)/aspect)*360/Math.PI));this.cameraFrame={aspect,orientation:aspect<1?'portrait':'landscape',verticalFov:effectiveFov,horizontalFov:Math.atan(Math.tan(effectiveFov*Math.PI/360)*aspect)*360/Math.PI,adaptive:MOBILE_BRANCH&&C.mobileAdaptive,mode};
   this.view=Mat.look(this.eye,this.target);this.proj=Mat.perspective(effectiveFov*Math.PI/180,aspect,.1,500);this.vp=Mat.mul(this.proj,this.view);this.invVP=this.inverse(this.vp);const was=this.underwater;this.underwater=this.eye[1]<this.water.surface(this.eye[0],this.eye[2])-.015;if(this.underwater&&!was)this.lensWet=1;
  }
- render(game,dt){const gl=this.gl;this.resize();this.makeWaterGrid();this.frame++;lights.update(game,this.water);this.camera(game,dt);profiler?.beginPass('upload');this.uploadSpectrum();this.water.pack();this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,this.water.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,this.water.wet);profiler?.endPass();
+ render(game,dt){const gl=this.gl;this.resize();this.makeWaterGrid();this.frame++;lights.update(game,this.water);this.camera(game,dt);profiler?.beginPass('upload');this.uploadSpectrum();
+  // Re-pack and upload only after the water changed. Writers outside Water.step set fluidDirty.
+  const ws=this.water;if(this.fluidDirty!==false||ws.time!==this.fluidTime||ws.epoch!==this.fluidEpoch||ws.level!==this.fluidLevel){ws.pack(this.fluidDirty!==false);this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,ws.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,ws.wet);this.fluidTime=ws.time;this.fluidEpoch=ws.epoch;this.fluidLevel=ws.level;this.fluidDirty=false;}profiler?.endPass();
   if(game.rescue?.active)this.prepareRescueMeshes(game);profiler?.beginPass('skyLight');this.updateSky(game);profiler?.endPass();
   profiler?.beginPass('localShadows');this.updateLampShadows(game);profiler?.endPass();
   profiler?.beginPass('waveCache');this.updateCache(game);profiler?.endPass();
@@ -2007,7 +2055,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   profiler?.beginPass('shadow');this.updateShadow(game);profiler?.endPass();
   profiler?.beginPass('causticFocus');this.updateFocus(game);profiler?.endPass();
   profiler?.beginPass('foamField');this.updateFoam(game);profiler?.endPass();gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);
-  let mirror=Mat.identity();mirror[5]=-1;mirror[13]=2*this.water.level;profiler?.beginPass('reflection');if(C.reflection&&!this.underwater&&(!this.reflectionValid||this.frame%C.reflectionEvery===0)){const vp=Mat.mul(this.vp,mirror),eye=[this.eye[0],2*this.water.level-this.eye[1],this.eye[2]];gl.bindFramebuffer(gl.FRAMEBUFFER,this.reflect.fbo);gl.viewport(0,0,this.reflect.w,this.reflect.h);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this.drawSky(vp,eye,game,1);this.drawScene(vp,eye,game,1);this.reflectionValid=true;}profiler?.endPass();
+  let mirror=Mat.identity();mirror[5]=-1;mirror[13]=2*this.water.level;profiler?.beginPass('reflection');if(!C.waterVisible||!(C.reflectionWeight>0))this.reflectionValid=false;else if(C.reflection&&!this.underwater&&(!this.reflectionValid||this.frame%C.reflectionEvery===0)){const vp=Mat.mul(this.vp,mirror),eye=[this.eye[0],2*this.water.level-this.eye[1],this.eye[2]];gl.bindFramebuffer(gl.FRAMEBUFFER,this.reflect.fbo);gl.viewport(0,0,this.reflect.w,this.reflect.h);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this.drawSky(vp,eye,game,1);this.drawScene(vp,eye,game,1);this.reflectionValid=true;}profiler?.endPass();
   profiler?.beginPass('airScene');this.updateAirScene(game);profiler?.endPass();
   profiler?.beginPass('opaque');gl.bindFramebuffer(gl.FRAMEBUFFER,this.scene.fbo);gl.viewport(0,0,...this.size);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this.drawSky(this.vp,this.eye,game);this.drawScene(this.vp,this.eye,game);profiler?.endPass();
   this.updateTracedReflections(game,dt);
@@ -2145,7 +2193,7 @@ class ContactPhysics{
   // m[7] is d(height)/dt at a fixed world point. Restore the material vertical
   // velocity before drag: sharp displaced crests must not act as a piston.
   let vy=m[7]+m[9]*m[6]+m[10]*m[8];if(!Number.isFinite(vy))vy=0;
-  pts.push({x,z,bottom,area,h:m[1],px:p[0],pz:p[2],gx:clamp(m[9],-3,3),gz:clamp(m[10],-3,3),vy,waterDepth:this.g.water.bilerp(this.g.water.h,p[0],p[2])});areaSum+=area;
+  pts.push({x,z,bottom,area,h:m[1]+(C.hullPressure?this.g.water.bilerp(this.g.water.pressure,m[12],m[13]):0),px:p[0],pz:p[2],gx:clamp(m[9],-3,3),gz:clamp(m[10],-3,3),vy,waterDepth:this.g.water.bilerp(this.g.water.h,p[0],p[2])});areaSum+=area;
  }a.samples=pts;a.area=areaSum;a.startX=b.x;a.startZ=b.z;a.startPitch=b.pitch;a.startRoll=b.roll;
  return a;
  }
@@ -2160,7 +2208,10 @@ class ContactPhysics{
   const F=h*(f+d*p.vy);B0+=F;B1+=F*jp;B2+=F*jr;force+=f;wet+=fraction/a.samples.length;waterVy+=p.vy*fraction/a.samples.length;if(fraction>.08)entry=Math.max(entry,-rel);
  }
  const ad=h*C.bodyAngularDrag*wet;A11+=ip*ad;A22+=ir*ad;
- const v=solveSymmetric3(A00,A01,A02,A11,A12,A22,B0,B1,B2);b.vy=v[0];b.pitchV=v[1];b.rollV=v[2];b.wetFraction=wet;b.heaveG=force/(s.m*9.81);b.airborne=wet<.025;
+ const v=solveSymmetric3(A00,A01,A02,A11,A12,A22,B0,B1,B2);b.vy=v[0];b.pitchV=v[1];b.rollV=v[2];b.wetFraction=wet;
+ // Columns have no topside buoyancy, so past ~70 deg the hull had no righting moment and
+ // stayed pinned at the roll limit. Right it while wet; normal motion is unaffected.
+ const exR=Math.abs(b.roll)-1.2,exP=Math.abs(b.pitch)-1.0;if(wet>.1){if(exR>0)b.rollV-=h*14*Math.sign(b.roll)*exR*wet;if(exP>0)b.pitchV-=h*14*Math.sign(b.pitch)*exP*wet;}b.heaveG=force/(s.m*9.81);b.airborne=wet<.025;
  a.entryCooldown=Math.max(0,a.entryCooldown-h);if(b.airborne)a.air+=h;
  if(a.air>.10&&wet>.08&&entry>C.entrySplashSpeed&&a.entryCooldown===0){this.stats.entries++;if(s.tug)this.g.slamCount++;a.entryCooldown=.5;this.emit(b.x,this.g.water.surface(b.x,b.z),b.z,[0,1,0],entry,'entry',b,s);a.air=0;}
  if(wet>.55)a.air=0;a.lastWet=wet;
@@ -2178,14 +2229,14 @@ class ContactPhysics{
  if(s.kind===1){b.vx+=(b.homeX-b.x)*h*2.2;b.vz+=(b.homeZ-b.z)*h*2.2;}
  const speed=Math.hypot(b.vx,b.vz),max=C.speedLimit*(s.tug?1:1.6);if(speed>max){b.vx*=max/speed;b.vz*=max/speed;}
  }
- solveStatic(b,s,c,h,first){const l=contactLever(b,s,c.p,c.n),relative=l.v-(c.surfaceVy||0)*c.n[1];
+ solveStatic(b,s,c,h,first,moved){const l=contactLever(b,s,c.p,c.n),relative=l.v-(c.surfaceVy||0)*c.n[1];
  let j=0;if(relative<0){const e=first&&-relative>C.contactBounceSpeed?C.contactRestitution:0;j=-(1+e)*relative/l.k;applyContactImpulse(b,s,l,c.n,j);
   // Tangential friction uses the same contact point and rotational inertia.
   const v=[b.vx,b.vy,b.vz],vn=v[0]*c.n[0]+v[1]*c.n[1]+v[2]*c.n[2],t=v.map((q,i)=>q-vn*c.n[i]),tl=Math.hypot(...t);
   if(tl>.00001){for(let i=0;i<3;i++)t[i]/=tl;const lt=contactLever(b,s,c.p,t),jt=clamp(-lt.v/lt.k,-C.contactFriction*j,C.contactFriction*j);applyContactImpulse(b,s,lt,t,jt);}
  }
  // Split position correction: penetration removal does not become launch speed.
- const push=clamp((c.depth-C.contactSlop)*.65,0,.085);b.x+=c.n[0]*push;b.y+=c.n[1]*push;b.z+=c.n[2]*push;
+ const depth=moved?c.depth-(moved[0]*c.n[0]+moved[1]*c.n[1]+moved[2]*c.n[2]):c.depth,push=clamp((depth-C.contactSlop)*.65,0,.085);b.x+=c.n[0]*push;b.y+=c.n[1]*push;b.z+=c.n[2]*push;if(moved){moved[0]+=c.n[0]*push;moved[1]+=c.n[1]*push;moved[2]+=c.n[2]*push;}
  b.contactHit=true;this.stats.maxPenetrationM=Math.max(this.stats.maxPenetrationM,c.depth);this.stats.maxImpulseNs=Math.max(this.stats.maxImpulseNs,j);
  if(first&&relative<-C.contactSplashSpeed)this.hit(b,s,c,-relative,j,'wall');
  }
@@ -2196,13 +2247,13 @@ class ContactPhysics{
  if(s.tug&&!this.g.free&&speed>1.5&&b.hitCooldown<=0){b.hull=Math.max(0,b.hull-(speed-1.5)*C.damageScale*.35);b.hitCooldown=.6;}
  }
  pairs(bodies,first){for(let i=0;i<bodies.length;i++)for(let j=i+1;j<bodies.length;j++){const [a,sa]=bodies[i],[b,sb]=bodies[j];if(Math.hypot(a.x-b.x,a.z-b.z)>(sa.length+sb.length)*.62||Math.abs(a.y-b.y)>2)continue;
-  const ra=contactRotation(a),rb=contactRotation(b),pa=collisionSpheres(sa),pb=collisionSpheres(sb),contacts=[];
-  for(const qa of pa){const p=localPoint(a,ra,...qa.slice(0,3));for(const qb of pb){const q=localPoint(b,rb,...qb.slice(0,3)),dx=p[0]-q[0],dy=p[1]-q[1],dz=p[2]-q[2],dist=Math.hypot(dx,dy,dz),sum=qa[3]+qb[3];if(dist>=sum)continue;
+  const ra=contactRotation(a),rb=contactRotation(b),pa=collisionSpheres(sa),pb=collisionSpheres(sb),wb=pb.map(qb=>localPoint(b,rb,qb[0],qb[1],qb[2])),contacts=[];
+  for(const qa of pa){const p=localPoint(a,ra,qa[0],qa[1],qa[2]);for(let ib=0;ib<pb.length;ib++){const qb=pb[ib],q=wb[ib],dx=p[0]-q[0],dy=p[1]-q[1],dz=p[2]-q[2],dist=Math.hypot(dx,dy,dz),sum=qa[3]+qb[3];if(dist>=sum)continue;
     const n=dist>1e-7?[dx/dist,dy/dist,dz/dist]:[1,0,0],point=p.map((v,k)=>v-n[k]*qa[3]);contacts.push({n,p:point,depth:sum-dist,key:'pair'+this.state(b).id});}}
-  contacts.sort((x,y)=>y.depth-x.depth);for(const c of contacts.slice(0,3)){const la=contactLever(a,sa,c.p,c.n),lb=contactLever(b,sb,c.p,c.n),rv=la.v-lb.v,k=la.k+lb.k;let impulse=0;
+  contacts.sort((x,y)=>y.depth-x.depth);const relMoved=[0,0,0];for(const c of contacts.slice(0,3)){const la=contactLever(a,sa,c.p,c.n),lb=contactLever(b,sb,c.p,c.n),rv=la.v-lb.v,k=la.k+lb.k;let impulse=0;
    if(rv<0){impulse=-(1+(first&&-rv>C.contactBounceSpeed?C.contactRestitution:0))*rv/k;applyContactImpulse(a,sa,la,c.n,impulse);applyContactImpulse(b,sb,lb,c.n,-impulse);
     const rel=[a.vx-b.vx,a.vy-b.vy,a.vz-b.vz],dot=rel.reduce((v,n,k)=>v+n*c.n[k],0),t=rel.map((v,k)=>v-c.n[k]*dot),tl=Math.hypot(...t);if(tl>1e-6){for(let k=0;k<3;k++)t[k]/=tl;const ta=contactLever(a,sa,c.p,t),tb=contactLever(b,sb,c.p,t),jt=clamp(-(ta.v-tb.v)/(ta.k+tb.k),-C.contactFriction*impulse,C.contactFriction*impulse);applyContactImpulse(a,sa,ta,t,jt);applyContactImpulse(b,sb,tb,t,-jt);}}
-   const d=clamp((c.depth-C.contactSlop)*.6,0,.08),ia=1/sa.m,ib=1/sb.m;for(const [axis,key]of [[0,'x'],[1,'y'],[2,'z']]){a[key]+=c.n[axis]*d*ia/(ia+ib);b[key]-=c.n[axis]*d*ib/(ia+ib);}a.contactHit=b.contactHit=true;
+   const d=clamp((c.depth-(relMoved[0]*c.n[0]+relMoved[1]*c.n[1]+relMoved[2]*c.n[2])-C.contactSlop)*.6,0,.08),ia=1/sa.m,ib=1/sb.m;for(const [axis,key]of [[0,'x'],[1,'y'],[2,'z']]){a[key]+=c.n[axis]*d*ia/(ia+ib);b[key]-=c.n[axis]*d*ib/(ia+ib);relMoved[axis]+=c.n[axis]*d;}a.contactHit=b.contactHit=true;
    this.stats.maxPenetrationM=Math.max(this.stats.maxPenetrationM,c.depth);this.stats.maxImpulseNs=Math.max(this.stats.maxImpulseNs,impulse);if(first&&rv<-C.contactSplashSpeed)this.hit(a,sa,c,-rv,impulse,'body');
   }
  }}
@@ -2217,7 +2268,7 @@ class ContactPhysics{
    // Safety stops do not bounce the angular velocity back into the hull.
    for(const[k,v,limit]of[['pitch','pitchV',C.pitchLimit],['roll','rollV',C.rollLimit]])if(Math.abs(b[k])>limit){b[k]=clamp(b[k],-limit,limit);b[v]=0;b.safetyClamps=(b.safetyClamps||0)+1;}
   }
-  const ct=performance.now();if(C.solidContacts)for(let it=0;it<C.contactIterations;it++){for(const[b,s]of bodies)for(const c of this.world.collect(b,s))this.solveStatic(b,s,c,h,it===0);this.pairs(bodies,it===0);}collisionMs+=performance.now()-ct;
+  const ct=performance.now();if(C.solidContacts)for(let it=0;it<C.contactIterations;it++){for(const[b,s]of bodies){const moved=[0,0,0];for(const c of this.world.collect(b,s))this.solveStatic(b,s,c,h,it===0,moved);}this.pairs(bodies,it===0);}collisionMs+=performance.now()-ct;
   for(const[b,s]of bodies)if(!['x','y','z','vx','vy','vz','pitch','roll','yaw'].every(k=>Number.isFinite(b[k]))){this.stats.faults++;if(r)r.faults++;Object.assign(b,{x:s.tug?g.home.x:b.homeX,z:s.tug?g.home.z:b.homeZ,y:2,vx:0,vy:0,vz:0,pitch:0,roll:0,yaw:0,pitchV:0,rollV:0,yawV:0});this.state(b).samples=[];}
  }
  g.boat.distance+=Math.hypot(g.boat.vx,g.boat.vz)*dt;
@@ -2264,7 +2315,7 @@ class Game{
  step(dt){
   if(this.paused)return;
   if(!this.started){this.water.time+=dt;spectrum.sync(this.water.time);this.boat.y=this.water.surface(this.boat.x,this.boat.z)+.055;return;}
-  this.elapsed+=dt;this.skyClock+=dt;if(C.orbitAuto)this.orbitClock+=dt;storm.sync();this.water.hullHead(this.boat);this.rescue?.stampPressure();if(C.simulation){for(let sub=0;sub<C.solverSubsteps;sub++)this.water.step(dt/C.solverSubsteps);}else this.water.time+=dt;spectrum.sync(this.water.time);let b=this.boat,[ix,iz]=this.steer(),input=Math.hypot(ix,iz),sample=this.water.sample(b.x,b.z);b.hitCooldown=Math.max(0,b.hitCooldown-dt);
+  this.elapsed+=dt;this.skyClock+=dt;if(C.orbitAuto)this.orbitClock+=dt;storm.sync();this.water.hullHead(this.boat);this.rescue?.stampPressure();if(C.simulation){const subs=Math.max(C.solverSubsteps,Math.ceil(dt*Math.sqrt(C.acceleration*PIPE_AREA)/(.4*DX)));for(let sub=0;sub<subs;sub++)this.water.step(dt/subs);}else this.water.time+=dt;this.water.refreshSurface();spectrum.sync(this.water.time);let b=this.boat,[ix,iz]=this.steer(),input=Math.hypot(ix,iz),sample=this.water.sample(b.x,b.z);b.hitCooldown=Math.max(0,b.hitCooldown-dt);
   this.physics.step(dt,ix,iz);this.rescue?.step(dt);const speed=Math.hypot(b.vx,b.vz),hit=!!b.contactHit,s=Math.sin(b.yaw),c=Math.cos(b.yaw);
   b.propInput=input;this.advanceSurfaceWakes(dt);b.wakeClock+=dt;if(!C.persistentWakes&&b.wakeClock>C.wakeInterval&&speed>.35&&!hit&&b.wetFraction>.2){b.wakeClock=0;let wx=b.x+s*.76,wz=b.z+c*.76;this.water.impulse(wx,wz,Math.min(1.1,speed*C.wakeImpulse),C.wakeRadius);for(let n=0;n<C.wakeDensity;n++)for(let side of[-1,1])this.addParticle(wx+c*(.29+.14*(n+.5)/C.wakeDensity)*side+s*(n/C.wakeDensity)*.16,wz-s*(.29+.14*(n+.5)/C.wakeDensity)*side+c*(n/C.wakeDensity)*.16,{foam:true,vx:sample.x*.5+c*side*.15,vz:sample.z*.5-s*side*.15,size:.18+speed*.018,life:C.foamLife+rand()*1.4});if(speed>2.3&&rand()<.4)this.splash(wx,wz,2,.35);}
   for(let g of (C.environment===0?this.water.gates:[]))if(g.value>.3){const expected=dt*15*C.spawnRate,emissions=Math.floor(expected)+(rand()<expected%1?1:0);for(let n=0;n<emissions;n++){let ss=this.water.sample(g.x,g.z+.65);if(Math.hypot(ss.x,ss.z)>.45)this.addParticle(g.x+(rand()-.5)*3,g.z+.7,{foam:true,life:2,size:.25,vx:ss.x,vz:ss.z});}}
@@ -2324,14 +2375,16 @@ class Game{
   $('waterHint').textContent=this.collected===3&&!this.free?'Close intake + open outlet. The harbour is safe at ≤ 1.15 m.':a&&o?'Both open: water runs through. Close the outlet to store water.':a&&!o?'Filling the lagoon. The high shoal becomes navigable at about 1.65 m.':!a&&!o?'Both closed. The lagoon holds its water; currents slowly settle.':'Close the outlet and open the intake to reach the high shoals.';
  }
  finish(won){if(this.result)return;this.result=won?'won':'lost';this.paused=true;clearInput();$('finishEyebrow').textContent=won?'ALL LIGHTS ACCOUNTED FOR':'THE SEA GETS ANOTHER STORY';$('finishTitle').textContent=won?'A brighter harbour.':'A little too close.';$('finishText').textContent=won?"Three little lights, back where they belong. You didn't fight the water. You gave it somewhere to go.":'Your skiff took too many knocks. Let the lagoon rise before crossing the shoals, or explore without damage in free sail.';$('finalTime').textContent=timeLabel(this.elapsed);$('finalHull').textContent=Math.ceil(this.boat.hull)+'%';$('finalGates').textContent=this.gateMoves;showModal('finish');if(won)this.sound.chime('win');}
- recover(){this.boat.x=this.home.x;this.boat.z=this.home.z;this.boat.vx=this.boat.vz=this.boat.vy=0;this.boat.y=this.water.surface(this.home.x,this.home.z)+.06;this.boat.anchor=false;if(!this.free)this.boat.hull=Math.max(0,this.boat.hull-10);hideModal('pause');this.paused=false;this.updateTools();if(this.boat.hull<=0)this.finish(false);else toast('Harbour recovery complete. Cargo kept aboard.',3);}
+ recover(){if(this.rescue?.attached){this.rescue.attached=false;this.rescue.tension=0;}const rb=this.boat;rb.pitch=rb.roll=0;rb.pitchV=rb.rollV=rb.yawV=0;this.boat.x=this.home.x;this.boat.z=this.home.z;this.boat.vx=this.boat.vz=this.boat.vy=0;this.boat.y=this.water.surface(this.home.x,this.home.z)+.06;this.boat.anchor=false;if(!this.free)this.boat.hull=Math.max(0,this.boat.hull-10);hideModal('pause');this.paused=false;this.updateTools();if(this.boat.hull<=0)this.finish(false);else toast('Harbour recovery complete. Cargo kept aboard.',3);}
 }
 /* --------------------------------------------------------------------------
    Projected annotations and current glyphs — lightweight 2D overlay. The game
    and water stay fully 3D; labels remain crisp at native CSS resolution.
    ------------------------------------------------------------------------ */
 function drawOverlay(game,renderer,ctx){
- const scale=Math.min(devicePixelRatio||1,2),w=innerWidth,h=innerHeight,canvas=ctx.canvas;if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}ctx.setTransform(scale,0,0,scale,0,0);ctx.clearRect(0,0,w,h);if(game.dive||!C.overlay||C.environment!==0)return;
+ const scale=Math.min(devicePixelRatio||1,2),w=innerWidth,h=innerHeight,canvas=ctx.canvas;if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}
+ // Only the Sluice scene draws here. An idle overlay that is already clear is left alone.
+ const idle=game.dive||!C.overlay||C.environment!==0;if(idle&&!canvas.overlayDrawn)return;ctx.setTransform(scale,0,0,scale,0,0);ctx.clearRect(0,0,w,h);canvas.overlayDrawn=!idle;if(idle)return;
  const project=(x,y,z)=>renderer.project(x,y,z),water=game.water,t=water.time;
  const pathRing=(x,z,r,y)=>{ctx.beginPath();for(let k=0;k<=48;k++){let a=k/48*TAU,p=project(x+Math.cos(a)*r,y,z+Math.sin(a)*r);if(k===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);}};
  if(game.showFlow&&game.started){ctx.lineWidth=1;for(let z=-13;z<12;z+=2.0)for(let x=-14;x<=14;x+=2.0){let s=water.sample(x,z),l=Math.hypot(s.x,s.z);if(s.depth<.15||l<.022)continue;let d=clamp(l*.75,.35,1.2),a=project(x,s.height+.08,z),b=project(x+s.x/l*d,s.height+.08,z+s.z/l*d),angle=Math.atan2(b.y-a.y,b.x-a.x);ctx.strokeStyle='rgba(226,250,225,'+clamp(.32+l*.12,.32,.75)+')';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.moveTo(b.x-Math.cos(angle-.6)*4,b.y-Math.sin(angle-.6)*4);ctx.lineTo(b.x,b.y);ctx.lineTo(b.x-Math.cos(angle+.6)*4,b.y-Math.sin(angle+.6)*4);ctx.stroke();}}
@@ -2446,14 +2499,14 @@ SCENES.push(
  {id:'arcadeNight',label:'Arcade / night pools',environment:2,level:1,anchor:true,x:0,z:7,look:{dayHour:0,waveScale:1.5,fftHeight:.15,cameraMode:3,orbitYaw:5,orbitRadius:25,orbitHeight:7}},
  {id:'beaconDusk',label:'Beacon / dusk',environment:1,level:1.15,anchor:false,x:-3,z:4,look:{dayHour:18.8,waveScale:4.6,fftHeight:.30,cameraMode:3,orbitYaw:24,orbitRadius:34,orbitHeight:11}});
 function testScenes(mode,scene){if(mode==='suite')return SCENES.slice(0,6);if(mode==='verify')return SCENES.filter(s=>['flow','stress','underwater'].includes(s.id));if(mode==='lighting')return ['beaconDawn','beaconNight','arcadeDive'].map(id=>SCENES.find(s=>s.id===id));if(mode==='lightTour')return SCENES.slice(6);if(['lightAudit','skyCache'].includes(mode))return [SCENES.find(s=>s.id==='beaconNight')];return SCENES.filter(s=>s.id===(mode==='soak'?'stress':scene));}
-function applyBasinLevel(level){for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i,x=i*DX-HALF,z=j*DX-HALF;if(C.environment!==0||z>-16.25&&z<12.25&&Math.abs(x)<21)water.h[k]=Math.max(0,level-water.bed[k]);}water.flux.fill(0);water.ux.fill(0);water.uz.fill(0);water.level=water.previousLevel=level;water.pack();game.boat.y=water.surface(game.boat.x,game.boat.z)+.06;game.boat.vy=0;}
+function applyBasinLevel(level){for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i,x=i*DX-HALF,z=j*DX-HALF;if(C.environment!==0||z>-16.25&&z<12.25&&Math.abs(x)<21)water.h[k]=Math.max(0,level-water.bed[k]);}water.flux.fill(0);water.ux.fill(0);water.uz.fill(0);water.level=water.previousLevel=level;water.pack(true);if(renderer)renderer.fluidDirty=true;game.boat.y=water.surface(game.boat.x,game.boat.z)+.06;game.boat.vy=0;}
 class Benchmark{
  constructor(owner){this.owner=owner;this.active=false;this.automatic=false;this.finishing=false;this.stage='idle';this.queue=[];this.current=null;this.job=null;this.saved=null;this.samplesTotal=0;this.sceneTime=0;this.stressClock=0;this.a=recall((MOBILE_BRANCH?'tideline.touch.baseline.v1':'tideline.breakwater.baseline.v4'),null);if(this.a?.schema!==2)this.a=null;}
  get locked(){return this.active&&this.automatic||this.finishing||this.owner.diagnostic||this.owner.resultHeld;}
  snapshot(){const w={arrays:{},numbers:{},gates:cloneJSON(water.gates)};for(const [k,v]of Object.entries(water)){if(ArrayBuffer.isView(v)&&!['bed','neighbors','edgeGate'].includes(k))w.arrays[k]=new v.constructor(v);else if(typeof v==='number')w.numbers[k]=v;}
   return{water:w,rescue:game.rescue?.snapshot(),game:{boat:cloneJSON(game.boat),cells:cloneJSON(game.cells),values:Object.fromEntries(Object.entries(game).filter(([k,v])=>typeof v==='number'||typeof v==='boolean'||typeof v==='string'||v===null)),particles:cloneJSON(game.particles),home:{...game.home}},effects:renderer.saveEffects(),settings:{...C},seed,eye:[...renderer.eye],target:[...renderer.target],body:document.body.className,modals:Object.fromEntries(['help','pause','finish','intro'].map(k=>[k,$(k).classList.contains('hidden')])),sound:sound.enabled};
  }
- restore(){if(!this.saved)return;const s=this.saved;Object.assign(C,s.settings);DT=1/C.simHz;seed=s.seed;storm.sync();water.setWorld(C.environment);renderer.useWorld(C.environment);renderer.restoreEffects(s.effects);for(const[k,v]of Object.entries(s.water.arrays))water[k].set(v);Object.assign(water,s.water.numbers);water.gates.forEach((g,i)=>Object.assign(g,s.water.gates[i]));spectrum.sync(water.time,true);Object.assign(game,s.game.values);game.boat=s.game.boat;game.cells=s.game.cells;game.particles=s.game.particles;game.home=s.game.home;game.rescue=new Rescue(game);if(s.rescue)game.rescue.restore(s.rescue);game.physics=new ContactPhysics(game);lights.update(game,water);renderer.skyReady=false;renderer.eye=s.eye;renderer.target=s.target;renderer.reflectionValid=false;document.body.className=s.body;for(const [k,hidden]of Object.entries(s.modals))$(k).classList.toggle('hidden',hidden);sound.enabled=s.sound;sound.updateButton();game.updateTools();game.updateUI();clearInput();accumulator=0;this.saved=null;this.owner.syncAll();}
+ restore(){if(!this.saved)return;const s=this.saved;Object.assign(C,s.settings);DT=1/C.simHz;seed=s.seed;storm.sync();water.setWorld(C.environment);renderer.useWorld(C.environment);renderer.restoreEffects(s.effects);for(const[k,v]of Object.entries(s.water.arrays))water[k].set(v);Object.assign(water,s.water.numbers);renderer.fluidDirty=true;water.gates.forEach((g,i)=>Object.assign(g,s.water.gates[i]));spectrum.sync(water.time,true);Object.assign(game,s.game.values);game.boat=s.game.boat;game.cells=s.game.cells;game.particles=s.game.particles;game.home=s.game.home;game.rescue=new Rescue(game);if(s.rescue)game.rescue.restore(s.rescue);game.physics=new ContactPhysics(game);lights.update(game,water);renderer.skyReady=false;renderer.eye=s.eye;renderer.target=s.target;renderer.reflectionValid=false;document.body.className=s.body;for(const [k,hidden]of Object.entries(s.modals))$(k).classList.toggle('hidden',hidden);sound.enabled=s.sound;sound.updateButton();game.updateTools();game.updateUI();clearInput();accumulator=0;this.saved=null;this.owner.syncAll();}
  options(){const raw=Number($('benchBudget').value),totalSeconds=[10,15,30,60].includes(raw)?raw:60,mode=$('benchMode').value;return{totalSeconds,activeSeconds:totalSeconds-BENCH_RESERVE_MS/1000,warmup:totalSeconds>=60?1.25:.5,seconds:4,repeats:['ab','audit','cache','verify','lighting','lightAudit','skyCache'].includes(mode)?2:1,scene:$('benchScene').value,mode};}
  variants(mode,base){if(mode==='lightAudit')return[{name:'Local lights off',settings:{...base,localLights:false}},{name:'Local lights on',settings:{...base,localLights:true}}];if(mode==='skyCache')return[{name:'Sky reuse off',settings:{...base,skyCache:false}},{name:'Sky reuse on',settings:{...base,skyCache:true}}];if(mode==='audit'){const off={...base,slamDamping:0};UPGRADE_KEYS.forEach(k=>off[k]=false);return[{name:'Base',settings:off},{name:'Upgrade',settings:base}];}if(mode==='cache')return[{name:'Cache off',settings:{...base,waveCache:false}},{name:'Cache on',settings:{...base,waveCache:true}}];if(mode==='ab')return[{name:'A',settings:this.a?.settings||base},{name:'B',settings:base}];if(mode==='effects'){const v=[{name:'Reference',settings:base}];for(const[k,name]of[['localFog','Light beams off'],['localShadows','Local shadows off'],['localLights','Local lights off'],['skyCache','Sky reuse off'],['spectral','FFT waves off'],['sunShadows','Shadows off'],['focusedCaustics','Focused light off'],['hullPressure','Hull pressure off'],['quadraticDrag','Quadratic drag off'],['softParticles','Soft particles off'],['ssr','SSR off'],['persistentFoam','Foam history off'],['bloom','Bloom off'],['reflection','Reflection off'],['particles','Particles off'],['caustics','Caustics off'],['foam','Foam off'],['simulation','Water solver off'],['waterVisible','Water surface off']])if(base[k])v.push({name,settings:{...base,[k]:false}});return v;}if(mode==='pixels')return[.5,.75,1,1.25].map(x=>({name:'Scale ×'+x,settings:{...base,renderScale:clamp(base.renderScale*x,.4,2)}}));if(mode==='simulation')return[1,2,4,8].map(x=>({name:x+' water substep'+(x===1?'':'s'),settings:{...base,solverSubsteps:x}}));return[{name:'Current',settings:base}];}
  start(automatic=true){
@@ -2669,7 +2722,7 @@ class Lab{
  searchControls(){const q=$('paramSearch').value.trim().toLowerCase();for(const group of $('parameterGroups').querySelectorAll('.paramGroup')){let visible=0;for(const row of group.querySelectorAll('.paramRow')){const p=PARAMS.find(p=>p.key===row.dataset.param),show=!q||[p.label,p.key,p.group,p.note].join(' ').toLowerCase().includes(q);row.hidden=!show;if(show)visible++;}group.hidden=visible===0;if(q&&visible)group.open=true;}}
  togglePin(key){const i=this.pins.indexOf(key);if(i>=0)this.pins.splice(i,1);else if(this.pins.length<10){this.pins.push(key);this.pinsVisible=true;}else{this.message('Ten controls are already pinned. Unpin one before you add another.');toast('Pin limit: 10. Remove one control first.',3);return;}store((MOBILE_BRANCH?'tideline.touch.pins.v1':'tideline.breakwater.pins.v4'),this.pins);this.renderPins();for(const b of document.querySelectorAll('button[data-pin]')){const pinned=this.pins.includes(b.dataset.pin);b.classList.toggle('pinned',pinned);b.setAttribute('aria-label',(pinned?'Unpin ':'Pin ')+(this.allParameters.find(p=>p.key===b.dataset.pin)?.label||b.dataset.pin));if(!b.closest('#pinControls'))b.textContent=pinned?'Unpin':'Pin';}this.lockUI();}
  movePin(key,d){const i=this.pins.indexOf(key),j=i+d;if(i<0||j<0||j>=this.pins.length)return;[this.pins[i],this.pins[j]]=[this.pins[j],this.pins[i]];store((MOBILE_BRANCH?'tideline.touch.pins.v1':'tideline.breakwater.pins.v4'),this.pins);this.renderPins();}
- set(key,value){if(this.bench.locked)return false;const p=this.allParameters.find(p=>p.key===key);if(!p)return false;const v=validSetting(p,value);if(v===undefined){this.syncKey(p);return false;}const old=p.get?p.get():C[key];if(key==='environment'&&old!==v)return chooseWorld(v,false);if(key==='dayHour')game.skyClock=0;if(key==='dayCycle'&&old!==v){if(old)C.dayHour=lights.hour;game.skyClock=0;this.syncKey(this.allParameters.find(p=>p.key==='dayHour'));}if(key==='orbitAuto'&&old!==v){if(old)C.orbitYaw=(C.orbitYaw+game.orbitClock*C.orbitRate+540)%360-180;game.orbitClock=0;this.syncKey(this.allParameters.find(p=>p.key==='orbitYaw'));}if(p.set){p.set(v);game.updateTools();}else{C[key]=v;if(key==='simHz'){DT=1/C.simHz;accumulator=0;}if(key==='ripples'&&!v){water.ripple.fill(0);water.rv.fill(0);water.rnext.fill(0);}this.persist();}if(old!==v)profiler.note('setting-change',{key,from:old,to:v,runtime:!!p.set});if(key==='dayHour'||key==='dayCycle')lights.update(game,water);this.syncKey(p);gallerySync();this.structuralNotice();this.applyPanelState();this.planDescription();$('settingsHash').textContent='CONFIG '+hashSettings(settingsCopy());return true;}
+ set(key,value){if(this.bench.locked)return false;const p=this.allParameters.find(p=>p.key===key);if(!p)return false;const v=validSetting(p,value);if(v===undefined){this.syncKey(p);return false;}const old=p.get?p.get():C[key];if(key==='environment'&&old!==v)return chooseWorld(v,false);if(key==='dayHour')game.skyClock=0;if(key==='dayCycle'&&old!==v){if(old)C.dayHour=lights.hour;game.skyClock=0;this.syncKey(this.allParameters.find(p=>p.key==='dayHour'));}if(key==='orbitAuto'&&old!==v){if(old)C.orbitYaw=(C.orbitYaw+game.orbitClock*C.orbitRate+540)%360-180;game.orbitClock=0;this.syncKey(this.allParameters.find(p=>p.key==='orbitYaw'));}if(p.set){p.set(v);game.updateTools();}else{C[key]=v;if(key==='simHz'){DT=1/C.simHz;accumulator=0;}if(key==='ripples'&&!v){water.ripple.fill(0);water.rv.fill(0);water.rnext.fill(0);renderer.fluidDirty=true;}this.persist();}if(old!==v)profiler.note('setting-change',{key,from:old,to:v,runtime:!!p.set});if(key==='dayHour'||key==='dayCycle')lights.update(game,water);this.syncKey(p);gallerySync();this.structuralNotice();this.applyPanelState();this.planDescription();$('settingsHash').textContent='CONFIG '+hashSettings(settingsCopy());return true;}
  syncKey(p){const value=p.get?p.get():C[p.key];for(const input of document.querySelectorAll('input[data-key="'+p.key+'"]')){if(input.type==='checkbox')input.checked=value;else if(input!==document.activeElement)input.value=typeof value==='number'?+value.toFixed(6):value;}}
  syncAll(){gallerySync();for(const p of this.allParameters)this.syncKey(p);this.structuralNotice();this.applyPanelState();$('settingsHash').textContent='CONFIG '+hashSettings(settingsCopy());}
  persist(){clearTimeout(this.saveTimer);this.saveTimer=setTimeout(()=>store(SETTINGS_KEY,{schema:2,settings:{...C}}),250);}
@@ -2680,7 +2733,10 @@ class Lab{
  lockUI(){gallerySync();const locked=this.bench.locked,active=this.bench.active||this.bench.finishing;for(const id of ['benchMode','benchScene','benchWarm','benchSeconds','benchRepeats','benchBudget','profile1','profile4','profile10','stormTest','rogueNow','stormCamera','benchRun','benchQuick','benchStandard','benchEndurance','benchAudit','saveA','settingsSave','settingsLoad','settingsReset','applyStructure','pageMemory','numericalTest','fftTest','setLevel','setLevelValue','devSplash','recoverBoat','missionStart','freeStart'])$(id).disabled=id==='pageMemory'||id==='numericalTest'?active||this.diagnostic:locked||active&&id.startsWith('bench');for(const input of document.querySelectorAll('input[data-key]'))input.disabled=locked;$('benchStop').disabled=!this.bench.active;$('manualRecord').disabled=this.bench.finishing||this.diagnostic;$('manualRecord').textContent=this.bench.active?'Stop recording':'Record play  F6';$('labPanel').classList.toggle('running',locked);}
  setupDrag(){for(const handle of document.querySelectorAll('[data-drag]')){const panel=$(handle.dataset.drag);let drag=null;handle.addEventListener('pointerdown',e=>{if(e.target.closest('button'))return;const r=panel.getBoundingClientRect();drag={x:e.clientX-r.left,y:e.clientY-r.top};handle.setPointerCapture(e.pointerId);e.preventDefault();});handle.addEventListener('pointermove',e=>{if(!drag)return;const x=clamp(e.clientX-drag.x,4,Math.max(4,innerWidth-panel.offsetWidth-4)),y=clamp(e.clientY-drag.y,65,Math.max(65,innerHeight-Math.min(panel.offsetHeight,innerHeight-130)-60));panel.style.left=x+'px';panel.style.top=y+'px';panel.style.right='auto';panel.style.bottom='auto';this.dragPositions[panel.id]={x,y};});const stop=()=>{if(drag)store('tideline.lab.positions.v2',this.dragPositions);drag=null;};handle.addEventListener('pointerup',stop);handle.addEventListener('pointercancel',stop);const saved=this.dragPositions[panel.id];if(saved&&Number.isFinite(saved.x)&&Number.isFinite(saved.y)){panel.style.left=saved.x+'px';panel.style.top=saved.y+'px';panel.style.right='auto';panel.style.bottom='auto';}}this.clampFloatPanels();}
  clampFloatPanels(){for(const id of ['perfHUD','pinPanel']){const p=$(id);if(!p||p.classList.contains('hidden')||!p.style.top)continue;p.style.left=clamp(parseFloat(p.style.left)||4,4,Math.max(4,innerWidth-p.offsetWidth-4))+'px';p.style.top=clamp(parseFloat(p.style.top)||65,65,Math.max(65,innerHeight-p.offsetHeight-60))+'px';}}
- tick(now){if(this.resultHeld)return;if(now-this.lastTick<1000/C.hudHz)return;this.lastTick=now;this.bench.active&&this.bench.updateProgress(now);const frames=profiler.window(now),s=summarize(frames);this.lastSummary=s;
+ tick(now){if(this.resultHeld)return;if(now-this.lastTick<1000/C.hudHz)return;this.lastTick=now;this.bench.active&&this.bench.updateProgress(now);
+  // A summary scans the whole frame window. Skip it while no view displays one.
+  if(!this.hudVisible&&!this.panelOpen&&!mobileUI?.showStats){for(const p of this.runtime)if(this.pins.includes(p.key))this.syncKey(p);return;}
+  const frames=profiler.window(now),s=summarize(frames);this.lastSummary=s;
   const state=this.bench.active?(this.bench.stage==='warmup'?'WARM-UP':'RECORDING'):game.paused?'PAUSED':C.monitor?'FREE SAIL':'MONITOR OFF';$('liveState').textContent=state;$('labFootState').textContent=state+' · '+N+' × '+N;
   $('liveFPS').textContent=C.monitor?fmt(s.fps,1):'OFF';$('liveFrame').textContent=fmt(s.frame.p95);$('liveCPU').textContent=fmt(s.cpu.p95);$('liveGPU').textContent=fmt(s.gpu.p95);$('gpuState').textContent=!profiler.ext?'Unavailable in this browser':!C.gpuTiming?'GPU sampling off':s.gpu.n?`${s.gpu.n} samples · ${Math.round(s.gpuCoverage*100)}% coverage`:'Waiting for valid GPU samples';
   const memory=profiler.memory();$('liveMemory').textContent='JS heap ≈ '+mib(memory.heap.used)+' · not process RAM';$('liveDraws').textContent=`${fmt(s.drawCalls.mean,0)} draws · ${fmt(s.triangles.mean/1000,1)}k triangles · ${game.particles.length} particles`;
@@ -2840,7 +2896,7 @@ const coastRead=new Float64Array(6);
 function coastalSample(x,z,t,depth,out=coastRead){
  const u=clamp((z-3.5)/6,0,1),shelter=1-(1-C.harbourShelter)*u*u*(3-2*u),ds=-(1-C.harbourShelter)*u*(1-u);
  const k=TAU/(C.reefPeriod*C.reefSpeed),w=TAU/C.reefPeriod,zb=-5.8+.038*x*x,b=(z-zb)/C.reefWidth,env=Math.exp(-1.6*b*b),ex=env*3.2*b*.076*x/C.reefWidth,ez=-env*3.2*b/C.reefWidth;
- const phase=k*(z-.038*x*x)-t*w,shape=Math.sin(phase)-.32*Math.cos(2*phase),grad=Math.cos(phase)+.64*Math.sin(2*phase),a=C.reefHeight*sstep(.08,.65,depth)*(C.waves?1:0);
+ const phase=k*(z-.038*x*x)-t*w,shape=Math.sin(phase)-.32*Math.cos(2*phase),grad=Math.cos(phase)+.64*Math.sin(2*phase),a=C.reefHeight*sstep(.08,.65,depth)*(1-sstep(4.5,6.5,z)*sstep(4.7,5.6,Math.abs(x)))*(C.waves?1:0);
  out[0]=shelter;out[1]=ds;out[2]=a*env*shape;out[3]=a*(ex*shape+env*grad*(-.076*x*k));out[4]=a*(ez*shape+env*grad*k);out[5]=-a*env*grad*w;return out;
 }
 function rescueTerrain(x,z){
@@ -2874,7 +2930,6 @@ function rescueScenery(){
  return b;
 }
 function bodyModel(b,sx=1,sy=1,sz=1){return Mat.model(b.x,b.y,b.z,sx,sy,sz,b.yaw,b.pitch,b.roll);}
-function bodyEndpoint(b,z){return Mat.transform(bodyModel(b),[0,.22,z]);}
 function makeWorkboat(){
  const b=makeBoat();for(let i=0;i<b.v.length;i+=9){const r=b.v[i+6],g=b.v[i+7],blue=b.v[i+8];if(r>g*1.3){b.v[i+6]=.10+r*.12;b.v[i+7]=.24+g*.25;b.v[i+8]=.39+blue*.2;}}
  b.box(0,.68,.08,.68,.70,.63,[.81,.82,.73]);b.box(0,1.055,.08,.77,.12,.74,[.18,.31,.39]);b.box(0,.79,-.242,.54,.30,.015,[.09,.23,.28]);
@@ -2888,7 +2943,7 @@ class Rescue{
  ensureObjects(){const desired=2+Math.round(C.extraFloaters);if(this.objects.length===desired)return;this.objects=this.objects.slice(0,desired);while(this.objects.length<desired){const i=this.objects.length,b=i<2?newBody(i===0?-5:5,5,1):newBody(-12+((i-2)%6)*3,10+Math.floor((i-2)/6)*3,2);b.y=this.game.water.surface(b.x,b.z);this.objects.push(b);}}
  snapshot(){return cloneJSON({target:this.target,objects:this.objects,attached:this.attached,broken:this.broken,mission:this.mission,complete:this.complete,dwell:this.dwell,tension:this.tension,peakTension:this.peakTension,overload:this.overload,breaks:this.breaks,collisions:this.collisions,groundContacts:this.groundContacts,faults:this.faults,maxStretch:this.maxStretch,emitClock:this.emitClock,ropeWork:this.ropeWork});}
  restore(s){Object.assign(this,cloneJSON(s));}
- endpoints(){return [bodyEndpoint(this.game.boat,.89),bodyEndpoint(this.target,-1.42)];}
+ endpoints(){const a=this.game.boat,b=this.target;return [localPoint(a,contactRotation(a),0,.22,.89),localPoint(b,contactRotation(b),0,.22,-1.42)];}
  toggleTow(force=false){if(!this.active||(!force&&(lab?.bench.locked||this.game.paused)))return false;if(this.attached){this.attached=false;this.tension=0;toast('Tow line released.');return true;}
   const [a,b]=this.endpoints(),dist=Math.hypot(...a.map((v,i)=>v-b[i]));if(dist>C.towAttachRange){toast('Move within '+C.towAttachRange.toFixed(1)+' m of the blue boat.');return false;}
   this.attached=true;this.broken=false;this.overload=0;C.towLength=clamp(dist+.25,2.5,14);lab?.syncKey(PARAMS.find(p=>p.key==='towLength'));if(!force)toast('Tow attached. Ease forward. [ reels in; ] pays out.');return true;
@@ -2969,24 +3024,30 @@ ${sharedGLSL}
 layout(location=0) in vec2 aUV;uniform mat4 uVP;uniform float uCrestIndex,uCurlRadius;
 out vec3 vP;out vec3 vN;out vec2 vAnchor;out float vFade;out float vLip;
 void main(){float x=aUV.x*36.-18.,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.2831853/uReefPeriod;
- float z=(1.5707963+uTime*w+uCrestIndex*6.2831853)/k+.038*x*x,zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-1.6*b*b);
- vec2 p=vec2(x,z);vec4 f=fluid(p);Sea s=sea(p,f.y);float radius=uCurlRadius*env*smoothstep(.2,1.2,f.y)*min(1.,uReefHeight);
- float angle=-1.5707963+aUV.y*4.15;vP=vec3(x,f.x,z)+s.d+vec3(0.,radius*(sin(angle)+1.),radius*cos(angle));
- vN=normalize(vec3(-.076*x,sin(angle),cos(angle)));vAnchor=p;vFade=env*smoothstep(0.,.06,aUV.x)*(1.-smoothstep(.94,1.,aUV.x))*smoothstep(.0,.12,aUV.y);vLip=aUV.y;gl_Position=uVP*vec4(vP,1.);
+ float z=(1.5707963+uCoastPhase+uCrestIndex*6.2831853)/k+.038*x*x,zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-1.6*b*b);
+ vec2 p=vec2(x,z);vec4 f=fluid(p);Sea s=sea(p,f.y);float shallow=smoothstep(.2,1.2,f.y)*breakwaterPass(p),radius=uCurlRadius*env*shallow*min(1.,uReefHeight);
+ // The wave travels along the crest normal. The sheet rises from the back of the
+ // crest, crosses the top, and the lip falls ahead of the face.
+ vec2 ahead=normalize(vec2(-.076*x,1.));float angle=-1.5707963+aUV.y*4.15,c=-cos(angle),sn=sin(angle);
+ vP=vec3(x,f.x,z)+s.d+vec3(ahead.x*radius*c,radius*(sn+1.),ahead.y*radius*c);
+ vN=normalize(vec3(ahead.x*c,sn,ahead.y*c));vAnchor=p;vFade=env*shallow*smoothstep(0.,.06,aUV.x)*(1.-smoothstep(.94,1.,aUV.x))*smoothstep(.0,.12,aUV.y);vLip=aUV.y;gl_Position=uVP*vec4(vP,1.);
 }`;
 const crestFS=`#version 300 es
 ${sharedGLSL}
 uniform vec3 uEye;uniform float uUnder;in vec3 vP;in vec3 vN;in vec2 vAnchor;in float vFade;in float vLip;out vec4 outColor;
 void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?vN:-vN),v=normalize(uEye-vP),l=normalize(uSun);float fr=.025+.975*pow(1.-clamp(dot(n,v),0.,1.),5.);
- vec3 color=mix(uBody*1.4+vec3(.015,.20,.16)*uSunTint*uSunStrength,skyColor(reflect(-v,n)),fr*.72);
+ // Thin water uses the main surface's crest transmission, then lets the face behind it show.
+ float back=pow(max(0.,dot(v,-l+n*.25)),3.),shade=sunVisibility(vP+n*.04);vec3 body=uBody+vec3(.025,.58,.42)*uSunTint*uSunStrength*uSSS*(.12+back)*.5*shade;
+ vec3 color=mix(body,skyColor(reflect(-v,n)),fr*.72);
  float f=smoothstep(.45,.98,vLip)*(.35+.65*noise(vAnchor*11.+uTime*.9));vec3 foam=vec3(.73,.86,.83)*(uAmbient*.55+uSunTint*uSunStrength*(.24+.65*max(0.,dot(n,l)))+localDiffuse(vP,n)*.6);
- color=mix(color,foam,clamp(f,0.,.85))+localWater(vP,n,v,uRoughness)*.6;float back=pow(max(0.,dot(v,-l+n*.25)),3.);color+=vec3(.03,.35,.21)*back*uSunStrength;
- color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,.96));
+ float lip=clamp(f,0.,.85);color=mix(color,foam,lip)+localWater(vP,n,v,uRoughness)*.6;
+ color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}
+ float cover=max(mix(.38,.9,fr),lip*1.1);outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,1.)*clamp(cover,0.,.96));
 }`;
 Renderer.prototype.drawCrests=function(game){if(C.environment!==3||!C.coastalWaves||!C.curlSheet||!C.waterVisible||!C.waves||C.curlStrength<=0||C.reefHeight<=0)return;const gl=this.gl;
  if(!this.crestProgram){this.crestProgram=this.program(crestVS,crestFS);const v=[],nx=96,ny=14;for(let i=0;i<nx;i++)for(let j=0;j<ny;j++)for(const [x,y]of [[i,j],[i+1,j],[i,j+1],[i,j+1],[i+1,j],[i+1,j+1]])v.push(x/nx,y/ny);this.crestCount=v.length/2;this.crestBytes=v.length*4;this.crestVAO=gl.createVertexArray();gl.bindVertexArray(this.crestVAO);this.crestBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,this.crestBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,8,0);}
  const p=this.crestProgram;this.common(p,this.vp,this.eye,game);gl.uniform1f(p.name('uCurlRadius'),C.curlStrength);gl.bindVertexArray(this.crestVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(true);
- const k=TAU/(C.reefPeriod*C.reefSpeed),w=TAU/C.reefPeriod,centre=Math.round((-5.8*k-Math.PI*.5-water.time*w)/TAU);
+ const k=TAU/(C.reefPeriod*C.reefSpeed),w=TAU/C.reefPeriod,centre=Math.round((-5.8*k-Math.PI*.5-TAU*((water.time/C.reefPeriod)%1))/TAU);
  for(let i=-1;i<=1;i++){gl.uniform1f(p.name('uCrestIndex'),centre+i);gl.drawArrays(gl.TRIANGLES,0,this.crestCount);profiler?.draw(this.crestCount/3,0);}gl.disable(gl.BLEND);
 };
 
@@ -3090,7 +3151,7 @@ Renderer.prototype.makeTraceTarget=function(w,h){
  const gl=this.gl,colors=[this.texture(gl.RGBA16F,w,h,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST),this.texture(gl.RGBA16F,w,h,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST)],fbo=gl.createFramebuffer(),depth=gl.createRenderbuffer();
  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);colors.forEach((t,i)=>gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0));gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);gl.bindRenderbuffer(gl.RENDERBUFFER,depth);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT24,w,h);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);
  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Reflection target is incomplete. Switch Trace method to 0.');
- gl.clearBufferfv(gl.COLOR,0,new Float32Array(4));gl.clearBufferfv(gl.COLOR,1,new Float32Array(4));gl.clear(gl.DEPTH_BUFFER_BIT);return{fbo,colors,depth,w,h,bytes:w*h*20};
+ gl.clearBufferfv(gl.COLOR,0,ZERO4);gl.clearBufferfv(gl.COLOR,1,ZERO4);gl.clear(gl.DEPTH_BUFFER_BIT);return{fbo,colors,depth,w,h,bytes:w*h*20};
 };
 Renderer.prototype.deleteTraceTarget=function(t){if(!t)return;const gl=this.gl;gl.deleteFramebuffer(t.fbo);gl.deleteRenderbuffer(t.depth);t.colors.forEach(c=>gl.deleteTexture(c));};
 Renderer.prototype.ensureTraceTargets=function(){
@@ -3104,11 +3165,11 @@ Renderer.prototype.updateTracedReflections=function(game,dt){
  this.traceReady=false;if(!this.traceSupported||!C.ssr||C.ssrMethod===0||!C.waterVisible||this.underwater){this.traceHistoryValid=false;return;}
  this.ensureTraceTargets();const gl=this.gl,[raw,h0,h1]=this.traceTargets,history=[h0,h1],previous=history[this.traceRead],next=history[1-this.traceRead];
  const sig=[C.environment,this.water.epoch,C.ssrScale,C.ssrTraversal,C.ssrDistance,C.ssrThickness,C.ssrTemporal,C.ssrBlend,C.ssrDebug,C.waveScale,C.microNormals,C.ssrDepthReject,C.ssrNormalReject,C.waveCount,C.spectral,C.props,C.dayHour,C.localLights,C.beaconOn,C.boatLamp].join('/');
- const cut=sig!==this.traceSignature||dt>.16||this.water.time<this.tracePreviousTime||Math.hypot(...this.eye.map((v,i)=>v-this.tracePreviousEye[i]))>4||Math.hypot(...this.target.map((v,i)=>v-this.tracePreviousTarget[i]))>6;
+ const wall=performance.now(),gap=(wall-(this.traceWall??wall))/1000;this.traceWall=wall;const cut=sig!==this.traceSignature||gap>.16||this.water.time<this.tracePreviousTime||Math.hypot(...this.eye.map((v,i)=>v-this.tracePreviousEye[i]))>4||Math.hypot(...this.target.map((v,i)=>v-this.tracePreviousTarget[i]))>6;
  if(cut){this.traceHistoryValid=false;this.traceResetCount++;}this.traceSignature=sig;
  profiler?.beginPass('depthBounds');gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.depthMask(false);const d=this.depthRangeProgram;gl.useProgram(d.p);gl.uniform1i(d.name('uInput'),0);let input=this.scene.depth,iw=this.size[0],ih=this.size[1];
  for(let i=0;i<6;i++){const t=this.depthLevels[i];gl.bindFramebuffer(gl.FRAMEBUFFER,t.fbo);gl.viewport(0,0,t.w,t.h);this.texAt(input,0);gl.uniform1i(d.name('uFirst'),i===0?1:0);gl.uniform2f(d.name('uInputSize'),iw,ih);gl.uniform2f(d.name('uOutputSize'),t.w,t.h);this.full(d);input=t.color;iw=t.w;ih=t.h;}profiler?.endPass();
- profiler?.beginPass('reflectionTrace');gl.bindFramebuffer(gl.FRAMEBUFFER,raw.fbo);gl.viewport(0,0,raw.w,raw.h);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);gl.clearBufferfv(gl.COLOR,0,new Float32Array(4));gl.clearBufferfv(gl.COLOR,1,new Float32Array(4));gl.clear(gl.DEPTH_BUFFER_BIT);
+ profiler?.beginPass('reflectionTrace');gl.bindFramebuffer(gl.FRAMEBUFFER,raw.fbo);gl.viewport(0,0,raw.w,raw.h);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);gl.clearBufferfv(gl.COLOR,0,ZERO4);gl.clearBufferfv(gl.COLOR,1,ZERO4);gl.clear(gl.DEPTH_BUFFER_BIT);
  const p=this.tracedProgram;this.common(p,this.vp,this.eye,game);this.texAt(this.scene.color,2);this.texAt(this.scene.depth,3);gl.uniform1i(p.name('uScene'),2);gl.uniform1i(p.name('uDepth'),3);const units=[4,5,10,11,14,15];this.depthLevels.forEach((t,i)=>{this.texAt(t.color,units[i]);gl.uniform1i(p.name('uDepth'+i),units[i]);});gl.uniform2fv(p.name('uLevelSize[0]'),this.depthLevelSizes);gl.uniform2f(p.name('uTraceResolution'),raw.w,raw.h);gl.uniformMatrix4fv(p.name('uInverseVP'),false,this.invVP);gl.uniform1f(p.name('uDistance'),C.ssrDistance);gl.uniform1f(p.name('uThickness'),C.ssrThickness);gl.uniform1i(p.name('uTraversal'),C.ssrTraversal);gl.uniform1i(p.name('uDebugTrace'),C.ssrDebug===3?1:0);gl.bindVertexArray(this.wvao);gl.drawElements(gl.TRIANGLES,this.wcount,gl.UNSIGNED_INT,0);profiler?.draw(this.wcount/3,0);profiler?.endPass();
  profiler?.beginPass('reflectionHistory');gl.bindFramebuffer(gl.FRAMEBUFFER,next.fbo);gl.viewport(0,0,next.w,next.h);gl.disable(gl.DEPTH_TEST);gl.depthMask(false);const r=this.resolveProgram;gl.useProgram(r.p);
  for(const[name,tex,unit]of[['uRaw',raw.colors[0],0],['uGeometry',raw.colors[1],1],['uPrevious',previous.colors[0],2],['uPreviousGeometry',previous.colors[1],3]]){this.texAt(tex,unit);gl.uniform1i(r.name(name),unit);}
@@ -3116,21 +3177,24 @@ Renderer.prototype.updateTracedReflections=function(game,dt){
  this.traceRead=1-this.traceRead;this.traceReady=true;this.traceHistoryValid=true;this.tracePreviousVP=new Float32Array(this.vp);this.tracePreviousEye=[...this.eye];this.tracePreviousTarget=[...this.target];this.tracePreviousTime=this.water.time;gl.depthMask(true);gl.enable(gl.DEPTH_TEST);
 };
 Renderer.prototype.makeAirCube=function(n){
- const gl=this.gl,color=gl.createTexture(),depth=gl.createTexture(),fbo=gl.createFramebuffer();
+ const gl=this.gl,color=gl.createTexture(),depth=gl.createTexture();
  for(const [t,internal,format,type,filter]of[[color,this.hdr?gl.RGBA16F:gl.RGBA8,gl.RGBA,this.hdr?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,gl.LINEAR],[depth,gl.DEPTH_COMPONENT24,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,gl.NEAREST]]){
   gl.bindTexture(gl.TEXTURE_CUBE_MAP,t);for(let i=0;i<6;i++)gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,0,internal,n,n,0,format,type,null);
   gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MAG_FILTER,filter);for(const k of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T,gl.TEXTURE_WRAP_R])gl.texParameteri(gl.TEXTURE_CUBE_MAP,k,gl.CLAMP_TO_EDGE);
- }return{color,depth,fbo,n,bytes:6*n*n*(this.hdr?12:8)};
+ }
+ // One framebuffer per face, validated once. Re-attaching and checking every capture stalled.
+ const fbos=[];if(n>1){for(let i=0;i<6;i++){const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,color,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,depth,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Above-water cube is incomplete.');fbos.push(f);}gl.bindFramebuffer(gl.FRAMEBUFFER,null);}
+ return{color,depth,fbos,n,bytes:6*n*n*(this.hdr?12:8)};
 };
-Renderer.prototype.deleteAirCube=function(c){if(!c)return;this.gl.deleteTexture(c.color);this.gl.deleteTexture(c.depth);this.gl.deleteFramebuffer(c.fbo);};
+Renderer.prototype.deleteAirCube=function(c){if(!c)return;this.gl.deleteTexture(c.color);this.gl.deleteTexture(c.depth);for(const f of c.fbos)this.gl.deleteFramebuffer(f);};
 Renderer.prototype.updateAirScene=function(game){
  this.airFacesThisFrame=0;if(!C.surfaceWindow||!C.waterVisible||!this.underwater){this.airReady=false;return;}
  const gl=this.gl,n=C.airCubeSize;if(this.airCube?.n!==n){this.deleteAirCube(this.airCube);this.airCube=this.makeAirCube(n);this.airReady=false;}
  const origin=[this.eye[0],this.water.level+.12,this.eye[2]],sig=[C.environment,this.water.epoch,C.props,C.dayHour,C.localLights,C.showBoat].join('/'),now=this.water.time;
  if(this.airReady&&sig===this.airSignature&&now>=this.airStamp&&now-this.airStamp<1/C.airCubeHz&&Math.hypot(...origin.map((v,i)=>v-this.airOrigin[i]))<.75)return;
  this.airOrigin=origin;this.capturingAir=true;this.airReady=false;const dirs=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],ups=[[0,-1,0],[0,-1,0],[0,0,1],[0,0,-1],[0,-1,0],[0,-1,0]],proj=Mat.perspective(Math.PI/2,1,.1,500);
- try{gl.bindFramebuffer(gl.FRAMEBUFFER,this.airCube.fbo);gl.viewport(0,0,n,n);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.disable(gl.BLEND);
-  for(let i=0;i<6;i++){gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,this.airCube.color,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,this.airCube.depth,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Above-water cube is incomplete.');gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);const vp=Mat.mul(proj,Mat.look(origin,origin.map((v,k)=>v+dirs[i][k]),ups[i]));this.drawSky(vp,origin,game);this.drawScene(vp,origin,game);this.airFacesThisFrame++;}
+ try{gl.viewport(0,0,n,n);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.disable(gl.BLEND);
+  for(let i=0;i<6;i++){gl.bindFramebuffer(gl.FRAMEBUFFER,this.airCube.fbos[i]);gl.viewport(0,0,n,n);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);const vp=Mat.mul(proj,Mat.look(origin,origin.map((v,k)=>v+dirs[i][k]),ups[i]));this.drawSky(vp,origin,game);this.drawScene(vp,origin,game);this.airFacesThisFrame++;}
  }finally{this.capturingAir=false;}
  this.airReady=true;this.airSignature=sig;this.airStamp=now;this.airCaptureCount++;gl.bindFramebuffer(gl.FRAMEBUFFER,null);
 };
@@ -3152,7 +3216,7 @@ Water.prototype.stepWallWaves=function(dt){
  for(let k=0;k<COUNT;k++){wet[k]=+(h[k]>.045);c2[k]=Math.min(speed*speed,9.81*Math.max(.08,h[k]));}
  const tab=storm.table,coupling=C.wallIncident*(1-Math.exp(-this.wallClock*2)),modes=Math.min(3,storm.count),invDX=1/DX;
  for(let z=1;z<n-1;z++)for(let x=1;x<n-1;x++){const k=z*n+x;if(!wet[k]){this.ripple[k]=this.rv[k]=this.rnext[k]=source[k]=0;continue;}
-  const left=wet[k-1],right=wet[k+1],up=wet[k-n],down=wet[k+n],walls=4-left-right-up-down,edge=Math.min(x,z,n-1-x,n-1-z)*DX,sponge=Math.pow(Math.max(0,1-edge/3),2)*C.wallSponge;
+  const left=wet[k-1],right=wet[k+1],up=wet[k-n],down=wet[k+n],walls=4-left-right-up-down,edge=Math.min(x,z,n-1-x,n-1-z)*DX,sponge=edge<3?(1-edge/3)*(1-edge/3)*C.wallSponge:0;
   loss[k]=C.wallDamping+walls*(1-C.wallRetention)*3+(1-sstep(.05,.65,h[k]))*1.6+sponge;source[k]=0;
   if(walls&&coupling&&C.waves){const px=x*DX-HALF,pz=z*DX-HALF;let gx=0,gz=0;for(let i=0;i<modes;i++){const o=i*7,kd=tab[o+2],a=tab[o+4],phase=(px*tab[o]+pz*tab[o+1])*kd-this.time*tab[o+3]+tab[o+5],grad=a*kd*Math.cos(phase);gx+=grad*tab[o];gz+=grad*tab[o+1];}
    const shelter=C.environment===3&&C.coastalWaves?1-(1-C.harbourShelter)*sstep(3.5,9.5,pz):1;
@@ -3166,7 +3230,7 @@ Water.prototype.stepWallWaves=function(dt){
  }
  // Zero-gradient edge plus a damped strip, rather than a hard zero-height edge.
  for(let i=1;i<n-1;i++){next[i]=next[n+i];next[(n-1)*n+i]=next[(n-2)*n+i];next[i*n]=next[i*n+1];next[i*n+n-1]=next[i*n+n-2];v[i]=v[n+i];v[(n-1)*n+i]=v[(n-2)*n+i];v[i*n]=v[i*n+1];v[i*n+n-1]=v[i*n+n-2];}
- [this.ripple,this.rnext]=[this.rnext,this.ripple];}
+ {const t=this.ripple;this.ripple=this.rnext;this.rnext=t;}}
 };
 Water.prototype.localWaveStats=function(){this.ensureWallArrays();let peak=0,energy=0,wetCount=0;const r=this.ripple,v=this.rv;for(let z=1;z<N-1;z++)for(let x=1;x<N-1;x++){const k=z*N+x;if(this.h[k]<=.045)continue;peak=Math.max(peak,Math.abs(r[k]));energy+=.5*v[k]*v[k];wetCount++;if(this.h[k+1]>.045)energy+=.5*Math.min(this.wallC2[k],this.wallC2[k+1])*Math.pow((r[k+1]-r[k])/DX,2);if(this.h[k+N]>.045)energy+=.5*Math.min(this.wallC2[k],this.wallC2[k+N])*Math.pow((r[k+N]-r[k])/DX,2);}this.wallPeak=peak;this.wallEnergy=energy*DX*DX;return{enabled:C.wallWaves,peakM:peak,energyDiagnostic:this.wallEnergy,clips:this.wallClips,substeps:this.wallSteps,courant:this.wallCFL,wetCells:wetCount,method:C.wallWaves?'Symmetric wet faces / reflecting solids / edge sponge':'Prior zero-height stencil'};};
 const opticsResetWater=Water.prototype.reset;
@@ -3174,7 +3238,7 @@ Water.prototype.reset=function(){opticsResetWater.call(this);this.ensureWallArra
 const opticsMotion=Water.prototype.motion;
 Water.prototype.motion=function(x,z,out){const a=opticsMotion.call(this,x,z,out);if(C.wallWaves){const px=a[12],pz=a[13];a[7]+=this.bilerp(this.rv,px,pz);a[9]+=(this.bilerp(this.ripple,px+DX,pz)-this.bilerp(this.ripple,px-DX,pz))/(2*DX);a[10]+=(this.bilerp(this.ripple,px,pz+DX)-this.bilerp(this.ripple,px,pz-DX))/(2*DX);}return a;};
 const opticsFastSurface=Water.prototype.fastSurface;
-Water.prototype.fastSurface=function(x,z){return opticsFastSurface.call(this,x,z)+(C.wallWaves?this.bilerp(this.ripple,x,z):0);};
+Water.prototype.fastSurface=function(x,z){return opticsFastSurface.call(this,x,z);};
 Water.prototype.wallPulse=function(x=-5,z=7.5){
  this.ensureWallArrays();const rr=1.3,k0=Math.round((z+HALF)/DX)*N+Math.round((x+HALF)/DX);let sum=0,w=0;const points=[];
  for(let j=Math.max(1,Math.floor((z-rr*3+HALF)/DX));j<Math.min(N-1,Math.ceil((z+rr*3+HALF)/DX));j++)for(let i=Math.max(1,Math.floor((x-rr*3+HALF)/DX));i<Math.min(N-1,Math.ceil((x+rr*3+HALF)/DX));i++){const k=j*N+i;if(this.h[k]<.045)continue;const d2=((i*DX-HALF-x)**2+(j*DX-HALF-z)**2)/(rr*rr),g=Math.exp(-d2*1.4),v=(1-d2*1.4)*g;points.push([k,v,g]);sum+=v;w+=g;}
@@ -3800,9 +3864,10 @@ Renderer.prototype.sampleBodyWet=function(mesh,body,model,dt){
  if(!mesh?.wetSamples)return;
  const w=this.water,p=mesh.wetPositions,a=mesh.wetSamples,m=model;
  const film=Math.exp(-dt/C.bodyFilmLife),damp=Math.exp(-dt/C.bodyDampLife);
- const out=this.bodyWetRead||(this.bodyWetRead=new Float64Array(14));
+ const out=this.bodyWetRead||(this.bodyWetRead=new Float64Array(14)),memo=this.bodyWetMemo||(this.bodyWetMemo=new Map());memo.clear();
+ // Vertices sharing a 2 cm water column reuse one surface solve; the wetting edge is 10 cm wide.
  for(let i=0;i<p.length;i+=3){const x=p[i],y=p[i+1],z=p[i+2],wx=m[0]*x+m[4]*y+m[8]*z+m[12],wy=m[1]*x+m[5]*y+m[9]*z+m[13],wz=m[2]*x+m[6]*y+m[10]*z+m[14],j=i/3*2;
-  let touch=0;if(w.bilerp(w.h,wx,wz)>.015){w.motion(wx,wz,out);touch=1-sstep(-.035,.07,wy-out[1]);}
+  let touch=0;if(w.bilerp(w.h,wx,wz)>.015){const key=(Math.round(wx*50)+32768)*65536+Math.round(wz*50)+32768;let surface=memo.get(key);if(surface===undefined){surface=w.motion(wx,wz,out)[1];memo.set(key,surface);}touch=1-sstep(-.035,.07,wy-surface);}
   a[j]=Math.max(touch,a[j]*film);a[j+1]=Math.max(touch,a[j+1]*damp);
  }
  for(let i=0;i<mesh.count;i++){const k=mesh.wetIndex[i]*2;mesh.wetValues[i*2]=a[k];mesh.wetValues[i*2+1]=a[k+1];}
@@ -4036,7 +4101,7 @@ try{
 </script>
 <script>
 (function(){
-var boot=window.TIDELINE_BOOT=BootKit.create({name:'TIDELINE',version:'SURFACE / 10.0',build:'TL-SURFACE-20261004.1',storageId:'tideline',host:'sb-root',
+var boot=window.TIDELINE_BOOT=BootKit.create({name:'TIDELINE',version:'SURFACE / 10.1',build:'TL-SURFACE-20261005.1',storageId:'tideline',host:'sb-root',
  renderers:[{id:'webgl2',attributes:{alpha:false,antialias:false,depth:true,powerPreference:'high-performance'},limits:{MAX_TEXTURE_SIZE:2048,MAX_RENDERBUFFER_SIZE:2048,MAX_TEXTURE_IMAGE_UNITS:16,MAX_VERTEX_TEXTURE_IMAGE_UNITS:8,MAX_COMBINED_TEXTURE_IMAGE_UNITS:32,MAX_DRAW_BUFFERS:3,MAX_COLOR_ATTACHMENTS:3}}],
  load:function(b){
   var style=document.createElement('style');style.id='game-active-style';style.textContent=document.getElementById('game-style').textContent;document.head.appendChild(style);

@@ -36,9 +36,10 @@ Renderer.prototype.sampleBodyWet=function(mesh,body,model,dt){
  if(!mesh?.wetSamples)return;
  const w=this.water,p=mesh.wetPositions,a=mesh.wetSamples,m=model;
  const film=Math.exp(-dt/C.bodyFilmLife),damp=Math.exp(-dt/C.bodyDampLife);
- const out=this.bodyWetRead||(this.bodyWetRead=new Float64Array(14));
+ const out=this.bodyWetRead||(this.bodyWetRead=new Float64Array(14)),memo=this.bodyWetMemo||(this.bodyWetMemo=new Map());memo.clear();
+ // Vertices sharing a 2 cm water column reuse one surface solve; the wetting edge is 10 cm wide.
  for(let i=0;i<p.length;i+=3){const x=p[i],y=p[i+1],z=p[i+2],wx=m[0]*x+m[4]*y+m[8]*z+m[12],wy=m[1]*x+m[5]*y+m[9]*z+m[13],wz=m[2]*x+m[6]*y+m[10]*z+m[14],j=i/3*2;
-  let touch=0;if(w.bilerp(w.h,wx,wz)>.015){w.motion(wx,wz,out);touch=1-sstep(-.035,.07,wy-out[1]);}
+  let touch=0;if(w.bilerp(w.h,wx,wz)>.015){const key=(Math.round(wx*50)+32768)*65536+Math.round(wz*50)+32768;let surface=memo.get(key);if(surface===undefined){surface=w.motion(wx,wz,out)[1];memo.set(key,surface);}touch=1-sstep(-.035,.07,wy-surface);}
   a[j]=Math.max(touch,a[j]*film);a[j+1]=Math.max(touch,a[j+1]*damp);
  }
  for(let i=0;i<mesh.count;i++){const k=mesh.wetIndex[i]*2;mesh.wetValues[i*2]=a[k];mesh.wetValues[i*2+1]=a[k+1];}
