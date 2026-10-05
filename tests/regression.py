@@ -121,6 +121,17 @@ async def main(args):
     const tableOk=table.every((x,i)=>Math.abs(f[off0[0]+i]-x)<=1e-5*Math.max(1e-3,x))&&table[15]>table[0],v=l.bench.variants('upgradeAudit',C),diff=Object.keys(v[0].settings).filter(k=>v[0].settings[k]!==v[1].settings[k]);
     return {ok:changed>50&&gl.getError()===0&&k2.every(x=>x>0&&isFinite(x))&&tableOk&&f[off0[1]]===1&&diff.length===D.upgradeFeatures.length&&diff.every(k=>D.upgradeFeatures.includes(k)),changedPixels:changed,k2,table:table.map(x=>+x.toFixed(4)),tableOk,diff};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # M4 reef: CPU and GPU breaker agree across the basin edge, with no step and no trough ridge.
+  await check('Reef breaker matches on CPU and GPU across the basin edge', '''const saved={...C};try{Object.assign(C,{environment:3,coastalWaves:true,waves:true,renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0});if(D.water.worldId!==3)D.chooseWorld(3,false);D.storm.sync();r.render(g,0);
+   const zb=x=>-5.8+.038*x*x+.6,pts=[[-25.9,zb(25.9)],[25.9,zb(25.9)],[-26.1,zb(26.1)],[26.1,zb(26.1)],[0,-5.8],[9,-2.2],[5.1,5.2],[-5.3,4.9]];
+   const gpu=r.probeCoast(pts),t=w.time,cpu=pts.map(([x,z])=>Array.from(D.coastalSample(x,z,t,w.bilerp(w.h,x,z)).slice(2,6)));
+   let worst=0;for(let i=0;i<pts.length;i++)for(let k=0;k<4;k++)worst=Math.max(worst,Math.abs(gpu[i][k]-cpu[i][k])/(1+Math.abs(cpu[i][k])));
+   // The GPU used 10 m depth past |x|=26 and raised the full reef beside the walls there.
+   const step=Math.max(...[0,1,2,3].map(k=>Math.abs(gpu[0][k]-gpu[2][k])),...[0,1,2,3].map(k=>Math.abs(gpu[1][k]-gpu[3][k])));
+   // One crest and one flat trough per period: with the 0.25 harmonic the trough has no local maximum.
+   let peaks=0,prev=[],T=C.reefPeriod;for(let i=0;i<=401;i++){const h=D.coastalSample(0,-5.8,t+i*T/400,3)[2];prev.push(h);if(prev.length>3)prev.shift();if(prev.length===3&&prev[1]>prev[0]+1e-9&&prev[1]>=prev[2])peaks++;}
+   return {ok:!!gpu&&worst<2e-3&&step<.05&&peaks===1&&cpu[4][0]!==0,worst,step,peaks,gpu:gpu.map(v=>v.map(x=>+x.toFixed(4))),cpu:cpu.map(v=>v.map(x=>+x.toFixed(4)))};
+  }finally{Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
