@@ -1212,7 +1212,7 @@ class Water{
   this.bed=new Float32Array(COUNT);this.h=new Float32Array(COUNT);this.next=new Float32Array(COUNT);
   this.pressure=new Float32Array(COUNT);this.flux=new Float32Array(COUNT*4);this.ux=new Float32Array(COUNT);this.uz=new Float32Array(COUNT);
   this.ripple=new Float32Array(COUNT);this.rv=new Float32Array(COUNT);this.rnext=new Float32Array(COUNT);
-  this.wet=new Uint8Array(COUNT);this.wetAge=new Float32Array(COUNT);this.tex=new Float32Array(COUNT*4);
+  this.wet=new Uint8Array(COUNT);this.wetAge=new Float32Array(COUNT);this.tex=new Float32Array(COUNT*4);this.eta=new Float32Array(COUNT);
   this.neighbors=new Int32Array(COUNT*4);this.edgeGate=new Int8Array(COUNT*4);this.edgeGate.fill(-1);
   this.gates=[{x:-7,z:-16.25,width:4.2,value:0,target:0},{x:6,z:12.25,width:4.3,value:1,target:1}];
   this.time=0;this.level=.35;this.previousLevel=.35;this.boundaryVolume=0;this.rogueOffset=0;this.epoch=0;
@@ -1290,13 +1290,13 @@ class Water{
   }
   [this.h,this.next]=[this.next,this.h];this.previousLevel=this.level;this.level=total/Math.max(1,count);
   // Damped, small-amplitude wave equation: cosmetic displacement, never volume.
-  const p1=profiler?.active?performance.now():0;if(p0)profiler.add('hydraulics',p1-p0);if(C.wallWaves){this.stepWallWaves(dt);if(p1)profiler.add('ripples',performance.now()-p1);return;}const r=this.ripple,rv=this.rv;if(!C.ripples){r.fill(0);rv.fill(0);this.rnext.fill(0);return;}
+  const p1=profiler?.active?performance.now():0;if(p0)profiler.add('hydraulics',p1-p0);if(C.wallWaves){this.stepWallWaves(dt);this.refreshSurface();if(p1)profiler.add('ripples',performance.now()-p1);return;}const r=this.ripple,rv=this.rv;if(!C.ripples){r.fill(0);rv.fill(0);this.rnext.fill(0);this.refreshSurface();return;}
   for(let j=1;j<N-1;j++)for(let i=1;i<N-1;i++){
    const k=j*N+i;if(this.h[k]<.045){rv[k]=0;this.rnext[k]=0;continue;}
    const lap=(r[k-1]+r[k+1]+r[k-N]+r[k+N]-4*r[k])/(DX*DX);
    rv[k]=(rv[k]+dt*rippleCoeff*lap)*rippleDecay;this.rnext[k]=clamp(r[k]+rv[k]*dt,-rippleLimit,rippleLimit);
   }
-  [this.ripple,this.rnext]=[this.rnext,this.ripple];if(p1)profiler.add('ripples',performance.now()-p1);
+  [this.ripple,this.rnext]=[this.rnext,this.ripple];this.refreshSurface();if(p1)profiler.add('ripples',performance.now()-p1);
  }
 
  hullHead(boat){const t0=performance.now();this.pressure.fill(0);if(C.hullPressure){const r=C.pressureRadius,c=Math.cos(boat.yaw),s=Math.sin(boat.yaw),wet=clamp(boat.wetFraction||0,0,1),rad=r*2.5,ix0=Math.max(1,Math.floor((boat.x-rad+HALF)/DX)),ix1=Math.min(N-2,Math.ceil((boat.x+rad+HALF)/DX)),iz0=Math.max(1,Math.floor((boat.z-rad+HALF)/DX)),iz1=Math.min(N-2,Math.ceil((boat.z+rad+HALF)/DX));
@@ -1319,12 +1319,22 @@ class Water{
   for(let i=0;i<5;i++){storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);const ex=px+out[0]-x,ez=pz+out[2]-z,det=Math.max(.003,out[11]);if(Math.abs(ex)+Math.abs(ez)<.0001)break;px-=clamp((out[5]*ex-out[4]*ez)/det,-1.5,1.5);pz-=clamp((out[3]*ez-out[4]*ex)/det,-1.5,1.5);}
   storm.evaluate(px,pz,this.time,this.bilerp(this.h,px,pz),out,storm.count,this.rogueOffset);
   const gx=out[9],gz=out[10],det=Math.max(.003,out[11]);out[9]=(gx*out[5]-gz*out[4])/det;out[10]=(gz*out[3]-gx*out[4])/det;
-  out[7]-=out[9]*out[6]+out[10]*out[8];out[1]+=this.bilerp(this.bed,px,pz)+this.bilerp(this.h,px,pz)+this.bilerp(this.ripple,px,pz);out[12]=px;out[13]=pz;return out;
+  out[7]-=out[9]*out[6]+out[10]*out[8];out[1]+=this.bilerp(this.eta,px,pz);out[12]=px;out[13]=pz;return out;
  }
  surface(x,z){return this.motion(x,z,storm.scratch)[1];}
- fastSurface(x,z){const d=this.bilerp(this.h,x,z);return this.bilerp(this.bed,x,z)+d+storm.evaluate(x,z,this.time,d,storm.scratch,Math.min(6,storm.count),this.rogueOffset)[1];}
+ fastSurface(x,z){const d=this.bilerp(this.h,x,z);return this.bilerp(this.eta,x,z)+storm.evaluate(x,z,this.time,d,storm.scratch,Math.min(6,storm.count),this.rogueOffset)[1];}
  impulse(x,z,amount=.75,radius=.7){if(!C.ripples)return;let gx=Math.round((x+HALF)/DX),gz=Math.round((z+HALF)/DX),rr=Math.ceil(radius/DX);for(let j=gz-rr;j<=gz+rr;j++)for(let i=gx-rr;i<=gx+rr;i++){if(i<1||j<1||i>=N-1||j>=N-1)continue;let k=j*N+i,d=Math.hypot(i*DX-HALF-x,j*DX-HALF-z);if(d<radius&&this.h[k]>.05)this.rv[k]+=amount*(1-d/radius);}}
- pack(){for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=this.bed[k]+this.h[k]+this.ripple[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
+ // Dry cells beside water carry the mean neighbouring free surface. Interpolating
+ // toward the bed raised a translucent water ramp, and false wet marks, up walls.
+ // Dry edge cells meet the open water drawn beyond the grid at its level.
+ refreshSurface(){const h=this.h,b=this.bed,r=this.ripple,e=this.eta,wet=.012,ocean=(this.worldId===0?C.oceanLevel:WORLD_DEFS[this.worldId].level)+C.oceanTide*Math.sin(this.time*C.oceanRate);
+  for(let k=0;k<COUNT;k++)e[k]=b[k]+h[k]+r[k];
+  for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i;if(h[k]>wet)continue;let sum=0,count=0;
+   for(let jj=Math.max(0,j-1);jj<=Math.min(N-1,j+1);jj++)for(let ii=Math.max(0,i-1);ii<=Math.min(N-1,i+1);ii++){const q=jj*N+ii;if(h[q]>wet){sum+=b[q]+h[q]+r[q];count++;}}
+   if(count)e[k]=sum/count;else if(i===0||j===0||i===N-1||j===N-1)e[k]=ocean;}
+  return e;
+ }
+ pack(){const e=this.refreshSurface();for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=e[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
  volume(){let v=0;for(const h of this.h)v+=h*DX*DX;return v;}
 }
 /* --------------------------------------------------------------------------
@@ -2971,17 +2981,23 @@ out vec3 vP;out vec3 vN;out vec2 vAnchor;out float vFade;out float vLip;
 void main(){float x=aUV.x*36.-18.,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.2831853/uReefPeriod;
  float z=(1.5707963+uTime*w+uCrestIndex*6.2831853)/k+.038*x*x,zb=-5.8+.038*x*x,b=(z-zb)/uReefWidth,env=exp(-1.6*b*b);
  vec2 p=vec2(x,z);vec4 f=fluid(p);Sea s=sea(p,f.y);float radius=uCurlRadius*env*smoothstep(.2,1.2,f.y)*min(1.,uReefHeight);
- float angle=-1.5707963+aUV.y*4.15;vP=vec3(x,f.x,z)+s.d+vec3(0.,radius*(sin(angle)+1.),radius*cos(angle));
- vN=normalize(vec3(-.076*x,sin(angle),cos(angle)));vAnchor=p;vFade=env*smoothstep(0.,.06,aUV.x)*(1.-smoothstep(.94,1.,aUV.x))*smoothstep(.0,.12,aUV.y);vLip=aUV.y;gl_Position=uVP*vec4(vP,1.);
+ // The wave travels along the crest normal. The sheet rises from the back of the
+ // crest, crosses the top, and the lip falls ahead of the face.
+ vec2 ahead=normalize(vec2(-.076*x,1.));float angle=-1.5707963+aUV.y*4.15,c=-cos(angle),sn=sin(angle);
+ vP=vec3(x,f.x,z)+s.d+vec3(ahead.x*radius*c,radius*(sn+1.),ahead.y*radius*c);
+ vN=normalize(vec3(ahead.x*c,sn,ahead.y*c));vAnchor=p;vFade=env*smoothstep(0.,.06,aUV.x)*(1.-smoothstep(.94,1.,aUV.x))*smoothstep(.0,.12,aUV.y);vLip=aUV.y;gl_Position=uVP*vec4(vP,1.);
 }`;
 const crestFS=`#version 300 es
 ${sharedGLSL}
 uniform vec3 uEye;uniform float uUnder;in vec3 vP;in vec3 vN;in vec2 vAnchor;in float vFade;in float vLip;out vec4 outColor;
 void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?vN:-vN),v=normalize(uEye-vP),l=normalize(uSun);float fr=.025+.975*pow(1.-clamp(dot(n,v),0.,1.),5.);
- vec3 color=mix(uBody*1.4+vec3(.015,.20,.16)*uSunTint*uSunStrength,skyColor(reflect(-v,n)),fr*.72);
+ // Thin water uses the main surface's crest transmission, then lets the face behind it show.
+ float back=pow(max(0.,dot(v,-l+n*.25)),3.);vec3 body=uBody+vec3(.025,.58,.42)*uSunTint*uSunStrength*uSSS*(.12+back)*.5;
+ vec3 color=mix(body,skyColor(reflect(-v,n)),fr*.72);
  float f=smoothstep(.45,.98,vLip)*(.35+.65*noise(vAnchor*11.+uTime*.9));vec3 foam=vec3(.73,.86,.83)*(uAmbient*.55+uSunTint*uSunStrength*(.24+.65*max(0.,dot(n,l)))+localDiffuse(vP,n)*.6);
- color=mix(color,foam,clamp(f,0.,.85))+localWater(vP,n,v,uRoughness)*.6;float back=pow(max(0.,dot(v,-l+n*.25)),3.);color+=vec3(.03,.35,.21)*back*uSunStrength;
- color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,.96));
+ float lip=clamp(f,0.,.85);color=mix(color,foam,lip)+localWater(vP,n,v,uRoughness)*.6;
+ color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}
+ float cover=max(mix(.38,.9,fr),lip*1.1);outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,1.)*clamp(cover,0.,.96));
 }`;
 Renderer.prototype.drawCrests=function(game){if(C.environment!==3||!C.coastalWaves||!C.curlSheet||!C.waterVisible||!C.waves||C.curlStrength<=0||C.reefHeight<=0)return;const gl=this.gl;
  if(!this.crestProgram){this.crestProgram=this.program(crestVS,crestFS);const v=[],nx=96,ny=14;for(let i=0;i<nx;i++)for(let j=0;j<ny;j++)for(const [x,y]of [[i,j],[i+1,j],[i,j+1],[i,j+1],[i+1,j],[i+1,j+1]])v.push(x/nx,y/ny);this.crestCount=v.length/2;this.crestBytes=v.length*4;this.crestVAO=gl.createVertexArray();gl.bindVertexArray(this.crestVAO);this.crestBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,this.crestBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,8,0);}
@@ -3174,7 +3190,7 @@ Water.prototype.reset=function(){opticsResetWater.call(this);this.ensureWallArra
 const opticsMotion=Water.prototype.motion;
 Water.prototype.motion=function(x,z,out){const a=opticsMotion.call(this,x,z,out);if(C.wallWaves){const px=a[12],pz=a[13];a[7]+=this.bilerp(this.rv,px,pz);a[9]+=(this.bilerp(this.ripple,px+DX,pz)-this.bilerp(this.ripple,px-DX,pz))/(2*DX);a[10]+=(this.bilerp(this.ripple,px,pz+DX)-this.bilerp(this.ripple,px,pz-DX))/(2*DX);}return a;};
 const opticsFastSurface=Water.prototype.fastSurface;
-Water.prototype.fastSurface=function(x,z){return opticsFastSurface.call(this,x,z)+(C.wallWaves?this.bilerp(this.ripple,x,z):0);};
+Water.prototype.fastSurface=function(x,z){return opticsFastSurface.call(this,x,z);};
 Water.prototype.wallPulse=function(x=-5,z=7.5){
  this.ensureWallArrays();const rr=1.3,k0=Math.round((z+HALF)/DX)*N+Math.round((x+HALF)/DX);let sum=0,w=0;const points=[];
  for(let j=Math.max(1,Math.floor((z-rr*3+HALF)/DX));j<Math.min(N-1,Math.ceil((z+rr*3+HALF)/DX));j++)for(let i=Math.max(1,Math.floor((x-rr*3+HALF)/DX));i<Math.min(N-1,Math.ceil((x+rr*3+HALF)/DX));i++){const k=j*N+i;if(this.h[k]<.045)continue;const d2=((i*DX-HALF-x)**2+(j*DX-HALF-z)**2)/(rr*rr),g=Math.exp(-d2*1.4),v=(1-d2*1.4)*g;points.push([k,v,g]);sum+=v;w+=g;}
