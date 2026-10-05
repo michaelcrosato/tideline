@@ -13,13 +13,15 @@ The game uses one fixed-step simulation loop. Rendering follows browser animatio
 3. A local reflected-wave stencil carries small disturbances beside wet/dry boundaries.
 4. A shared GPU cache supplies displacement, normals, and motion to rendering passes. Its spatial and temporal sampling are finite.
 
+Dry cells within two cells of water carry the lowest neighbouring free-surface height. Rendering, wetness, caustics and hull buoyancy therefore meet a level waterline at walls instead of interpolating toward the bed height. Dry grid-edge cells meet the open water drawn beyond the grid.
+
 Both hull and renderer query this layered surface. A bounded inverse-displacement lookup is used to sample it in world coordinates. The graphics wetness path uses a smaller relaxed inverse solve than the full CPU contact path. It is an approximation, particularly near steep displaced crests.
 
 ## Surface refinement
 
 ### Foam
 
-The existing ping-pong RGBA8 history remains the source of foam density. RG packs density, B stores a young-foam amount, and A now carries breakup structure. All channels use the same backtrace velocity. Sources are tied to crest compression, slope, active shallows, and short stern segments. Age changes the breakup threshold. Density controls where detail is visible.
+The existing ping-pong RGBA8 history remains the source of foam density. RG packs density, B stores a young-foam amount, and A now carries breakup structure. All channels use the same backtrace velocity. Sources are tied to crest compression, slope, active shallows, and short stern segments. Age changes the breakup threshold. The age byte uses stochastic rounding so small per-step decays are not lost. Density controls where detail is visible.
 
 No new particles are added merely to fill a quota. Turning wakes are not rotated with the current boat heading. Old density remains in its previous location and moves with local flow. Semi-Lagrangian history is diffusive and is not a conservative bubble simulation.
 

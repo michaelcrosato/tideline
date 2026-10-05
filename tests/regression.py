@@ -83,7 +83,7 @@ async def main(args):
   await check('Memory accounting includes the added maps','const m=D.profiler.memory();return {ok:m.gpuTargetBytes>2*128*128*4&&m.ownedArrayBytes>0,extraMapBytes:2*128*128*4};')
   record('No JavaScript exceptions',not errors,errors)
   record('No external runtime requests',not [u for u in network if u.startswith('http')],network)
-  result={'build':'TL-SURFACE-20261004.1','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
+  result={'build':'TL-SURFACE-20261005.1','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
   Path(args.output).write_text(json.dumps(result,indent=2))
   print(json.dumps({k:result[k] for k in ['passed','total','seconds']},indent=2))
   if not args.cdp:await browser.close()

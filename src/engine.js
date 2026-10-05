@@ -731,13 +731,14 @@ class Water{
  // Dry edge cells meet the open water drawn beyond the grid at its level.
  refreshSurface(){const h=this.h,b=this.bed,r=this.ripple,e=this.eta,ring=this.surfaceRing||(this.surfaceRing=new Uint8Array(COUNT)),wet=.012,ocean=(this.worldId===0?C.oceanLevel:WORLD_DEFS[this.worldId].level)+C.oceanTide*Math.sin(this.time*C.oceanRate);
   for(let k=0;k<COUNT;k++){e[k]=b[k]+h[k]+r[k];ring[k]=h[k]>wet?0:255;}
-  for(let pass=1;pass<=2;pass++)for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i;if(ring[k]<255)continue;let low=Infinity;
-   for(let jj=Math.max(0,j-1);jj<=Math.min(N-1,j+1);jj++)for(let ii=Math.max(0,i-1);ii<=Math.min(N-1,i+1);ii++){const q=jj*N+ii;if(ring[q]<pass&&e[q]<low)low=e[q];}
-   if(pass===1&&low===Infinity&&(i===0||j===0||i===N-1||j===N-1))low=ocean;
-   if(low<Infinity){ring[k]=pass;if(low<e[k])e[k]=low;}}
-  return e;
+  for(let pass=1;pass<=2;pass++)for(let j=0;j<N;j++){const j0=j>0?-N:0,j1=j<N-1?N:0;for(let i=0;i<N;i++){const k=j*N+i;if(ring[k]<255)continue;const i0=i>0?-1:0,i1=i<N-1?1:0;let low=Infinity;
+   for(let dj=j0;dj<=j1;dj+=N)for(let di=i0;di<=i1;di++){const q=k+dj+di;if(ring[q]<pass&&e[q]<low)low=e[q];}
+   if(pass===1&&low===Infinity&&(i0===0||j0===0||i1===0||j1===0))low=ocean;
+   if(low<Infinity){ring[k]=pass;if(low<e[k])e[k]=low;}}}
+  this.etaTime=this.time;this.etaEpoch=this.epoch;return e;
  }
- pack(){const e=this.refreshSurface();for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=e[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
+ // The game step refreshes the surface; rendering reuses it unless the water was edited directly.
+ pack(force=false){const e=force||this.etaTime!==this.time||this.etaEpoch!==this.epoch?this.refreshSurface():this.eta;for(let k=0;k<COUNT;k++){let o=k*4;this.tex[o]=e[k];this.tex[o+1]=this.h[k];this.tex[o+2]=this.ux[k];this.tex[o+3]=this.uz[k];}}
  volume(){let v=0;for(const h of this.h)v+=h*DX*DX;return v;}
 }
 /* --------------------------------------------------------------------------
@@ -1431,7 +1432,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  }
  render(game,dt){const gl=this.gl;this.resize();this.makeWaterGrid();this.frame++;lights.update(game,this.water);this.camera(game,dt);profiler?.beginPass('upload');this.uploadSpectrum();
   // Re-pack and upload only after the water changed. Writers outside Water.step set fluidDirty.
-  const ws=this.water;if(this.fluidDirty!==false||ws.time!==this.fluidTime||ws.epoch!==this.fluidEpoch||ws.level!==this.fluidLevel){ws.pack();this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,ws.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,ws.wet);this.fluidTime=ws.time;this.fluidEpoch=ws.epoch;this.fluidLevel=ws.level;this.fluidDirty=false;}profiler?.endPass();
+  const ws=this.water;if(this.fluidDirty!==false||ws.time!==this.fluidTime||ws.epoch!==this.fluidEpoch||ws.level!==this.fluidLevel){ws.pack(this.fluidDirty!==false);this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,ws.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,ws.wet);this.fluidTime=ws.time;this.fluidEpoch=ws.epoch;this.fluidLevel=ws.level;this.fluidDirty=false;}profiler?.endPass();
   if(game.rescue?.active)this.prepareRescueMeshes(game);profiler?.beginPass('skyLight');this.updateSky(game);profiler?.endPass();
   profiler?.beginPass('localShadows');this.updateLampShadows(game);profiler?.endPass();
   profiler?.beginPass('waveCache');this.updateCache(game);profiler?.endPass();
@@ -1766,7 +1767,9 @@ class Game{
    and water stay fully 3D; labels remain crisp at native CSS resolution.
    ------------------------------------------------------------------------ */
 function drawOverlay(game,renderer,ctx){
- const scale=Math.min(devicePixelRatio||1,2),w=innerWidth,h=innerHeight,canvas=ctx.canvas;if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}ctx.setTransform(scale,0,0,scale,0,0);ctx.clearRect(0,0,w,h);if(game.dive||!C.overlay||C.environment!==0)return;
+ const scale=Math.min(devicePixelRatio||1,2),w=innerWidth,h=innerHeight,canvas=ctx.canvas;if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}
+ // Only the Sluice scene draws here. An idle overlay that is already clear is left alone.
+ const idle=game.dive||!C.overlay||C.environment!==0;if(idle&&!canvas.overlayDrawn)return;ctx.setTransform(scale,0,0,scale,0,0);ctx.clearRect(0,0,w,h);canvas.overlayDrawn=!idle;if(idle)return;
  const project=(x,y,z)=>renderer.project(x,y,z),water=game.water,t=water.time;
  const pathRing=(x,z,r,y)=>{ctx.beginPath();for(let k=0;k<=48;k++){let a=k/48*TAU,p=project(x+Math.cos(a)*r,y,z+Math.sin(a)*r);if(k===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);}};
  if(game.showFlow&&game.started){ctx.lineWidth=1;for(let z=-13;z<12;z+=2.0)for(let x=-14;x<=14;x+=2.0){let s=water.sample(x,z),l=Math.hypot(s.x,s.z);if(s.depth<.15||l<.022)continue;let d=clamp(l*.75,.35,1.2),a=project(x,s.height+.08,z),b=project(x+s.x/l*d,s.height+.08,z+s.z/l*d),angle=Math.atan2(b.y-a.y,b.x-a.x);ctx.strokeStyle='rgba(226,250,225,'+clamp(.32+l*.12,.32,.75)+')';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.moveTo(b.x-Math.cos(angle-.6)*4,b.y-Math.sin(angle-.6)*4);ctx.lineTo(b.x,b.y);ctx.lineTo(b.x-Math.cos(angle+.6)*4,b.y-Math.sin(angle+.6)*4);ctx.stroke();}}
@@ -1881,7 +1884,7 @@ SCENES.push(
  {id:'arcadeNight',label:'Arcade / night pools',environment:2,level:1,anchor:true,x:0,z:7,look:{dayHour:0,waveScale:1.5,fftHeight:.15,cameraMode:3,orbitYaw:5,orbitRadius:25,orbitHeight:7}},
  {id:'beaconDusk',label:'Beacon / dusk',environment:1,level:1.15,anchor:false,x:-3,z:4,look:{dayHour:18.8,waveScale:4.6,fftHeight:.30,cameraMode:3,orbitYaw:24,orbitRadius:34,orbitHeight:11}});
 function testScenes(mode,scene){if(mode==='suite')return SCENES.slice(0,6);if(mode==='verify')return SCENES.filter(s=>['flow','stress','underwater'].includes(s.id));if(mode==='lighting')return ['beaconDawn','beaconNight','arcadeDive'].map(id=>SCENES.find(s=>s.id===id));if(mode==='lightTour')return SCENES.slice(6);if(['lightAudit','skyCache'].includes(mode))return [SCENES.find(s=>s.id==='beaconNight')];return SCENES.filter(s=>s.id===(mode==='soak'?'stress':scene));}
-function applyBasinLevel(level){for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i,x=i*DX-HALF,z=j*DX-HALF;if(C.environment!==0||z>-16.25&&z<12.25&&Math.abs(x)<21)water.h[k]=Math.max(0,level-water.bed[k]);}water.flux.fill(0);water.ux.fill(0);water.uz.fill(0);water.level=water.previousLevel=level;water.pack();if(renderer)renderer.fluidDirty=true;game.boat.y=water.surface(game.boat.x,game.boat.z)+.06;game.boat.vy=0;}
+function applyBasinLevel(level){for(let j=0;j<N;j++)for(let i=0;i<N;i++){const k=j*N+i,x=i*DX-HALF,z=j*DX-HALF;if(C.environment!==0||z>-16.25&&z<12.25&&Math.abs(x)<21)water.h[k]=Math.max(0,level-water.bed[k]);}water.flux.fill(0);water.ux.fill(0);water.uz.fill(0);water.level=water.previousLevel=level;water.pack(true);if(renderer)renderer.fluidDirty=true;game.boat.y=water.surface(game.boat.x,game.boat.z)+.06;game.boat.vy=0;}
 class Benchmark{
  constructor(owner){this.owner=owner;this.active=false;this.automatic=false;this.finishing=false;this.stage='idle';this.queue=[];this.current=null;this.job=null;this.saved=null;this.samplesTotal=0;this.sceneTime=0;this.stressClock=0;this.a=recall((MOBILE_BRANCH?'tideline.touch.baseline.v1':'tideline.breakwater.baseline.v4'),null);if(this.a?.schema!==2)this.a=null;}
  get locked(){return this.active&&this.automatic||this.finishing||this.owner.diagnostic||this.owner.resultHeld;}

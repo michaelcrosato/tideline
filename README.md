@@ -2,7 +2,7 @@
 
 A water and light lab in one offline HTML file. Sail, tow a disabled boat, change the light, and compare water-rendering features in repeatable tests.
 
-**Current build:** `TL-SURFACE-20261004.1` · Surface 10.0
+**Current build:** `TL-SURFACE-20261005.1` · Surface 10.1
 
 [Source on GitHub](https://github.com/michaelcrosato/tideline) · [Validation workflow](https://github.com/michaelcrosato/tideline/actions/workflows/ci.yml)
 
@@ -35,6 +35,8 @@ The five quick controls are **Time of day, Swell height, Water clarity, Surface 
 - **Wave-height wetness:** scenery shading samples the displaced surface. Nearby surfaces keep two height marks: a fast-draining film and a slower damp mark. Each boat also keeps moisture on its model vertices.
 - **Filtered highlights:** normal variation and unresolved small ripples broaden specular highlights. This is an original variance approximation, not a complete LEAN mapping implementation.
 - **Path wakes:** short stern sources follow both boats. The history preserves the route after a turn. Balanced positive and negative impulses also feed the local ripple field. They do not add transported water volume.
+
+Surface 10.1 is a correctness and cost pass: sluice gates work at the default grid, water no longer climbs walls as a translucent sheet, capsized boats right themselves, reef breakers stop at the breakwater, and several shading and per-frame costs are lower. See [changes](CHANGELOG.md).
 
 The default transport grid, visible mesh, and particle ceiling are unchanged from the previous build. There is no automatic FPS-based quality reduction.
 

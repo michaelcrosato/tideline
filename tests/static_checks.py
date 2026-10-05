@@ -21,7 +21,7 @@ check('Game payload is deferred text',all(f'type="text/plain" id="{key}"' in htm
 check('No remote script or style dependencies',not re.search(r'<(?:script|link)\b[^>]*(?:src|href)=["\'](?:https?:)?//',html,re.I))
 check('No unresolved source markers','@@SURFACE_MODULE@@' not in html and '@@engine.js@@' not in html)
 check('No literal credential or local working path',not re.search(r'github_pat_[A-Za-z0-9_]{25,}|gh[pousr]_[A-Za-z0-9]{25,}|/mnt/data/|/home/oai/|C:\\Users\\',html))
-check('Both startup identity and runtime build are retained',"TL-SURFACE-20261004.1" in html and 'const BUILD=BOOT.config.build' in html)
+check('Both startup identity and runtime build are retained',"TL-SURFACE-20261005.1" in html and 'const BUILD=BOOT.config.build' in html)
 if shutil.which('node'):
     for name in ['bootkit.js','engine.js','surface.js','launch.js']:
         result=subprocess.run(['node','--check',str(ROOT/'src'/name)],capture_output=True,text=True)
