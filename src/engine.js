@@ -402,6 +402,7 @@ num('Surface refinement','bodyDampLife','Hull damp-mark decay (s)',22,2,90,1);
 num('Surface refinement','wetGloss','Wet-surface reflection strength',.45,0,1,.05);
 flag('Surface refinement','filteredHighlights','Filter small-wave highlights',true);
 num('Surface refinement','highlightVariance','Normal variance filter strength',.22,0,.75,.01);
+flag('Surface refinement','farSeaRoughness','Roughen the far sea',true,'Outside the basin the wave LOD fades detail out. Its slope variance widens the highlight instead of leaving a mirror.');
 flag('Surface refinement','persistentWakes','Persistent boat-path wakes',true);
 num('Surface refinement','wakeSourceStrength','Local wake forcing strength',.025,0,.10,.005,'Balanced local velocity impulses. Not a complete energy-conserving ship wake model.');
 num('Surface refinement','wakeSourceInterval','Wake source interval (s)',.12,.06,.3,.01);
@@ -443,15 +444,16 @@ class OceanSpectrum {
   this.re=new Float64Array(nn);this.im=new Float64Array(nn);this.bands=[];
   let state=(C.worldSeed^0xa8123)>>>0;const random=()=>{state=(Math.imul(state,1664525)+1013904223)>>>0;return (state+.5)/4294967296;};
   const angle=C.fftDirection*Math.PI/180,wx=Math.cos(angle),wz=Math.sin(angle),windLength=C.fftWind*C.fftWind/9.81;
-  for(const length of [48,12]){const h0r=new Float64Array(nn),h0i=new Float64Array(nn),omega=new Float64Array(nn),opposite=new Uint32Array(nn);let expected=0;
+  for(const length of [48,12]){const h0r=new Float64Array(nn),h0i=new Float64Array(nn),omega=new Float64Array(nn),opposite=new Uint32Array(nn);let expected=0,slope=0,energy=0;
    for(let z=0;z<n;z++)for(let x=0;x<n;x++){const k=z*n+x,kx=TAU*(x<=n/2?x:x-n)/length,kz=TAU*(z<=n/2?z:z-n)/length,mag=Math.hypot(kx,kz);opposite[k]=((n-z)%n)*n+(n-x)%n;if(!mag||x===n/2||z===n/2)continue;
     const direction=(kx*wx+kz*wz)/mag;const spread=(1-C.fftSpread)+C.fftSpread*direction*direction;const shortCut=Math.exp(-Math.pow(mag*.085,2));const bandPass=length===48?1-sstep(2.5,4.5,mag):sstep(1.8,3.0,mag);
-    const p=Math.exp(-1/Math.pow(mag*windLength,2))*spread*shortCut*bandPass/Math.pow(mag,4)*(direction>0?1:.25);
+    const p=Math.exp(-1/Math.pow(mag*windLength,2))*spread*shortCut*bandPass/Math.pow(mag,4)*(direction>0?1:.25);slope+=p*mag*mag;energy+=p;
     const g=Math.sqrt(-2*Math.log(random())),phase=TAU*random(),a=Math.sqrt(p*.5);h0r[k]=a*g*Math.cos(phase);h0i[k]=a*g*Math.sin(phase);omega[k]=Math.sqrt(9.81*mag*Math.tanh(mag*C.fftDepth));expected+=2*(h0r[k]*h0r[k]+h0i[k]*h0i[k]);
    }
    // A fixed expected-energy normalization. Do not normalize each frame.
    const scale=nn/Math.sqrt(Math.max(expected,1e-20));for(let i=0;i<nn;i++){h0r[i]*=scale;h0i[i]*=scale;}
-   this.bands.push({length,h0r,h0i,omega,opposite,a:new Float32Array(nn*4),b:new Float32Array(nn*4)});
+   // Mean-square wavenumber of the band. With the unit-RMS height above, this is its slope variance per m² of height.
+   this.bands.push({length,h0r,h0i,omega,opposite,k2:energy>0?slope/energy:0,a:new Float32Array(nn*4),b:new Float32Array(nn*4)});
   }
   this.atlas=new Float32Array(nn*16);this.tick=-1;this.version++;
  }
@@ -869,8 +871,8 @@ const FRAME_FIELDS=[
  ['float','uSpectral uSpectrumAlpha uSpectrumN uSpectrumHeight uSpectrumShort uCacheN uShadowN uShadowSoft uShadowBias uShadowStrength uFocusStrength'],
  ['float','uDaylight uNightAmbient uStars uLocalOn uLocalSpec uBio uLampShadowN uLampBias'],
  ['float','uCoastOn uReefHeight uReefPeriod uReefSpeed uHarbourShelter uReefWidth uCoastPhase uFoamAging uFreshLife uWaveShadow uWaveShadowStrength'],
- ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle'],
- ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8]'],['mat4','uLampVP[2]'],
+ ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle uFarSea'],
+ ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8] uFarSeaTable[4]'],['mat4','uLampVP[2]'],
  ['vec3','uSun uAbsorb uBody uUnderAbsorb uHaze uSolar uMoon uSunTint'],
  // Switched by the preparation passes within a frame (frameFlags).
  ['mat4','uSunVP'],['float','uSkyCacheOn uLampShadowOn uCacheOn uShadowOn uFocusOn uWetReady']
@@ -916,6 +918,8 @@ vec4 fluid(vec2 p){
  return mix(mix(texelFetch(uFluid,i,0),texelFetch(uFluid,i+ivec2(1,0),0),f.x),mix(texelFetch(uFluid,i+ivec2(0,1),0),texelFetch(uFluid,i+ivec2(1,1),0),f.x),f.y);
 }
 float sstep(float a,float b,float v){return smoothstep(a,b,v);}
+// Air haze. Scenery, water and crest sheets share one start distance.
+float airFog(float dist){return 1.-exp(-max(0.,dist-28.)*uFog);}
 float noise2(vec2 p){return sin(p.x+sin(p.y*1.7))*sin(p.y*.83+cos(p.x*1.13));}
 float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 vec2 hash2(vec2 p){return fract(sin(vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))))*43758.5453);}
@@ -981,7 +985,14 @@ vec3 surfaceWorld(vec2 world){vec2 a=world;
  for(int i=0;i<3;i++){vec4 f=fluid(a);Sea s=sea(a,f.y);a=mix(a,world-s.d.xz,.75);}
  vec4 f=fluid(a);Sea s=sea(a,f.y);return vec3(a.x,f.y+s.d.y>.012?f.x+s.d.y:-16.,a.y);
 }
+// Slope variance of the wave detail that the far-sea LOD fades out (same footprint as waterVS).
+// The faded waves still roughen the surface, so their energy widens the highlight.
+// The renderer tabulates it per frame (farSeaTable); this interpolates in log footprint.
+float farSeaVariance(vec2 p){float footprint=max(0.,max(abs(p.x),abs(p.y))-26.)*.13;if(footprint<=0.||uFarSea<.5)return 0.;
+ // Linear interpolation written as hat weights with constant indices (no dynamic indexing).
+ float x=clamp(log2(max(footprint,.05)/.05)/.6,0.,15.),v=0.;for(int k=0;k<4;k++)v+=dot(uFarSeaTable[k],max(vec4(0.),1.-abs(x-vec4(0.,1.,2.,3.)-float(k*4))));return v;}
 float filteredWaterRoughness(vec2 anchor,vec3 n,float r){
+ float far=farSeaVariance(anchor);if(far>0.)r=pow(min(.4096,pow(r,4.)+min(.08,far)),.25);
  if(uFilteredHighlights<.5)return r;
  vec3 dx=dFdx(n),dy=dFdy(n);float variance=(dot(dx,dx)+dot(dy,dy))*.5;
  float width=length(fwidth(anchor));
@@ -1029,7 +1040,7 @@ void main(){vec4 f=fluid(vP.xz);float surface=f.x;
   col+=film*uWetGloss*(localWater(vP,n,view,wr)*.24+uSunTint*uSunStrength*min(20.,sp)*nl*.02);
  }
  col+=uEmissiveTint*uGlow;
- float dist=length(vP-uEye);if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);col=col*tr+uHaze*(1.-tr);}else if(dist>28.)col=mix(col,skyColor(normalize(vP-uEye)),1.-exp(-(dist-28.)*uFog));outColor=vec4(col,1.);
+ float dist=length(vP-uEye);if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);col=col*tr+uHaze*(1.-tr);}else{float fog=airFog(dist);if(fog>0.)col=mix(col,skyColor(normalize(vP-uEye)),fog);}outColor=vec4(col,1.);
 }`;
 const waterVS=`#version 300 es
 ${sharedGLSL}
@@ -1112,7 +1123,7 @@ void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;
   float crest=smoothstep(.1,2.8,vSea.y),back=pow(max(0.,dot(v,-sun+n*.24)),3.);col+=crestLight(mix(2.2,.6,crest))*uSunTint*(crest*(.12+back)*uSSS)*uSunStrength*(1.-fresnel)*lightVisibility;
   vec3 lampDiffuse=foam>.001?localDiffuse(vP,n):vec3(0.);vec3 foamCol=vec3(.73,.88,.91)*(uAmbient*.48+.4*max(0.,dot(n,sun))*uSunStrength*uSunTint*lightVisibility+lampDiffuse*.65);col=mix(col,foamCol,clamp(foam,0.,uFoamOpacity));
   col+=localWater(vP,n,v,rough)*(1.-clamp(foam,0.,.8));float wakeRadius=length(vP.xz-uBoat.xy);col+=vec3(.006,.28,.63)*uBio*clamp(foam,0.,1.)*(.18+exp(-wakeRadius*.15)*clamp(uBoat.w*.3,0.,1.));
-  float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);if(fog>0.)col=mix(col,skyColor(normalize(vP-uEye)),fog);
+  float fog=airFog(length(uEye-vP));if(fog>0.)col=mix(col,skyColor(normalize(vP-uEye)),fog);
   if(uOpticsDebug>.5&&uTraceReady>.5){vec4 dr=readStableReflection(uv,n,surfaceZ);if(uOpticsDebug<1.5)col=mix(vec3(.08,.012,.025),vec3(.12,.8,.62),dr.a);else if(uOpticsDebug<2.5)col=mix(vec3(.3,.04,.02),vec3(.04,.85,.65),clamp((length(texture(uStableGeometry,uv).xyz)-1.)/.68,0.,1.));else col=texture(uStableReflection,uv).rgb;}
  }else{
   vec3 I=-v,N=-n;float ci=clamp(dot(-I,N),0.,1.),sint2=uWaterIOR*uWaterIOR*(1.-ci*ci),tir=step(1.,sint2);
@@ -1431,11 +1442,18 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.frameSet({uTime:this.water.time,uGrid:N,uDX:DX,uLevel:this.water.level,
    uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
    uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
-   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle});
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness});
   this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(this.water.time),o.uMode);
+  this.farSeaTable(f.subarray(o.uFarSeaTable,o.uFarSeaTable+16),f.subarray(o.uWave),f.subarray(o.uMode));
   f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
   f.set(lights.sun,o.uSun);f.set([C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale],o.uAbsorb);f.set([C.bodyR*amb[0],C.bodyG*amb[1],C.bodyB*amb[2]],o.uBody);f.set([C.underR,C.underG,C.underB],o.uUnderAbsorb);f.set([C.hazeR*amb[0],C.hazeG*amb[1],C.hazeB*amb[2]],o.uHaze);
   f.set(lights.solar,o.uSolar);f.set(lights.moon,o.uMoon);f.set(lights.tint,o.uSunTint);
+ }
+ // Slope variance of the wave detail the far-sea LOD fades out, at footprints 0.05·2^(0.6i), i=0..15.
+ // Same LOD terms as seaRaw: Gerstner modes give ½(ka)² each; the spectral bands give height²·mean k².
+ farSeaTable(out,wave,mode){const spectral=C.spectral&&C.waves&&spectrum.bands.length?C.fftHeight*C.fftHeight*(spectrum.bands[0].k2+spectrum.bands[1].k2*C.fftShort*C.fftShort):0;
+  for(let i=0;i<16;i++){const footprint=.05*Math.pow(2,.6*i);let v=0;for(let j=0;j<storm.count;j++){const k=wave[j*4+2],lod=1-sstep(.6,3,k*footprint),ka=mode[j*4]*k;v+=.5*ka*ka*(1-lod*lod);}
+   const band=1-sstep(.25,1.5,footprint);out[i]=v+spectral*(1-band*band);}
  }
  // Readiness flags that the preparation passes switch within a frame, and the sun
  // shadow matrix that updateShadow replaces. Read again before every pass.
@@ -2486,7 +2504,7 @@ void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?v
  float f=smoothstep(.45,.98,vLip)*(.35+.65*noise(vAnchor*11.+uTime*.9));vec3 foam=vec3(.73,.86,.83)*(uAmbient*.55+uSunTint*uSunStrength*(.24+.65*max(0.,dot(n,l)))+localDiffuse(vP,n)*.6);
  float lip=clamp(f,0.,.85);color=mix(color,foam,lip)+localWater(vP,n,v,uRoughness)*.6;
  color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}
- else{float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);if(fog>0.)color=mix(color,skyColor(normalize(vP-uEye)),fog);}
+ else{float fog=airFog(length(uEye-vP));if(fog>0.)color=mix(color,skyColor(normalize(vP-uEye)),fog);}
  float cover=max(mix(.38,.9,fr),lip*1.1);outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,1.)*clamp(cover,0.,.96));
 }`;
 Renderer.prototype.drawCrests=function(game){if(C.environment!==3||!C.coastalWaves||!C.curlSheet||!C.waterVisible||!C.waves||C.curlStrength<=0||C.reefHeight<=0)return;const gl=this.gl;
@@ -3358,7 +3376,7 @@ try{
  await BOOT.run('L80','Ready fence',()=>new Promise((resolve,reject)=>{const gl=renderer.gl,sync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);if(!sync){reject(BootKit.error('GFX-FENCE','The first-frame completion fence could not be created.'));return;}gl.flush();const check=()=>{if(BOOT.failed){gl.deleteSync(sync);reject(BootKit.error('BOOT-CANCELLED','First frame cancelled.'));return;}const r=gl.clientWaitSync(sync,0,0);if(r===gl.TIMEOUT_EXPIRED){setTimeout(check,20);return;}gl.deleteSync(sync);const err=gl.getError();if(r===gl.WAIT_FAILED||err!==gl.NO_ERROR){reject(BootKit.error('FRAME-GPU','The first game frame failed. GL error '+err+'.'));return;}BOOT.report.renderer.firstFrameComplete=true;resolve();};setTimeout(check,20);}),30000);
  // Debug tools are opt-in and are not used to drive gameplay. They make the
  // shipped single file directly inspectable in a browser or automated test.
- window.__tideline={surfaceFeatures:SURFACE_FEATURES,quickLook:{controls:QUICK_LOOK,set:lookSet,reset:resetLook,sync:()=>{gallerySync();lookSync(mobileUI?.root);},pane:showLookPane},ContactPhysics,ContactWorld,bodySpec,contactStudy,mobile:mobileUI,uiBranch:MOBILE_BRANCH?'mobile':'desktop',surfaceStudy,wallWaveCheck,Rescue,coastalSample,rescueTerrain,lights,WORLD_DEFS,chooseWorld,testScenes,drawAbyssCard,water,game,renderer,storm,spectrum,OceanSpectrum,analyzeReport,framesCSV,UPGRADE_KEYS,Sound,Water,DT,terrainHeight,lab,profiler,settings:C,parameters:PARAMS,build:BUILD,profiles:WORKLOAD_PROFILES,phonePreset:PHONE_PRESET,phonePresetReport,limits:{BENCH_MAX_MS,BENCH_RESERVE_MS},summarize,distribution,gpuSampleSelected,
+ window.__tideline={surfaceFeatures:SURFACE_FEATURES,upgradeFeatures:UPGRADE_FEATURES,quickLook:{controls:QUICK_LOOK,set:lookSet,reset:resetLook,sync:()=>{gallerySync();lookSync(mobileUI?.root);},pane:showLookPane},ContactPhysics,ContactWorld,bodySpec,contactStudy,mobile:mobileUI,uiBranch:MOBILE_BRANCH?'mobile':'desktop',surfaceStudy,wallWaveCheck,Rescue,coastalSample,rescueTerrain,lights,WORLD_DEFS,chooseWorld,testScenes,drawAbyssCard,water,game,renderer,storm,spectrum,OceanSpectrum,analyzeReport,framesCSV,UPGRADE_KEYS,Sound,Water,DT,terrainHeight,lab,profiler,settings:C,parameters:PARAMS,build:BUILD,profiles:WORKLOAD_PROFILES,phonePreset:PHONE_PRESET,phonePresetReport,limits:{BENCH_MAX_MS,BENCH_RESERVE_MS},summarize,distribution,gpuSampleSelected,
   stats:()=>({level:water.level,time:game.elapsed,volume:water.volume(),boundaryVolume:water.boundaryVolume,boat:{...game.boat},cells:game.cells.map(c=>({...c,depth:water.sample(c.x,c.z).depth,bed:terrainHeight(c.x,c.z)})),gates:water.gates.map(g=>({...g})),collected:game.collected,paused:game.paused,free:game.free,result:game.result,frames:game.frames,particles:game.particles.length,error:renderer.gl.getError()}),
   conservationCheck:(steps=180)=>{let test=new Water();test.gates[1].value=test.gates[1].target=0;let before=test.volume();for(let i=0;i<steps;i++)test.step(DT,true);let after=test.volume();return{before,after,relativeDrift:Math.abs(after-before)/before,minDepth:test.h.reduce((a,b)=>Math.min(a,b),Infinity),finite:test.h.every(Number.isFinite)};}
  };
