@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Touch regression with reduced graphics, not a physical-phone performance test.
 The pointer release check dispatches a synthetic pointer event; the other touch
-sequences use CDP contacts. In-memory HTML avoids local-navigation restrictions.
+sequences use CDP contacts. In-memory HTML is served from a routed origin, which avoids local-navigation
+restrictions and keeps localStorage available.
 """
 import argparse,asyncio,json,sys
 from pathlib import Path
 from playwright.async_api import async_playwright
 from regression import REDUCED,ROOT
+URL='https://tideline.test/'
 async def main(args):
  output=Path(args.output);output.mkdir(parents=True,exist_ok=True)
  async with async_playwright() as p:
@@ -15,12 +17,22 @@ async def main(args):
   page=await context.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
   settings={**REDUCED,'visualGrid':97,'waveCount':8,'ssr':False,'localFog':False,'sunShadows':False,'focusedCaustics':False,'reflection':False,'sprayRate':0,'underParticles':0}
   html=(ROOT/'index.html').read_text().replace('if(boot.tests&&window.__BOOT_TEST_SETTINGS)','boot.tests=true;window.__BOOT_TEST_SETTINGS='+json.dumps(settings)+';if(boot.tests&&window.__BOOT_TEST_SETTINGS)')
-  await page.set_content(html,wait_until='domcontentloaded');await page.wait_for_selector('#sb-startWindow:enabled',timeout=90000);await page.click('#sb-startWindow');await page.wait_for_function('TIDELINE_BOOT.running||TIDELINE_BOOT.failed',timeout=150000)
-  assert await page.evaluate('TIDELINE_BOOT.running')
-  # Stop only the rendering scheduler. Input and UI remain active for multi-touch tests.
-  await page.evaluate('window.D=__tideline;window.requestAnimationFrame=()=>0;D.game.paused=false;D.mobile.root.hidden=false');await page.wait_for_timeout(900)
+  # A routed origin gives the page real localStorage, which the phone preset checks need.
+  await context.route('**/*',lambda r:r.fulfill(body=html,content_type='text/html') if r.request.url==URL else r.abort())
+  async def boot(page):
+   await page.goto(URL,wait_until='domcontentloaded');await page.wait_for_selector('#sb-startWindow:enabled',timeout=90000);await page.click('#sb-startWindow');await page.wait_for_function('TIDELINE_BOOT.running||TIDELINE_BOOT.failed',timeout=150000)
+   assert await page.evaluate('TIDELINE_BOOT.running')
   rows=[]
   def check(name,ok,detail=None):rows.append({'name':name,'passed':bool(ok),'detail':detail});print(name,ok,flush=True)
+  await boot(page)
+  # Phone preset: first run with no saved settings. Reduced test settings load after the
+  # preset, so every preset key they do not set must hold the preset value.
+  first=await page.evaluate('()=>({report:__tideline.phonePresetReport(),hardware:__tideline.profiler.hardware().qualityPreset,live:{...__tideline.settings},preset:__tideline.phonePreset})')
+  untouched={k:v for k,v in first['preset'].items() if k not in settings}
+  check('Phone preset applied on first run',first['report']['appliedThisRun'] and first['report']['appliedAt'] and untouched and all(first['live'][k]==v for k,v in untouched.items()) and set(first['report']['overridden'])<=set(settings),{'report':first['report'],'untouched':untouched})
+  check('Phone preset recorded in reports',(first['hardware'] or {}).get('name')=='phone' and first['hardware']['appliedThisRun'] and first['hardware']['appliedAt'] and first['hardware']['settings']==first['preset'],first['hardware'])
+  # Stop only the rendering scheduler. Input and UI remain active for multi-touch tests.
+  await page.evaluate('window.D=__tideline;window.requestAnimationFrame=()=>0;D.game.paused=false;D.mobile.root.hidden=false');await page.wait_for_timeout(900)
   check('Mobile branch selected',await page.evaluate('D.uiBranch==="mobile"'))
   check('No visible joystick',not await page.locator('#joystick').is_visible())
   await page.click('[data-m-nav="light"]')
@@ -62,6 +74,13 @@ async def main(args):
   check('Landscape panel stays on screen',await page.locator('#mSheet').evaluate('(e)=>{const r=e.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1}'))
   await page.screenshot(path=str(output/'mobile-landscape.png'))
   check('No mobile JavaScript exceptions',not errors,errors)
+  await page.evaluate("D.lab.set('reflectionEvery',1)");await page.wait_for_timeout(600)
+  # A second page in the same context shares localStorage: the user's override must survive.
+  page2=await context.new_page();page2.on('pageerror',lambda e:errors.append(str(e)));await boot(page2)
+  second=await page2.evaluate('''()=>{const D=__tideline;window.requestAnimationFrame=()=>0;return{report:D.phonePresetReport(),reflectionEvery:D.settings.reflectionEvery,saved:JSON.parse(localStorage.getItem('tideline.contact.mobile.v9')).settings.reflectionEvery}}''')
+  check('Phone preset applies only once',not second['report']['appliedThisRun'] and second['report']['appliedAt'] and second['report']['appliedAt']==first['report']['appliedAt'],second)
+  check('User override of phone preset is kept',second['reflectionEvery']==1 and second['saved']==1 and 'reflectionEvery' in second['report']['overridden'],second)
+  check('No JavaScript exceptions after reopening',not errors,errors)
   out={'environment':'Chromium with emulated mobile touch; reduced test graphics; no physical phone','passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows}
   (output/'mobile-tests.json').write_text(json.dumps(out,indent=2));print(json.dumps(out,indent=2))
   await context.close()

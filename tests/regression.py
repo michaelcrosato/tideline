@@ -45,6 +45,7 @@ async def main(args):
     record(name,ok,data)
    except Exception as e:record(name,False,{'error':str(e)})
   await check('All reduced-setting keys exist','return '+json.dumps(list(['grid','visualGrid','cacheSize','maxPixels','renderScale','reflectionScale','shadowSize','lampShadowSize','foamResolution','focusSize','fftPower','particleLimit','sprayRate','underParticles','ssrSteps','airCubeSize','wetHistorySize']))+'.every(k=>D.parameters.some(p=>p.key===k));')
+  await check('Desktop never applies the phone preset','return D.uiBranch==="desktop"&&D.phonePresetReport()===null&&D.profiler.hardware().qualityPreset===null;')
   await check('Five quick controls are retained','return D.quickLook.controls.length===5;')
   await check('Four new feature switches are enabled','return D.surfaceFeatures.length===4&&D.surfaceFeatures.every(k=>C[k]===true);')
   await check('Advanced parameters have unique keys','return new Set(D.parameters.map(p=>p.key)).size===D.parameters.length;')

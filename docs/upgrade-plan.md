@@ -17,7 +17,7 @@ This is the working plan for the Surface 10.2 upgrade series. Each milestone is 
 
 | Milestone | Effort | State | PR | Notes |
 |---|---|---|---|---|
-| M0 Phone quality defaults | Medium | Not started | | |
+| M0 Phone quality defaults | Medium | Done | PR_LINK | `PHONE_PRESET` applied once on first touch-UI run with no saved settings; recorded as `hardware.qualityPreset` in reports; `tests/mobile.py` checks first run, report, apply-once and user override. Not added to the `mGraphics` menu (no way to re-apply it after overriding); `renderer.high` left on. Build ID/CHANGELOG/README deferred to the end of Phase 1. |
 | M1 Shared uniform buffer | Extra high | Not started | | |
 | M2 Lighting fixes + `lightStyle` | High | Not started | | |
 | M3 Far-sea roughness | Medium | Not started | | |
