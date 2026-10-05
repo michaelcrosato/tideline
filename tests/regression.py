@@ -75,6 +75,25 @@ async def main(args):
    const t=r.surfaceWetTargets[r.surfaceWetRead],gl=r.gl,p=new Uint8Array(4),px=Math.floor((-7+26)/52*t.w),py=Math.floor((15+26)/52*t.h);gl.bindFramebuffer(gl.FRAMEBUFFER,t.fbo);gl.readPixels(px,py,1,1,gl.RGBA,gl.UNSIGNED_BYTE,p);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
    const dec=(a,b)=>(a*256+b)/65535*48-16,film=dec(p[0],p[1]),damp=dec(p[2],p[3]);return {ok:film>1.7&&damp>=film&&damp<=2.03,film,damp};
    }finally{Object.assign(C,save);w.h.set(h);w.level=lev;D.storm.sync();r.clearSurfaceHistory();}''')
+  # Frame uniform block: one std140 buffer for the shared values, sent once per frame.
+  await check('Shared values use one uniform block in every shared program', '''const gl=r.gl,handles=Object.entries(r).filter(([,v])=>v&&v.p instanceof WebGLProgram&&v.loc),members=new Set(),bad=[],stale=[];let blocks=0;
+   for(const [name,h] of handles){const i=gl.getUniformBlockIndex(h.p,'Frame');if(i===gl.INVALID_INDEX){if(gl.getUniformLocation(h.p,'uFluid'))bad.push(name);continue;}blocks++;
+    if(gl.getActiveUniformBlockParameter(h.p,i,gl.UNIFORM_BLOCK_BINDING)!==0||gl.getActiveUniformBlockParameter(h.p,i,gl.UNIFORM_BLOCK_DATA_SIZE)>r.frameData.byteLength)bad.push(name);
+    for(const u of gl.getActiveUniformBlockParameter(h.p,i,gl.UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES))members.add(gl.getActiveUniform(h.p,u).name.replace('[0]',''));}
+   // A location lookup for a block member returns null, so a leftover per-pass upload would do nothing.
+   for(const [name,h] of handles)for(const k of Object.keys(h.loc))if(members.has(k.replace('[0]','')))stale.push(name+'.'+k);
+   return {ok:blocks>=12&&members.size>=90&&!bad.length&&!stale.length&&gl.getIndexedParameter(gl.UNIFORM_BUFFER_BINDING,0)===r.frameBuffer,programs:blocks,members:members.size,bytes:r.frameData.byteLength,bad,stale};''')
+  await check('Frame block holds the values of the frame just drawn', '''const saved={...C};try{C.renderScale=.4;C.visualGrid=65;C.sprayRate=0;C.underParticles=0;D.storm.sync();r.render(g,1/60);
+   const gl=r.gl,names=['uTime','uLevel','uWaveCount','uMode[0]','uSunVP','uCacheOn','uShadowOn','uWetReady','uSun','uReefPeriod','uNaturalFoam'],off=gl.getActiveUniforms(r.waterProgram.p,gl.getUniformIndices(r.waterProgram.p,names),gl.UNIFORM_OFFSET).map(b=>b/4);
+   const buf=new ArrayBuffer(r.frameData.byteLength),f=new Float32Array(buf),n=new Int32Array(buf);gl.bindBuffer(gl.UNIFORM_BUFFER,r.frameBuffer);gl.getBufferSubData(gl.UNIFORM_BUFFER,0,f);
+   const same=(a,b)=>a===Math.fround(b),mode=D.storm.phases(w.time);
+   const v={time:same(f[off[0]],w.time),level:same(f[off[1]],w.level),waveCount:n[off[2]]===D.storm.count,modes:[0,1,2,4,5,6].every(i=>f[off[3]+i]===mode[i]),sunVP:r.sunVP.every((x,i)=>same(f[off[4]+i],x)),
+    cache:f[off[5]]===+(C.waveCache&&r.cacheReady&&r.hdr),shadow:f[off[6]]===+(C.sunShadows&&r.shadowReady),wet:f[off[7]]===+!!r.surfaceWetReady,sun:[0,1,2].every(i=>same(f[off[8]+i],D.lights.sun[i])),reef:same(f[off[9]],C.reefPeriod),surface:f[off[10]]===+C.naturalFoam};
+   return {ok:Object.values(v).every(Boolean),...v};}finally{Object.assign(C,saved);D.storm.sync();}''')
+  await check('Frame block is sent once per frame', '''const saved={...C},gl=r.gl,send=gl.bufferSubData;let full=0,flags=0;
+   try{C.renderScale=.4;C.visualGrid=65;C.sprayRate=0;C.underParticles=0;D.storm.sync();r.render(g,1/60);
+    gl.bufferSubData=function(t,o,...rest){if(t===gl.UNIFORM_BUFFER){if(o===0)full++;else flags++;}return send.call(this,t,o,...rest);};
+    r.render(g,1/60);return {ok:full===1&&flags<=8,fullUploads:full,flagUploads:flags};}finally{gl.bufferSubData=send;Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

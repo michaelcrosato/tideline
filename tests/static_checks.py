@@ -22,6 +22,10 @@ check('No remote script or style dependencies',not re.search(r'<(?:script|link)\
 check('No unresolved source markers','@@SURFACE_MODULE@@' not in html and '@@engine.js@@' not in html)
 check('No literal credential or local working path',not re.search(r'github_pat_[A-Za-z0-9_]{25,}|gh[pousr]_[A-Za-z0-9]{25,}|/mnt/data/|/home/oai/|C:\\Users\\',html))
 check('Both startup identity and runtime build are retained',"TL-SURFACE-20261005.1" in html and 'const BUILD=BOOT.config.build' in html)
+engine=(ROOT/'src/engine.js').read_text(encoding='utf-8')
+shared=[re.search(r'const '+name+r'=`(.*?)`;',engine,re.S) for name in ['sharedGLSL','surfaceGLSL']]
+plain=[t for m in shared if m for t in re.findall(r'\buniform\s+(?:(?:highp|mediump|lowp)\s+)?(\w+)',m.group(1)) if not t.startswith('sampler')]
+check('Shared shader values are declared only in the Frame block',all(shared) and '${FRAME.glsl}' in shared[0].group(1) and not plain)
 if shutil.which('node'):
     for name in ['bootkit.js','engine.js','surface.js','launch.js']:
         result=subprocess.run(['node','--check',str(ROOT/'src'/name)],capture_output=True,text=True)

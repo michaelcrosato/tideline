@@ -44,7 +44,7 @@ Constraints set by the project owner:
 
 **Working rules.** These apply to every milestone:
 - Edit `src/engine.js` and `src/surface.js` only, then rebuild with `python tools/build.py`. Never edit `index.html` by hand.
-- Each new feature gets a registry `flag`/`num` and joins a Prior/New comparison. Follow the `SURFACE_FEATURES` pattern in `src/surface.js`, which covers the list, the `settings()` wrapper, the `Benchmark.prototype.variants` mode and `surfaceReport`.
+- Each new feature gets a registry `flag`/`num` and joins a Prior/New comparison. Follow the `SURFACE_FEATURES` pattern in `src/surface.js`, which covers the list, the `frameValues()` wrapper (since M1, shader values are `FRAME_FIELDS` entries in the shared `Frame` block, not per-pass uniforms), the `Benchmark.prototype.variants` mode and `surfaceReport`.
 - No automatic FPS-based quality changes, matching the existing design rule.
 - Simulated state stays deterministic. Render-only smoothing must never feed simulation, benchmark hashes or `water.time`.
 - Bump the build to `TL-SURFACE-2026MMDD.1` / Surface 10.2 when the work is finished. Update CHANGELOG, README, `docs/architecture.md`, `tests/static_checks.py` and `tests/regression.py` to match.
