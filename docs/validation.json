@@ -1,0 +1,496 @@
+{
+  "build": "TL-SURFACE-20261004.1",
+  "sourceHTMLSHA256": "2561a6df3520964c3131d37ae0130716138b5cc674ea788775817b64044f082f",
+  "core": {
+    "build": "TL-SURFACE-20261004.1",
+    "testEnvironment": "Chromium / software graphics / reduced settings / in-memory HTML",
+    "seconds": 10.72,
+    "passed": 24,
+    "total": 24,
+    "tests": [
+      {
+        "name": "Engine is deferred until Start",
+        "passed": true,
+        "data": null
+      },
+      {
+        "name": "Fourteen startup stages and first GPU frame",
+        "passed": true,
+        "data": {
+          "running": true,
+          "errors": [],
+          "stages": [
+            {
+              "code": "B10",
+              "status": "pass"
+            },
+            {
+              "code": "B20",
+              "status": "pass"
+            },
+            {
+              "code": "B30",
+              "status": "pass"
+            },
+            {
+              "code": "B40",
+              "status": "pass"
+            },
+            {
+              "code": "B50",
+              "status": "pass"
+            },
+            {
+              "code": "B60",
+              "status": "pass"
+            },
+            {
+              "code": "L10",
+              "status": "pass"
+            },
+            {
+              "code": "L20",
+              "status": "pass"
+            },
+            {
+              "code": "L30",
+              "status": "pass"
+            },
+            {
+              "code": "L40",
+              "status": "pass"
+            },
+            {
+              "code": "L50",
+              "status": "pass"
+            },
+            {
+              "code": "L60",
+              "status": "pass"
+            },
+            {
+              "code": "L70",
+              "status": "pass"
+            },
+            {
+              "code": "L80",
+              "status": "pass"
+            }
+          ]
+        }
+      },
+      {
+        "name": "All reduced-setting keys exist",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Five quick controls are retained",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Four new feature switches are enabled",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Advanced parameters have unique keys",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Wet history uses a bounded map",
+        "passed": true,
+        "data": {
+          "report": {
+            "features": {
+              "naturalFoam": true,
+              "waveWetness": true,
+              "filteredHighlights": true,
+              "persistentWakes": true
+            },
+            "wetHistorySize": 128,
+            "wetHistoryReady": true,
+            "bodyWetHz": 10,
+            "hullSamples": 169,
+            "workboatSamples": 211,
+            "wakeSources": 0,
+            "wakeNetError": 0,
+            "notes": "Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase."
+          }
+        }
+      },
+      {
+        "name": "New shaders linked successfully",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Body wetness is attached to both boat meshes",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Wake impulse has zero signed source",
+        "passed": true,
+        "data": {
+          "cells": 18,
+          "net": -3.642919299551295e-17
+        }
+      },
+      {
+        "name": "Wake source is balanced beside a dry boundary",
+        "passed": true,
+        "data": {
+          "cells": 18,
+          "net": 2.949029909160572e-17
+        }
+      },
+      {
+        "name": "Wake generation is disabled by its switch",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "Hull films remain on the model and dry faster than damp marks",
+        "passed": true,
+        "data": {
+          "wetVertices": 39,
+          "dryUpperVertices": 107,
+          "filmDriesFaster": true
+        }
+      },
+      {
+        "name": "Graphics history save and restore retains boat moisture",
+        "passed": true,
+        "data": {
+          "film": 0.6100000143051147,
+          "damp": 0.8199999928474426
+        }
+      },
+      {
+        "name": "Short sources follow turns, not a moving V mask",
+        "passed": true,
+        "data": {
+          "sources": 20,
+          "net": 3.642919299551295e-17
+        }
+      },
+      {
+        "name": "All visual switches can render off and on",
+        "passed": true,
+        "data": true
+      },
+      {
+        "name": "GPU wet marks keep high water after a fall",
+        "passed": true,
+        "data": {
+          "film": 1.9453421835660336,
+          "damp": 1.9936827649347677
+        }
+      },
+      {
+        "name": "Water transport stays finite and conservative",
+        "passed": true,
+        "data": {
+          "before": 12323.703117532423,
+          "after": 12323.703149857116,
+          "relativeDrift": 2.6229691560593104e-09,
+          "minDepth": 0,
+          "finite": true
+        }
+      },
+      {
+        "name": "Calm-water drop still settles without relaunch",
+        "passed": true,
+        "data": {
+          "maxUp": 0.3777740710083146,
+          "airAfterEntry": 0,
+          "entries": 1,
+          "finalVy": 4.767034189223748e-11
+        }
+      },
+      {
+        "name": "Benchmark settings have six default segments",
+        "passed": true,
+        "data": {
+          "options": {
+            "totalSeconds": 60,
+            "activeSeconds": 57,
+            "warmup": 1.25,
+            "seconds": 4,
+            "repeats": 2,
+            "scene": "beaconNight",
+            "mode": "surface"
+          }
+        }
+      },
+      {
+        "name": "Comparison changes only declared surface switches",
+        "passed": true,
+        "data": {
+          "diff": [
+            "naturalFoam",
+            "waveWetness",
+            "filteredHighlights",
+            "persistentWakes"
+          ]
+        }
+      },
+      {
+        "name": "Memory accounting includes the added maps",
+        "passed": true,
+        "data": {
+          "extraMapBytes": 131072
+        }
+      },
+      {
+        "name": "No JavaScript exceptions",
+        "passed": true,
+        "data": []
+      },
+      {
+        "name": "No external runtime requests",
+        "passed": true,
+        "data": []
+      }
+    ],
+    "limitations": [
+      "Not tested on physical Android/iOS or RTX hardware.",
+      "These checks are not a performance rating."
+    ]
+  },
+  "mobile": {
+    "environment": "Chromium with emulated mobile touch; reduced test graphics; no physical phone",
+    "passed": 10,
+    "total": 10,
+    "tests": [
+      {
+        "name": "Mobile branch selected",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "No visible joystick",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "Five mobile quick sliders",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "Fullscreen entry is visible",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "Independent steering and camera contacts",
+        "passed": true,
+        "detail": {
+          "steering": true,
+          "camera": true,
+          "sliders": 0,
+          "contacts": [
+            "steer",
+            "camera"
+          ],
+          "stick": {
+            "x": 0.7808688094430304,
+            "z": -0.6246950475544243
+          },
+          "reel": 0,
+          "counts": {
+            "steerStarts": 1,
+            "cameraStarts": 1,
+            "simultaneous": 1,
+            "uiWhileSteering": 0,
+            "cancelled": 0
+          },
+          "lastReset": "ready"
+        }
+      },
+      {
+        "name": "Slider works while steering remains held",
+        "passed": true,
+        "detail": {
+          "before": 18.8,
+          "after": 13.12,
+          "snapshot": {
+            "steering": true,
+            "camera": false,
+            "sliders": 1,
+            "contacts": [
+              "steer"
+            ],
+            "stick": {
+              "x": 0.7808688094430304,
+              "z": -0.6246950475544243
+            },
+            "reel": 0,
+            "counts": {
+              "steerStarts": 2,
+              "cameraStarts": 1,
+              "simultaneous": 1,
+              "uiWhileSteering": 1,
+              "cancelled": 0
+            },
+            "lastReset": "ready"
+          },
+          "ranges": [
+            {
+              "active": true,
+              "scroll": false,
+              "x": 144.60000610351562,
+              "value": "13.12"
+            }
+          ]
+        }
+      },
+      {
+        "name": "Independent pointer release keeps steering",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "Rotation clears held steering",
+        "passed": true,
+        "detail": {
+          "steering": false,
+          "camera": false,
+          "sliders": 0,
+          "contacts": [],
+          "stick": {
+            "x": 0,
+            "z": 0
+          },
+          "reel": 0,
+          "counts": {
+            "steerStarts": 2,
+            "cameraStarts": 1,
+            "simultaneous": 1,
+            "uiWhileSteering": 1,
+            "cancelled": 0
+          },
+          "lastReset": "orientation-changed"
+        }
+      },
+      {
+        "name": "Landscape panel stays on screen",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "No mobile JavaScript exceptions",
+        "passed": true,
+        "detail": []
+      }
+    ]
+  },
+  "defaultDetailStartup": {
+    "running": true,
+    "firstFrameComplete": true,
+    "errors": [],
+    "settings": {
+      "grid": 209,
+      "mesh": 657,
+      "particles": 26000,
+      "fftPower": 7,
+      "wetMap": 256,
+      "renderSize": [
+        1375,
+        950
+      ]
+    },
+    "features": {
+      "features": {
+        "naturalFoam": true,
+        "waveWetness": true,
+        "filteredHighlights": true,
+        "persistentWakes": true
+      },
+      "wetHistorySize": 256,
+      "wetHistoryReady": true,
+      "bodyWetHz": 10,
+      "hullSamples": 169,
+      "workboatSamples": 211,
+      "wakeSources": 0,
+      "wakeNetError": 0,
+      "notes": "Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase."
+    },
+    "bootSeconds": 16.95,
+    "jsErrors": []
+  },
+  "staticChecks": {
+    "passed": 11,
+    "total": 11,
+    "scope": "Build identity, deterministic assembly, offline dependencies, JavaScript syntax, credential/local-path scan"
+  },
+  "publicationHelper": {
+    "passed": 9,
+    "total": 9,
+    "scope": "Mocked calls only. No repository was created by these unit tests."
+  },
+  "scheduleAndExports": {
+    "testSettings": "Explicitly reduced software-rendering settings. Not a hardware speed rating.",
+    "totalLimitMs": 60000,
+    "resultReadyMs": 58731.09999999986,
+    "segments": 6,
+    "measuredFrames": 51,
+    "retainedWarnings": "Weak frame/GPU sample counts and discarded simulation time. Do not use this run to approve extra performance load.",
+    "orderedScenes": [
+      {
+        "id": "surfaceShore",
+        "hour": 7.1,
+        "frames": 11
+      },
+      {
+        "id": "surfaceWake",
+        "hour": 10,
+        "frames": 10
+      },
+      {
+        "id": "surfaceNight",
+        "hour": 0,
+        "frames": 6
+      },
+      {
+        "id": "surfaceNight",
+        "hour": 0,
+        "frames": 6
+      },
+      {
+        "id": "surfaceWake",
+        "hour": 10,
+        "frames": 9
+      },
+      {
+        "id": "surfaceShore",
+        "hour": 7.1,
+        "frames": 9
+      }
+    ],
+    "rendererStopped": true,
+    "voyageRestored": true,
+    "exports": {
+      "checksumPass": true,
+      "imageCount": 4,
+      "framesInCSV": 51,
+      "framesInJSON": 51,
+      "matchingFrameCounts": true,
+      "surfaceDetailAllSegments": true,
+      "wakeColumns": true,
+      "pngSignatures": true
+    }
+  },
+  "limits": [
+    "No test on a physical mobile device or an RTX GPU.",
+    "Wetness uses height columns and model vertices, not a 3D moisture volume.",
+    "Wake balance checks signed source sums, not total fluid/body energy.",
+    "Specular filtering is a variance approximation, not full LEAN mapping."
+  ],
+  "validationOrigin": "Historical results bundled with the original source ZIP. See the repository GitHub Actions for current checks.",
+  "repositoryURL": "https://github.com/michaelcrosato/tideline"
+}

@@ -1,0 +1,11 @@
+.github/
+.venv/
+docs/
+tests/
+artifacts/
+benchmark-reports/
+test-results*/
+test-results*.json
+playwright-report/
+*.zip
+*.log

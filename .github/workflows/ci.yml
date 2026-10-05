@@ -1,0 +1,47 @@
+name: Validate TIDELINE
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Install and validate the static build
+        run: |
+          npm ci
+          npm run check
+          npm run build
+          uv run --no-project python tools/build.py --check
+          uv run --no-project python tests/static_checks.py
+          uv run --no-project python tests/publish_safety.py
+          cmp index.html dist/index.html
+          git diff --exit-code -- index.html
+      - name: Install browser test tools
+        run: |
+          uv venv .venv
+          uv pip install -r tests/requirements.txt
+          uv run --no-project python -m playwright install --with-deps chromium
+      - name: Run game and mobile regression checks
+        run: |
+          uv run --no-project python tests/regression.py
+          uv run --no-project python tests/mobile.py

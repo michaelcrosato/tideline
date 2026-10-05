@@ -1,0 +1,15 @@
+{
+	"name": "tideline",
+	"version": "1.0.0",
+	"private": true,
+	"description": "An offline WebGL water and light lab with mobile controls and repeatable benchmarks.",
+	"engines": {
+		"node": "24.x"
+	},
+	"scripts": {
+		"build": "node tools/build.mjs",
+		"check": "node tools/build.mjs --check",
+		"dev": "npm run build && node tools/serve.mjs",
+		"preview": "node tools/serve.mjs"
+	}
+}
