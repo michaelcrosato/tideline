@@ -46,7 +46,7 @@ async def main(args):
    except Exception as e:record(name,False,{'error':str(e)})
   await check('All reduced-setting keys exist','return '+json.dumps(list(['grid','visualGrid','cacheSize','maxPixels','renderScale','reflectionScale','shadowSize','lampShadowSize','foamResolution','focusSize','fftPower','particleLimit','sprayRate','underParticles','ssrSteps','airCubeSize','wetHistorySize']))+'.every(k=>D.parameters.some(p=>p.key===k));')
   await check('Desktop never applies the phone preset','return D.uiBranch==="desktop"&&D.phonePresetReport()===null&&D.profiler.hardware().qualityPreset===null;')
-  await check('Five quick controls are retained','return D.quickLook.controls.length===5;')
+  await check('Six quick controls, including Light style','return D.quickLook.controls.length===6&&D.quickLook.controls.some(p=>p.key==="lightStyle");')
   await check('Four new feature switches are enabled','return D.surfaceFeatures.length===4&&D.surfaceFeatures.every(k=>C[k]===true);')
   await check('Advanced parameters have unique keys','return new Set(D.parameters.map(p=>p.key)).size===D.parameters.length;')
   await check('Wet history uses a bounded map','return {ok:r.surfaceWetTargets.length===2&&r.surfaceWetTargets[0].w===128,report:r.surfaceReport()};')
@@ -94,6 +94,21 @@ async def main(args):
    try{C.renderScale=.4;C.visualGrid=65;C.sprayRate=0;C.underParticles=0;D.storm.sync();r.render(g,1/60);
     gl.bufferSubData=function(t,o,...rest){if(t===gl.UNIFORM_BUFFER){if(o===0)full++;else flags++;}return send.call(this,t,o,...rest);};
     r.render(g,1/60);return {ok:full===1&&flags<=8,fullUploads:full,flagUploads:flags};}finally{gl.bufferSubData=send;Object.assign(C,saved);D.storm.sync();}''')
+  # M2 lighting: shadow dims only the light scattered in the water body, never the reflection.
+  await check('A fully shadowed pixel keeps its reflection', '''const saved={...C},gl=r.gl,orig=r.updateShadow;
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   const compare=(a,b)=>{let max=0,sum=0,lum=0;for(let i=0;i<a.length;i+=4)for(let k=0;k<3;k++){const d=Math.abs(a[i+k]-b[i+k]);max=Math.max(max,d);sum+=d;lum+=a[i+k];}return {max,mean:sum/(a.length*.75),level:lum/(a.length*.75)};};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,timeLighting:false,sunStrength:0,bodyR:0,bodyG:0,bodyB:0,foam:false,sunShadows:true,shadowStrength:1,waterVisible:true,reflection:true});D.storm.sync();
+    const lit=grab();r.updateShadow=function(game){orig.call(this,game);if(!this.shadowReady)return;const gl=this.gl;gl.bindFramebuffer(gl.FRAMEBUFFER,this.shadowTarget.fbo);gl.depthMask(true);gl.clearDepth(0);gl.clear(gl.DEPTH_BUFFER_BIT);gl.clearDepth(1);};
+    const shaded=grab(),reflection=compare(lit,shaded);
+    // The same full shadow with the sun on must change the image, so the shadow is applied.
+    C.sunStrength=1.65;const sunShaded=grab();r.updateShadow=orig;const sunLit=grab(),sun=compare(sunLit,sunShaded);
+    return {ok:reflection.max<=2&&reflection.level>8&&sun.mean>.5,reflection,sun};}finally{r.updateShadow=orig;Object.assign(C,saved);D.storm.sync();}''')
+  await check('Sun and moon cross-fade at dusk without a jump', '''const saved={...C},L=D.lights;let prev=null,worst={light:0,tint:0},steps=0;
+   try{C.timeLighting=true;C.dayCycle=false;for(let h=17.6;h<=18.6;h+=.002){C.dayHour=h;L.update(g,w);const v=L.sun.map(x=>x*L.strength),t=L.tint.map(x=>x*L.strength);
+    if(prev){worst.light=Math.max(worst.light,Math.hypot(...v.map((x,i)=>x-prev.v[i])));worst.tint=Math.max(worst.tint,Math.hypot(...t.map((x,i)=>x-prev.t[i])));}prev={v,t};steps++;}
+    return {ok:worst.light<.06&&worst.tint<.06,steps,...worst};}finally{Object.assign(C,saved);L.update(g,w);}''')
+  await check('Glow and Natural light styles both render', '''const saved={...C};try{C.renderScale=.4;C.visualGrid=65;C.sprayRate=0;C.underParticles=0;for(const s of [1,0]){C.lightStyle=s;r.render(g,1/60);if(r.gl.getError()!==0)return false;}const v=l.bench.variants('lightStyle',C);return {ok:v.length===2&&v[0].settings.lightStyle===0&&v[1].settings.lightStyle===1&&r.surfaceReport().lightStyle==='Glow',variants:v.map(x=>x.name)};}finally{Object.assign(C,saved);}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

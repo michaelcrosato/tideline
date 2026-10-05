@@ -805,6 +805,7 @@ num('Advanced light','ssrThickness','Reflection hit thickness (m)',.55,.05,2,.05
 num('Advanced light','ssrWeight','Screen reflection blend',.9,0,1,.05);
 num('Advanced light','roughness','Water highlight roughness',.14,.04,.6,.01);
 num('Advanced light','sssStrength','Light through crests',1.6,0,6,.1);
+num('Advanced light','lightStyle','Light style: 0 glow / 1 natural',0,0,1,1,'Glow keeps the teal crest light. Natural filters the sun through the water, so crests turn gold at dusk. Same cost.');
 num('Advanced light','cloudCover','Storm cloud cover',.50,0,1,.05);
 flag('Advanced light','bloom','HDR highlight glow',true);
 num('Advanced light','bloomStrength','Highlight glow strength',.14,0,1,.02);
@@ -1432,13 +1433,23 @@ function makeCell(){let b=new Builder();b.cylinder(0,0,0,.34,.34,.09,[.47,.36,.2
 /* Eight bounded local lights. Positions are shared by material lighting,
    spotlight shadows, the beam pass, and the visible lamp models. */
 class LightRig{
- constructor(){this.positions=new Float32Array(32);this.colors=new Float32Array(32);this.directions=new Float32Array(32);this.sun=[-.5,.5,.3];this.solar=[-.5,.5,.3];this.moon=[.5,.5,-.3];this.tint=[1,1,1];this.day=1;this.hour=12;this.active=0;this.power=1;this.vps=[Mat.identity(),Mat.identity()];this.packedVP=new Float32Array(32);this.drone=[0,-1,0];}
+ constructor(){this.positions=new Float32Array(32);this.colors=new Float32Array(32);this.directions=new Float32Array(32);this.sun=[-.5,.5,.3];this.solar=[-.5,.5,.3];this.moon=[.5,.5,-.3];this.tint=[1,1,1];this.waterLight=[1,1,1];this.day=1;this.hour=12;this.active=0;this.power=1;this.vps=[Mat.identity(),Mat.identity()];this.packedVP=new Float32Array(32);this.drone=[0,-1,0];}
  put(i,p,color,power,range,dir=[0,-1,0],angle=180){const o=i*4;this.positions.set([...p,range*C.lightRange],o);this.colors.set([...color,power*this.power*C.lampPower],o);this.directions.set([...norm(dir),angle===180?-1:Math.cos(angle*Math.PI/180)],o);}
  update(game,water){const h=((C.dayHour+(C.dayCycle?game.skyClock*24/C.daySeconds:0))%24+24)%24,a=(h-6)/24*TAU,alt=Math.sin(a);this.hour=h;this.day=sstep(-.29,.20,alt);
-  this.solar=norm([Math.cos(a)*-.94,alt,.25]);this.moon=norm([-this.solar[0],Math.max(.2,-alt),-.35]);this.sun=alt>.035?this.solar:this.moon;
-  const warm=1-sstep(.04,.6,alt),solarTint=[1,lerp(.96,.52,warm),lerp(.9,.23,warm)];this.tint=alt>.035?solarTint:[.30,.49,.86];
-  this.strength=C.sunStrength*sstep(-.035,.15,alt)+(1-this.day)*C.moonStrength;this.ambient=C.ambientStrength*this.day+C.nightAmbient*(1-this.day);
+  this.solar=norm([Math.cos(a)*-.94,alt,.25]);this.moon=norm([-this.solar[0],Math.max(.2,-alt),-.35]);
+  const warm=1-sstep(.04,.6,alt),solarTint=[1,lerp(.96,.52,warm),lerp(.9,.23,warm)],moonTint=[.30,.49,.86];
+  // Sun and moon cross-fade over altitude -0.02...0.08 instead of switching at one altitude.
+  // Direction and tint are weighted by each source's light, so the turn happens while both are dim.
+  const fade=sstep(-.02,.08,alt),solarLight=C.sunStrength*sstep(-.035,.15,alt)*fade,moonLight=C.moonStrength*(1-this.day)*(1-fade),sum=solarLight+moonLight;
+  const dir=this.solar.map((v,i)=>v*solarLight+this.moon[i]*moonLight);
+  this.sun=sum>1e-6&&Math.hypot(...dir)>1e-6?norm(dir):fade>.5?this.solar:this.moon;
+  this.tint=sum>1e-6?solarTint.map((v,i)=>(v*solarLight+moonTint[i]*moonLight)/sum):fade>.5?solarTint:moonTint;
+  this.strength=sum;this.ambient=C.ambientStrength*this.day+C.nightAmbient*(1-this.day);
   if(!C.timeLighting){this.sun=norm([C.sunX,C.sunY,C.sunZ]);this.solar=this.sun;this.day=1;this.tint=[1,.92,.82];this.strength=C.sunStrength;this.ambient=C.ambientStrength;}
+  // The water body and underwater haze scatter sky light and sunlight, so they follow the
+  // sun's tint and strength (relative to the default noon sun), not only the daylight value.
+  const sunShare=clamp(this.strength/1.65,0,2);this.waterLight=this.tint.map((v,i)=>.035+.965*(.5*this.day+.5*sunShare*v/[1,.96,.9][i]));
+  if(!C.timeLighting)this.waterLight=[1,1,1];
   this.power=C.localLights?(C.lightsAtDay?1:1-sstep(.15,.78,this.day)):0;this.colors.fill(0);
   const id=C.environment,t=water.time,base=WORLD_DEFS[id].level,b=game.boat,yaw=(C.beaconAim+C.beaconRate*t)*Math.PI/180;
   const beacon=id===3?[-15,12.7,4.5]:id===1?[-15,terrainHeight(-15,-11,1)+9.95,-11]:id===2?[0,9,-14]:[-17,terrainHeight(-17,4.3,0)+4,4.3];
@@ -1473,7 +1484,7 @@ const FRAME_FIELDS=[
  ['float','uSpectral uSpectrumAlpha uSpectrumN uSpectrumHeight uSpectrumShort uCacheN uShadowN uShadowSoft uShadowBias uShadowStrength uFocusStrength'],
  ['float','uDaylight uNightAmbient uStars uLocalOn uLocalSpec uBio uLampShadowN uLampBias'],
  ['float','uCoastOn uReefHeight uReefPeriod uReefSpeed uHarbourShelter uReefWidth uCoastPhase uFoamAging uFreshLife uWaveShadow uWaveShadowStrength'],
- ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach'],
+ ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle'],
  ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8]'],['mat4','uLampVP[2]'],
  ['vec3','uSun uAbsorb uBody uUnderAbsorb uHaze uSolar uMoon uSunTint'],
  // Switched by the preparation passes within a frame (frameFlags).
@@ -1562,9 +1573,13 @@ vec3 skyRaw(vec3 r){r=normalize(r);float y=clamp(r.y,0.,1.);float sunset=exp(-po
  vec2 stars=vec2(atan(r.z,r.x)*70.,asin(clamp(r.y,-1.,1.))*90.);vec2 cell=floor(stars),q=fract(stars)-hash2(cell);float star=pow(max(0.,1.-length(q)*5.),4.)*step(.98,hash(cell+17.));sky+=star*vec3(.50,.62,.85)*uStars*(1.-uDaylight)*(1.-mask)*smoothstep(.01,.25,r.y);
  return max(sky,vec3(.0002));
 }
-vec3 skyColor(vec3 r){r=normalize(r);vec2 uv=vec2(atan(r.z,r.x)/6.2831853+.5,asin(clamp(r.y,-1.,1.))/3.14159265+.5);vec3 col=uSkyCacheOn>.5?texture(uSkyMap,uv).rgb:skyRaw(r);
- float sun=max(0.,dot(r,uSolar)),moon=max(0.,dot(r,uMoon));col+=vec3(1.,.48,.17)*pow(sun,18.)*.3*uDaylight+vec3(4.,2.0,.85)*pow(sun,3200.)*smoothstep(-.06,.04,uSolar.y);col+=vec3(.24,.36,.68)*(pow(moon,9000.)*2.+pow(moon,80.)*.04)*(1.-uDaylight);return col;
+// disc scales the sun and moon discs. Reflections pass 0: the GGX highlight is the reflected sun.
+vec3 skyColor(vec3 r,float disc){r=normalize(r);vec2 uv=vec2(atan(r.z,r.x)/6.2831853+.5,asin(clamp(r.y,-1.,1.))/3.14159265+.5);vec3 col=uSkyCacheOn>.5?texture(uSkyMap,uv).rgb:skyRaw(r);
+ float sun=max(0.,dot(r,uSolar)),moon=max(0.,dot(r,uMoon));col+=vec3(1.,.48,.17)*pow(sun,18.)*.3*uDaylight+vec3(4.,2.0,.85)*pow(sun,3200.)*smoothstep(-.06,.04,uSolar.y)*disc;col+=vec3(.24,.36,.68)*(pow(moon,9000.)*2.*disc+pow(moon,80.)*.04)*(1.-uDaylight);return col;
 }
+vec3 skyColor(vec3 r){return skyColor(r,1.);}
+// Light through a thin crest. Glow keeps the original teal; Natural filters the sun through the water path.
+vec3 crestLight(float path){return uLightStyle<.5?vec3(.025,.58,.42):exp(-uAbsorb*path);}
 
 float causticNet(vec2 p){p*=uCausticScale;float t=uTime*uCausticSpeed;vec2 q=p+vec2(sin(p.y*.7+t*.5),sin(p.x*.83-t*.43))*.7;float a=sin(q.x*2.9+q.y*.7+t*.6),b=sin(q.y*3.1-q.x*.6-t*.4),c=sin((q.x+q.y)*2.2+t*.35);return pow(max(0.,1.-abs(a+b+c)*.4),18.);}
 float unpackFoam(vec4 c){return dot(c.rg,vec2(256.,1.))*255./65535.;}
@@ -1699,15 +1714,17 @@ void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;
  vec3 col;
  // The underwater view replaces all above-water shading, so it is not evaluated there.
  if(uUnder<.5){
-  vec2 refrUV=clamp(uv+n.xz*uRefraction*clamp(wetDepth*.25,.15,1.),vec2(.001),vec2(.999));float sceneZ=linearDepth(texture(uDepth,refrUV).r);if(sceneZ<surfaceZ+.025){refrUV=uv;sceneZ=linearDepth(texture(uDepth,uv).r);}float thick=clamp(sceneZ-surfaceZ,.02,40.);vec3 trans=exp(-uAbsorb*thick);col=texture(uScene,refrUV).rgb*trans+uBody*(1.-trans);
-  vec3 r=reflect(-v,n);vec3 reflected=skyColor(r);if(uReflectionWeight>0.){vec3 planar=texture(uReflection,clamp(uv+n.xz*uReflectionDistortion,vec2(.001),vec2(.999))).rgb;reflected=mix(reflected,planar,uReflectionWeight*.72);}
+  vec2 refrUV=clamp(uv+n.xz*uRefraction*clamp(wetDepth*.25,.15,1.),vec2(.001),vec2(.999));float sceneZ=linearDepth(texture(uDepth,refrUV).r);if(sceneZ<surfaceZ+.025){refrUV=uv;sceneZ=linearDepth(texture(uDepth,uv).r);}float thick=clamp(sceneZ-surfaceZ,.02,40.);vec3 trans=exp(-uAbsorb*thick),transmitted=texture(uScene,refrUV).rgb*trans;
+  vec3 r=reflect(-v,n);vec3 reflected=skyColor(r,0.);if(uReflectionWeight>0.){vec3 planar=texture(uReflection,clamp(uv+n.xz*uReflectionDistortion,vec2(.001),vec2(.999))).rgb;reflected=mix(reflected,planar,uReflectionWeight*.72);}
   if(uSSR>.5){vec4 hit=uTraceReady>.5?readStableReflection(uv,n,surfaceZ):traceReflection(vP+n*.05,r);reflected=mix(reflected,hit.rgb,hit.a*uSSRWeight);}
-  float fresnel=uFresnel+(1.-uFresnel)*pow(1.-clamp(dot(n,v),0.,1.),uFresnelPower);col=mix(col,reflected,clamp(fresnel,.02,.96));
   float lightVisibility=sunVisibility(vP+n*.04);if(lightVisibility>0.)lightVisibility*=waterShadow(vP+n*.12,sun);
+  // Shadow dims only the light scattered in the water body. The refracted scene carries its
+  // own shadow, and reflected light does not pass through the shadowed water.
+  col=transmitted+uBody*(1.-trans)*mix(.72,1.,lightVisibility);
+  float fresnel=uFresnel+(1.-uFresnel)*pow(1.-clamp(dot(n,v),0.,1.),uFresnelPower);col=mix(col,reflected,clamp(fresnel,.02,.96));
   vec3 halfway=normalize(sun+v);float nh=max(0.,dot(n,halfway)),a2=rough*rough*rough*rough,denom=nh*nh*(a2-1.)+1.;float spec=a2/(3.14159265*denom*denom+1e-5);col+=uSunTint*min(32.,spec)*max(0.,dot(n,sun))*.075*uSpecStrength*uSunStrength*lightVisibility;
   // Thin, raised crests transmit more backlight than the troughs. Shaded crests receive none.
-  float crest=smoothstep(.1,2.8,vSea.y),back=pow(max(0.,dot(v,-sun+n*.24)),3.);col+=vec3(.025,.58,.42)*uSunTint*(crest*(.12+back)*uSSS)*uSunStrength*(1.-fresnel)*lightVisibility;
-  col*=mix(.72,1.,lightVisibility);
+  float crest=smoothstep(.1,2.8,vSea.y),back=pow(max(0.,dot(v,-sun+n*.24)),3.);col+=crestLight(mix(2.2,.6,crest))*uSunTint*(crest*(.12+back)*uSSS)*uSunStrength*(1.-fresnel)*lightVisibility;
   vec3 lampDiffuse=foam>.001?localDiffuse(vP,n):vec3(0.);vec3 foamCol=vec3(.73,.88,.91)*(uAmbient*.48+.4*max(0.,dot(n,sun))*uSunStrength*uSunTint*lightVisibility+lampDiffuse*.65);col=mix(col,foamCol,clamp(foam,0.,uFoamOpacity));
   col+=localWater(vP,n,v,rough)*(1.-clamp(foam,0.,.8));float wakeRadius=length(vP.xz-uBoat.xy);col+=vec3(.006,.28,.63)*uBio*clamp(foam,0.,1.)*(.18+exp(-wakeRadius*.15)*clamp(uBoat.w*.3,0.,1.));
   float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);if(fog>0.)col=mix(col,skyColor(normalize(vP-uEye)),fog);
@@ -1780,8 +1797,9 @@ void main(){vec2 p=vUV*52.-26.;float top=surfaceWorld(p).y;vec4 old=texture(uWet
 }`;
 const skyFS=`#version 300 es
 ${sharedGLSL}
-in vec2 vUV;uniform mat4 uInverseVP;uniform vec3 uEye;uniform float uUnder;out vec4 outColor;
-void main(){vec4 p=uInverseVP*vec4(vUV*2.-1.,1.,1.);vec3 r=normalize(p.xyz/p.w-uEye);outColor=vec4(uUnder>.5?uHaze:skyColor(r),1.);}`;
+in vec2 vUV;uniform mat4 uInverseVP;uniform vec3 uEye;uniform float uUnder,uReflect;out vec4 outColor;
+// The planar reflection leaves out the sun disc; the water adds the sun as its highlight.
+void main(){vec4 p=uInverseVP*vec4(vUV*2.-1.,1.,1.);vec3 r=normalize(p.xyz/p.w-uEye);outColor=vec4(uUnder>.5?uHaze:skyColor(r,uReflect>.5?0.:1.),1.);}`;
 const bloomFS=`#version 300 es
 precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uColor;uniform vec2 uTexel;out vec4 outColor;
 void main(){vec3 col=vec3(0.);for(int j=-1;j<=1;j++)for(int i=-1;i<=1;i++){vec3 s=texture(uColor,vUV+vec2(i,j)*uTexel*2.).rgb;float lum=dot(s,vec3(.2126,.7152,.0722));col+=s*max(0.,lum-.9)/(lum+.001);}outColor=vec4(col/9.,1.);}`;
@@ -2024,14 +2042,14 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  settings(p){this.bindAbyss(p);this.bindBeacon(p);}
  frameSet(values){const f=this.frameData,o=FRAME.offset;for(const k in values){if(!(k in o))throw Error('Frame block has no '+k+'.');f[o[k]]=values[k];}}
  // Values that hold for the whole frame. surface.js adds its own after these.
- frameValues(){const f=this.frameData,o=FRAME.offset,clarityScale=Math.pow(4,1-C.waterClarity/50),amb=.035+.965*lights.day;
+ frameValues(){const f=this.frameData,o=FRAME.offset,clarityScale=Math.pow(4,1-C.waterClarity/50),amb=lights.waterLight;
   this.frameSet({uTime:this.water.time,uGrid:N,uDX:DX,uLevel:this.water.level,
    uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
    uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
-   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach()});
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle});
   this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(this.water.time),o.uMode);
   f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
-  f.set(lights.sun,o.uSun);f.set([C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale],o.uAbsorb);f.set([C.bodyR*amb,C.bodyG*amb,C.bodyB*amb],o.uBody);f.set([C.underR,C.underG,C.underB],o.uUnderAbsorb);f.set([C.hazeR*amb,C.hazeG*amb,C.hazeB*amb],o.uHaze);
+  f.set(lights.sun,o.uSun);f.set([C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale],o.uAbsorb);f.set([C.bodyR*amb[0],C.bodyG*amb[1],C.bodyB*amb[2]],o.uBody);f.set([C.underR,C.underG,C.underB],o.uUnderAbsorb);f.set([C.hazeR*amb[0],C.hazeG*amb[1],C.hazeB*amb[2]],o.uHaze);
   f.set(lights.solar,o.uSolar);f.set(lights.moon,o.uMoon);f.set(lights.tint,o.uSunTint);
  }
  // Readiness flags that the preparation passes switch within a frame, and the sun
@@ -3076,13 +3094,14 @@ void main(){float x=aUV.x*36.-18.,k=6.2831853/(uReefPeriod*uReefSpeed),w=6.28318
 const crestFS=`#version 300 es
 ${sharedGLSL}
 uniform vec3 uEye;uniform float uUnder;in vec3 vP;in vec3 vN;in vec2 vAnchor;in float vFade;in float vLip;out vec4 outColor;
-void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?vN:-vN),v=normalize(uEye-vP),l=normalize(uSun);float fr=.025+.975*pow(1.-clamp(dot(n,v),0.,1.),5.);
+void main(){if(vFade<.025||uCoastOn<.5)discard;vec3 n=normalize(gl_FrontFacing?vN:-vN),v=normalize(uEye-vP),l=normalize(uSun);float fr=uFresnel+(1.-uFresnel)*pow(1.-clamp(dot(n,v),0.,1.),uFresnelPower);
  // Thin water uses the main surface's crest transmission, then lets the face behind it show.
- float back=pow(max(0.,dot(v,-l+n*.25)),3.),shade=sunVisibility(vP+n*.04);vec3 body=uBody+vec3(.025,.58,.42)*uSunTint*uSunStrength*uSSS*(.12+back)*.5*shade;
- vec3 color=mix(body,skyColor(reflect(-v,n)),fr*.72);
+ float back=pow(max(0.,dot(v,-l+n*.25)),3.),shade=sunVisibility(vP+n*.04);vec3 body=uBody*mix(.72,1.,shade)+crestLight(1.)*uSunTint*uSunStrength*uSSS*(.12+back)*.5*shade;
+ vec3 color=mix(body,skyColor(reflect(-v,n),0.),fr*.72);
  float f=smoothstep(.45,.98,vLip)*(.35+.65*noise(vAnchor*11.+uTime*.9));vec3 foam=vec3(.73,.86,.83)*(uAmbient*.55+uSunTint*uSunStrength*(.24+.65*max(0.,dot(n,l)))+localDiffuse(vP,n)*.6);
  float lip=clamp(f,0.,.85);color=mix(color,foam,lip)+localWater(vP,n,v,uRoughness)*.6;
  color+=vec3(.005,.18,.40)*uBio*f;if(uUnder>.5){vec3 t=exp(-uUnderAbsorb*uUnderDensity*length(vP-uEye));color=color*t+uHaze*(1.-t);}
+ else{float fog=1.-exp(-max(0.,length(uEye-vP)-30.)*uFog);if(fog>0.)color=mix(color,skyColor(normalize(vP-uEye)),fog);}
  float cover=max(mix(.38,.9,fr),lip*1.1);outColor=vec4(max(color,0.),clamp(vFade*2.2,0.,1.)*clamp(cover,0.,.96));
 }`;
 Renderer.prototype.drawCrests=function(game){if(C.environment!==3||!C.coastalWaves||!C.curlSheet||!C.waterVisible||!C.waves||C.curlStrength<=0||C.reefHeight<=0)return;const gl=this.gl;
@@ -3721,13 +3740,14 @@ const QUICK_LOOK=[
  {key:'waveScale',name:'Swell height',hint:'Large waves and boat motion.',min:0,max:16,step:.1,low:'Low',high:'Storm',kind:'swell'},
  {key:'waterClarity',name:'Water clarity',hint:'See more or less below the surface.',min:0,max:100,step:1,low:'Murky',high:'Clear',kind:'clarity'},
  {key:'foamOpacity',name:'Surface foam',hint:'Reveal the white foam on the waves.',min:0,max:1,step:.01,low:'None',high:'Full',kind:'foam'},
- {key:'exposure',name:'Brightness',hint:'Adjust the view without changing the hour.',min:.25,max:3,step:.05,low:'Dark',high:'Bright',kind:'brightness'}
+ {key:'exposure',name:'Brightness',hint:'Adjust the view without changing the hour.',min:.25,max:3,step:.05,low:'Dark',high:'Bright',kind:'brightness'},
+ {key:'lightStyle',name:'Light style',hint:'Teal glow, or natural sunlight through the crests.',min:0,max:1,step:1,low:'Glow',high:'Natural',kind:'style'}
 ];
 let lookPane='main',lookPendingWorld=null,lookResetSaved=null,lookStatusTimer=0,lookReturnFocus='lookAdvanced';
 function lookClock(hour){const m=Math.round(hour*60)%1440;return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');}
 function lookDaypart(h){return h<5||h>=21?'Night':h<7?'Dawn':h<16?'Day':h<18.2?'Sunset':h<20?'Dusk':'Evening';}
 function lookValue(p){return p.key==='dayHour'?(lights.hour??C.dayHour):C[p.key];}
-function lookValueText(p,v){if(p.key==='dayHour')return lookClock(v);if(p.key==='foamOpacity')return Math.round(v*100)+'%';if(p.key==='waterClarity')return Math.round(v)+'%';return v.toFixed(p.key==='exposure'?2:1)+'×';}
+function lookValueText(p,v){if(p.key==='dayHour')return lookClock(v);if(p.key==='lightStyle')return v>=.5?'Natural':'Glow';if(p.key==='foamOpacity')return Math.round(v*100)+'%';if(p.key==='waterClarity')return Math.round(v)+'%';return v.toFixed(p.key==='exposure'?2:1)+'×';}
 function lookIcon(name){const paths={back:'M14 5l-7 7 7 7',next:'M9 5l7 7-7 7',scene:'M3 7l6-3 6 3 6-3v14l-6 3-6-3-6 3V7m6-3v14m6-11v14',tune:'M4 7h16M4 17h16M9 4v6m6 4v6',reset:'M4 9a8 8 0 1 1 0 6M4 3v6h6',test:'M4 19h16M7 15V9m5 6V5m5 10v-4',minus:'M5 12h14',plus:'M5 12h14m-7-7v14'};return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${(paths[name]||paths.tune).split('||').map(p=>`<path d="${p}"/>`).join('')}</svg>`;}
 function lookRows(touch=false){return `<div class="lookSliders">${QUICK_LOOK.map(p=>{const id=touch?'mLook_'+p.key:(p.id||'look_'+p.key),v=lookValue(p),out=p.key==='dayHour'&&!touch?'clockLight':id+'_value';return `<div class="lookControl look-${p.kind}" data-look-row="${p.key}"><div class="lookLabel"><label for="${id}">${p.name}</label><span class="lookValue"><small data-look-state="${p.key}"></small><output id="${out}" for="${id}" data-look-value="${p.key}">${lookValueText(p,v)}</output></span></div><p id="${id}_hint" class="lookHint">${p.hint}</p><input id="${id}" class="lookRange" type="range" data-look-key="${p.key}" min="${p.min}" max="${p.max}" step="${p.step}" value="${Math.min(v,p.max)}" aria-describedby="${id}_hint" title="${p.hint}"/><div class="lookEnds" aria-hidden="true"><span>${p.low}</span>${p.kind==='time'?'<span>06:00</span><span>Noon</span><span>18:00</span>':''}<span>${p.high}</span></div></div>`;}).join('')}</div>`;}
 function lookSync(root){if(!root)return;if(lookResetSaved&&lookResetSaved.environment!==C.environment)lookResetSaved=null;for(const p of QUICK_LOOK){const value=lookValue(p),v=p.key==='waveScale'&&!C.waves?0:p.key==='foamOpacity'&&!C.foam?0:value;for(const input of root.querySelectorAll(`[data-look-key="${p.key}"]`)){
@@ -3738,7 +3758,7 @@ function lookSync(root){if(!root)return;if(lookResetSaved&&lookResetSaved.enviro
  input.setAttribute('aria-valuetext',p.key==='dayHour'?lookClock(v)+' · '+lookDaypart(v):lookValueText(p,v));input.disabled=!!lab?.bench.locked;
  }for(const output of root.querySelectorAll(`[data-look-value="${p.key}"]`))output.textContent=lookValueText(p,v);
  for(const state of root.querySelectorAll(`[data-look-state="${p.key}"]`))state.textContent=p.key==='dayHour'?lookDaypart(v):'';
- }for(const b of root.querySelectorAll('[data-look-reset]')){const state=lookResetSaved?'undo':'reset';if(b.dataset.lookResetState!==state){b.innerHTML=lookIcon('reset')+(b.classList.contains('lookResetIcon')?'<small>'+(lookResetSaved?'Undo':'Reset')+'</small>':(lookResetSaved?'Undo reset':'Reset look'));b.setAttribute('aria-label',lookResetSaved?'Undo reset':'Reset look');b.title=lookResetSaved?'Restore your previous look':'Reset these five controls, not the voyage';b.dataset.lookResetState=state;}b.disabled=!!lab?.bench.locked;}
+ }for(const b of root.querySelectorAll('[data-look-reset]')){const state=lookResetSaved?'undo':'reset';if(b.dataset.lookResetState!==state){b.innerHTML=lookIcon('reset')+(b.classList.contains('lookResetIcon')?'<small>'+(lookResetSaved?'Undo':'Reset')+'</small>':(lookResetSaved?'Undo reset':'Reset look'));b.setAttribute('aria-label',lookResetSaved?'Undo reset':'Reset look');b.title=lookResetSaved?'Restore your previous look':'Reset the quick controls, not the voyage';b.dataset.lookResetState=state;}b.disabled=!!lab?.bench.locked;}
 }
 function lookNotice(text){for(const e of document.querySelectorAll('[data-look-status]'))e.textContent=text;clearTimeout(lookStatusTimer);lookStatusTimer=setTimeout(()=>{for(const e of document.querySelectorAll('[data-look-status]'))e.textContent='Changes apply while you play.';},4000);}
 function lookSet(key,raw){if(lab.bench.locked)return false;const p=QUICK_LOOK.find(p=>p.key===key);if(!p||!Number.isFinite(Number(raw)))return false;lookResetSaved=null;
@@ -3749,7 +3769,7 @@ function lookSet(key,raw){if(lab.bench.locked)return false;const p=QUICK_LOOK.fi
 }
 function resetLook(){if(lab.bench.locked)return;const keys=QUICK_LOOK.map(p=>p.key).concat(['waves','foam','timeLighting','dayCycle']);
  if(lookResetSaved){const saved=lookResetSaved.values;lookResetSaved=null;for(const k of ['dayCycle',...keys.filter(k=>k!=='dayCycle')])lab.set(k,saved[k]);lookNotice('Reset undone. Your previous look is back.');}
- else{lookResetSaved={environment:C.environment,values:Object.fromEntries(keys.map(k=>[k,k==='dayHour'?(lights.hour??C.dayHour):C[k]]))};const def=WORLD_DEFS[C.environment];for(const[k,v]of Object.entries({dayCycle:false,timeLighting:true,waves:true,foam:true,dayHour:def.hour,waveScale:def.wave,waterClarity:DEFAULTS.waterClarity,foamOpacity:DEFAULTS.foamOpacity,exposure:DEFAULTS.exposure}))lab.set(k,v);lookNotice('Look reset. Your boat and voyage are unchanged.');}
+ else{lookResetSaved={environment:C.environment,values:Object.fromEntries(keys.map(k=>[k,k==='dayHour'?(lights.hour??C.dayHour):C[k]]))};const def=WORLD_DEFS[C.environment];for(const[k,v]of Object.entries({dayCycle:false,timeLighting:true,waves:true,foam:true,dayHour:def.hour,waveScale:def.wave,waterClarity:DEFAULTS.waterClarity,foamOpacity:DEFAULTS.foamOpacity,exposure:DEFAULTS.exposure,lightStyle:DEFAULTS.lightStyle}))lab.set(k,v);lookNotice('Look reset. Your boat and voyage are unchanged.');}
  lookSync($('gallery'));lookSync(mobileUI?.root);mobileUI?.update(true);
 }
 function showLookPane(pane,focus=true){if(lab.bench.locked)return;lookPane=pane;for(const el of $('gallery').querySelectorAll('[data-look-pane]'))el.hidden=el.dataset.lookPane!==pane;
@@ -3872,6 +3892,8 @@ function initContactUI(){const opt=document.createElement('option');opt.value='c
    Wall marks are height columns, not a 3D moisture volume. Boat marks are stored
    on model vertices. Wake sources are balanced surface-velocity disturbances. */
 const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persistentWakes'];
+// lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
+const LIGHT_STYLES=['Glow','Natural'];
 PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
@@ -4018,7 +4040,7 @@ Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=
  const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0);
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;
@@ -4037,20 +4059,20 @@ SCENES.push(
  {id:'surfaceNight',label:'Surface / night highlights',environment:1,level:1.15,anchor:true,x:-3,z:8,look:{dayHour:0,waveScale:3.2,fftHeight:.28,rogueEnabled:false,cameraMode:3,cameraFollow:0,orbitYaw:8,orbitRadius:29,orbitHeight:7}}
 );
 const surfaceTestScenes=testScenes;
-testScenes=function(mode,scene){if(mode==='surface')return ['surfaceShore','surfaceWake','surfaceNight'].map(id=>SCENES.find(s=>s.id===id));if(mode==='surfaceAudit')return [SCENES.find(s=>s.id==='surfaceWake')];return surfaceTestScenes(mode,scene);};
-PLAN_LABELS.surface='Surface verification / 3 views × 2 passes';PLAN_LABELS.surfaceAudit='Surface / prior-new-new-prior / changed local wakes';
+testScenes=function(mode,scene){if(mode==='surface')return ['surfaceShore','surfaceWake','surfaceNight'].map(id=>SCENES.find(s=>s.id===id));if(mode==='surfaceAudit')return [SCENES.find(s=>s.id==='surfaceWake')];if(mode==='lightStyle')return ['reefView','surfaceShore'].map(id=>SCENES.find(s=>s.id===id));return surfaceTestScenes(mode,scene);};
+PLAN_LABELS.surface='Surface verification / 3 views × 2 passes';PLAN_LABELS.surfaceAudit='Surface / prior-new-new-prior / changed local wakes';PLAN_LABELS.lightStyle='Light style / glow-natural-natural-glow / 2 dawn views';
 const surfaceOptions=Benchmark.prototype.options;
-Benchmark.prototype.options=function(){const o=surfaceOptions.call(this);if(['surface','surfaceAudit'].includes(o.mode))o.repeats=o.totalSeconds>=60||o.mode==='surfaceAudit'?2:1;return o;};
+Benchmark.prototype.options=function(){const o=surfaceOptions.call(this);if(['surface','surfaceAudit'].includes(o.mode))o.repeats=o.totalSeconds>=60||o.mode==='surfaceAudit'?2:1;if(o.mode==='lightStyle')o.repeats=2;return o;};
 const surfaceVariants=Benchmark.prototype.variants;
-Benchmark.prototype.variants=function(mode,base){if(mode==='surfaceAudit')return [false,true].map(on=>({name:on?'New surface':'Prior surface',settings:{...base,...Object.fromEntries(SURFACE_FEATURES.map(k=>[k,on]))}}));return surfaceVariants.call(this,mode,base);};
+Benchmark.prototype.variants=function(mode,base){if(mode==='lightStyle')return LIGHT_STYLES.map((name,i)=>({name:name+' light',settings:{...base,lightStyle:i}}));if(mode==='surfaceAudit')return [false,true].map(on=>({name:on?'New surface':'Prior surface',settings:{...base,...Object.fromEntries(SURFACE_FEATURES.map(k=>[k,on]))}}));return surfaceVariants.call(this,mode,base);};
 const surfaceSteer=Benchmark.prototype.steering;
 Benchmark.prototype.steering=function(){if(this.current?.scene==='surfaceWake'){const b=game.boat,a=this.sceneTime*.22,target=[Math.sin(a)*4.5,13+Math.cos(a)*3.5],dx=target[0]-b.x,dz=target[1]-b.z,l=Math.hypot(dx,dz)||1;return [dx/l*.48,dz/l*.48];}return surfaceSteer.call(this);};
 function initSurfaceUI(){
- for(const [id,label]of [['surface','Surface verification · foam / wakes / wet light'],['surfaceAudit','Surface comparison · prior / new / new / prior']]){const o=document.createElement('option');o.value=id;o.textContent=label;$('benchMode').appendChild(o);}
+ for(const [id,label]of [['surface','Surface verification · foam / wakes / wet light'],['surfaceAudit','Surface comparison · prior / new / new / prior'],['lightStyle','Light style comparison · glow / natural / natural / glow']]){const o=document.createElement('option');o.value=id;o.textContent=label;$('benchMode').appendChild(o);}
  for(const s of SCENES.filter(s=>s.id.startsWith('surface'))){const o=document.createElement('option');o.value=s.id;o.textContent=s.label;$('benchScene').appendChild(o);}
  $('benchMode').value='surface';lab.planDescription();
  $('galleryBench').textContent='Run 60 s surface test · F7';$('galleryBench').onclick=()=>{$('benchMode').value='surface';$('benchBudget').value='60';lab.planDescription();lab.bench.start(true);};
- // The five quick-look controls remain unchanged. All new controls use the existing registry.
+ // Quick Look gained Light style (M2). All other new controls use the existing registry.
 }
 
 

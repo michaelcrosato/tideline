@@ -3,6 +3,8 @@
    Wall marks are height columns, not a 3D moisture volume. Boat marks are stored
    on model vertices. Wake sources are balanced surface-velocity disturbances. */
 const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persistentWakes'];
+// lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
+const LIGHT_STYLES=['Glow','Natural'];
 PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
@@ -149,7 +151,7 @@ Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=
  const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0);
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;
@@ -168,18 +170,18 @@ SCENES.push(
  {id:'surfaceNight',label:'Surface / night highlights',environment:1,level:1.15,anchor:true,x:-3,z:8,look:{dayHour:0,waveScale:3.2,fftHeight:.28,rogueEnabled:false,cameraMode:3,cameraFollow:0,orbitYaw:8,orbitRadius:29,orbitHeight:7}}
 );
 const surfaceTestScenes=testScenes;
-testScenes=function(mode,scene){if(mode==='surface')return ['surfaceShore','surfaceWake','surfaceNight'].map(id=>SCENES.find(s=>s.id===id));if(mode==='surfaceAudit')return [SCENES.find(s=>s.id==='surfaceWake')];return surfaceTestScenes(mode,scene);};
-PLAN_LABELS.surface='Surface verification / 3 views × 2 passes';PLAN_LABELS.surfaceAudit='Surface / prior-new-new-prior / changed local wakes';
+testScenes=function(mode,scene){if(mode==='surface')return ['surfaceShore','surfaceWake','surfaceNight'].map(id=>SCENES.find(s=>s.id===id));if(mode==='surfaceAudit')return [SCENES.find(s=>s.id==='surfaceWake')];if(mode==='lightStyle')return ['reefView','surfaceShore'].map(id=>SCENES.find(s=>s.id===id));return surfaceTestScenes(mode,scene);};
+PLAN_LABELS.surface='Surface verification / 3 views × 2 passes';PLAN_LABELS.surfaceAudit='Surface / prior-new-new-prior / changed local wakes';PLAN_LABELS.lightStyle='Light style / glow-natural-natural-glow / 2 dawn views';
 const surfaceOptions=Benchmark.prototype.options;
-Benchmark.prototype.options=function(){const o=surfaceOptions.call(this);if(['surface','surfaceAudit'].includes(o.mode))o.repeats=o.totalSeconds>=60||o.mode==='surfaceAudit'?2:1;return o;};
+Benchmark.prototype.options=function(){const o=surfaceOptions.call(this);if(['surface','surfaceAudit'].includes(o.mode))o.repeats=o.totalSeconds>=60||o.mode==='surfaceAudit'?2:1;if(o.mode==='lightStyle')o.repeats=2;return o;};
 const surfaceVariants=Benchmark.prototype.variants;
-Benchmark.prototype.variants=function(mode,base){if(mode==='surfaceAudit')return [false,true].map(on=>({name:on?'New surface':'Prior surface',settings:{...base,...Object.fromEntries(SURFACE_FEATURES.map(k=>[k,on]))}}));return surfaceVariants.call(this,mode,base);};
+Benchmark.prototype.variants=function(mode,base){if(mode==='lightStyle')return LIGHT_STYLES.map((name,i)=>({name:name+' light',settings:{...base,lightStyle:i}}));if(mode==='surfaceAudit')return [false,true].map(on=>({name:on?'New surface':'Prior surface',settings:{...base,...Object.fromEntries(SURFACE_FEATURES.map(k=>[k,on]))}}));return surfaceVariants.call(this,mode,base);};
 const surfaceSteer=Benchmark.prototype.steering;
 Benchmark.prototype.steering=function(){if(this.current?.scene==='surfaceWake'){const b=game.boat,a=this.sceneTime*.22,target=[Math.sin(a)*4.5,13+Math.cos(a)*3.5],dx=target[0]-b.x,dz=target[1]-b.z,l=Math.hypot(dx,dz)||1;return [dx/l*.48,dz/l*.48];}return surfaceSteer.call(this);};
 function initSurfaceUI(){
- for(const [id,label]of [['surface','Surface verification · foam / wakes / wet light'],['surfaceAudit','Surface comparison · prior / new / new / prior']]){const o=document.createElement('option');o.value=id;o.textContent=label;$('benchMode').appendChild(o);}
+ for(const [id,label]of [['surface','Surface verification · foam / wakes / wet light'],['surfaceAudit','Surface comparison · prior / new / new / prior'],['lightStyle','Light style comparison · glow / natural / natural / glow']]){const o=document.createElement('option');o.value=id;o.textContent=label;$('benchMode').appendChild(o);}
  for(const s of SCENES.filter(s=>s.id.startsWith('surface'))){const o=document.createElement('option');o.value=s.id;o.textContent=s.label;$('benchScene').appendChild(o);}
  $('benchMode').value='surface';lab.planDescription();
  $('galleryBench').textContent='Run 60 s surface test · F7';$('galleryBench').onclick=()=>{$('benchMode').value='surface';$('benchBudget').value='60';lab.planDescription();lab.bench.start(true);};
- // The five quick-look controls remain unchanged. All new controls use the existing registry.
+ // Quick Look gained Light style (M2). All other new controls use the existing registry.
 }

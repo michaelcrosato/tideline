@@ -36,7 +36,7 @@ async def main(args):
   check('Mobile branch selected',await page.evaluate('D.uiBranch==="mobile"'))
   check('No visible joystick',not await page.locator('#joystick').is_visible())
   await page.click('[data-m-nav="light"]')
-  check('Five mobile quick sliders',await page.locator('#mSheet [data-look-key]').count()==5)
+  check('Six mobile quick sliders',await page.locator('#mSheet [data-look-key]').count()==6)
   check('Fullscreen entry is visible',await page.locator('#mGameModeButton').is_visible())
   await page.screenshot(path=str(output/'mobile-look.png'))
   await page.click('#mSheet [data-m-action="close"]')
