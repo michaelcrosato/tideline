@@ -851,6 +851,7 @@ num('Hull interaction','forwardDrag','Forward drag coefficient',.18,0,2,.02);
 num('Hull interaction','slamDamping','Water-entry damping',.45,0,2,.05);
 flag('Spray optics','softParticles','Soft particle intersections',true);
 num('Spray optics','softDepth','Particle depth fade (m)',.30,.03,1,.01);
+flag('Spray optics','sprayLighting','Sunlit spray',true,'Forward scattering toward the sun, one sun-shadow tap per drop, and air haze. Same draw.');
 flag('Spray optics','bubbles','Impact bubble plumes',true);
 num('Spray optics','bubbleCount','Bubbles per hull impact',180,0,1000,20);
 num('Spray optics','bubbleRise','Bubble rise speed (m/s)',.7,.1,2,.05);
@@ -1486,7 +1487,7 @@ const FRAME_FIELDS=[
  ['float','uSpectral uSpectrumAlpha uSpectrumN uSpectrumHeight uSpectrumShort uCacheN uShadowN uShadowSoft uShadowBias uShadowStrength uFocusStrength'],
  ['float','uDaylight uNightAmbient uStars uLocalOn uLocalSpec uBio uLampShadowN uLampBias'],
  ['float','uCoastOn uReefHeight uReefPeriod uReefSpeed uHarbourShelter uReefWidth uCoastPhase uFoamAging uFreshLife uWaveShadow uWaveShadowStrength'],
- ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle uFarSea'],
+ ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle uFarSea uSprayLight'],
  ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8] uFarSeaTable[4]'],['mat4','uLampVP[2]'],
  ['vec3','uSun uAbsorb uBody uUnderAbsorb uHaze uSolar uMoon uSunTint'],
  // Switched by the preparation passes within a frame (frameFlags).
@@ -1772,7 +1773,20 @@ const pointVS=`#version 300 es
 ${sharedGLSL}
 layout(location=0)in vec3 aPosition;layout(location=1)in vec4 aColor;layout(location=2)in float aSize;
 uniform mat4 uVP;uniform float uScale;uniform vec3 uEye;uniform float uUnder;out vec4 vColor;out float vKind;
-void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aPosition.xz);Sea s=sea(aPosition.xz,f.y);pos=vec3(aPosition.x,f.x+.055,aPosition.z)+s.d;}gl_Position=uVP*vec4(pos,1.);gl_PointSize=clamp(abs(aSize)*uScale/max(.15,gl_Position.w),1.,55.);vColor=aColor;vColor.rgb*=vec3(uAmbient*.48)+uSunTint*uSunStrength*.36+localDiffuse(pos,vec3(0,1,0))*.45;vColor.rgb+=vec3(.005,.13,.25)*uBio*vKind;if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*length(pos-uEye));vColor.rgb=vColor.rgb*tr+uHaze*(1.-tr);}}
+// One shadow-map tap per drop; the 3x3 filter would cost nine per vertex.
+float sprayShadow(vec3 p){if(uShadowOn<.5)return 1.;vec4 clip=uSunVP*vec4(p,1.);vec3 q=clip.xyz/clip.w*.5+.5;if(any(lessThan(q,vec3(.001)))||any(greaterThan(q,vec3(.999))))return 1.;return mix(1.,step(q.z-uShadowBias,texture(uShadowMap,q.xy).r),uShadowStrength);}
+void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aPosition.xz);Sea s=sea(aPosition.xz,f.y);pos=vec3(aPosition.x,f.x+.055,aPosition.z)+s.d;}gl_Position=uVP*vec4(pos,1.);gl_PointSize=clamp(abs(aSize)*uScale/max(.15,gl_Position.w),1.,55.);vColor=aColor;
+ vec3 sunLight=uSunTint*uSunStrength*.36,ray=pos-uEye;float dist=length(ray);ray/=max(dist,.001);
+ if(uSprayLight>.5){
+  // Drops scatter forward: a Henyey-Greenstein lobe (g=.55) from the view ray toward the sun,
+  // normalized so its sphere average stays the old isotropic .36. Shadowed drops lose the sun.
+  float mu=dot(ray,normalize(uSun)),g=.55,hg=(1.-g*g)/pow(1.+g*g-2.*g*mu,1.5);
+  sunLight=uSunTint*uSunStrength*(.16+.2*min(hg,8.))*sprayShadow(pos);
+ }
+ vColor.rgb*=vec3(uAmbient*.48)+sunLight+localDiffuse(pos,vec3(0,1,0))*.45;vColor.rgb+=vec3(.005,.13,.25)*uBio*vKind;
+ if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);vColor.rgb=vColor.rgb*tr+uHaze*(1.-tr);}
+ // Above water, spray fades into the same air haze as the scenery and the water.
+ else if(uSprayLight>.5){float fog=airFog(dist);if(fog>0.)vColor.rgb=mix(vColor.rgb,skyColor(ray),fog);}}
 `;
 const pointFS=`#version 300 es
 precision highp float;precision highp sampler2D;in vec4 vColor;in float vKind;uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
@@ -2072,7 +2086,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.frameSet({uTime:this.water.time,uGrid:N,uDX:DX,uLevel:this.water.level,
    uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
    uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
-   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:oceanSurface(this.water.time),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness});
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:oceanSurface(this.water.time),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness,uSprayLight:+C.sprayLighting});
   this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(this.water.time),o.uMode);
   this.farSeaTable(f.subarray(o.uFarSeaTable,o.uFarSeaTable+16),f.subarray(o.uWave),f.subarray(o.uMode));
   f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
@@ -3952,7 +3966,7 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness'];
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting'];
 PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){

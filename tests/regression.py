@@ -132,6 +132,18 @@ async def main(args):
    let peaks=0,prev=[],T=C.reefPeriod;for(let i=0;i<=401;i++){const h=D.coastalSample(0,-5.8,t+i*T/400,3)[2];prev.push(h);if(prev.length>3)prev.shift();if(prev.length===3&&prev[1]>prev[0]+1e-9&&prev[1]>=prev[2])peaks++;}
    return {ok:!!gpu&&worst<2e-3&&step<.05&&peaks===1&&cpu[4][0]!==0,worst,step,peaks,gpu:gpu.map(v=>v.map(x=>+x.toFixed(4))),cpu:cpu.map(v=>v.map(x=>+x.toFixed(4)))};
   }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # M5 spray: drops glow toward the sun (forward scattering) and lose the sun in shadow.
+  await check('Spray scatters toward the sun and takes sun shadow', '''const saved={...C},gl=r.gl,orig=r.updateShadow,parts=g.particles.slice();
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   const sum=(a,b)=>{let t=0;for(let i=0;i<a.length;i+=4)t+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);return t;};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,softParticles:false,timeLighting:false,sunStrength:2,cameraMode:3,orbitAuto:false,orbitHeight:6,orbitRadius:24,bloom:false,lensDrops:false});D.storm.sync();r.camera(g,100);
+    const e=r.eye,tg=r.target,d=[tg[0]-e[0],0,tg[2]-e[2]],l=Math.hypot(...d),cloud=[];for(let i=0;i<400;i++)cloud.push({x:e[0]+d[0]/l*6+Math.sin(i*1.7)*1.5,y:e[1]-1+Math.sin(i*2.3),z:e[2]+d[2]/l*6+Math.cos(i*1.3)*1.5,vx:0,vy:0,vz:0,life:1,maxLife:1,size:.12});
+    const light=(sx,sz)=>{C.sunX=sx;C.sunY=.25;C.sunZ=sz;g.particles.length=0;const bare=grab();g.particles.push(...cloud);const lit=grab();return sum(lit,bare);};
+    const toward=light(d[0]/l,d[2]/l),away=light(-d[0]/l,-d[2]/l);
+    C.sunShadows=true;C.shadowStrength=1;const open=light(d[0]/l,d[2]/l);r.updateShadow=function(game){orig.call(this,game);if(!this.shadowReady)return;const gl=this.gl;gl.bindFramebuffer(gl.FRAMEBUFFER,this.shadowTarget.fbo);gl.depthMask(true);gl.clearDepth(0);gl.clear(gl.DEPTH_BUFFER_BIT);gl.clearDepth(1);};
+    const shaded=light(d[0]/l,d[2]/l);
+    return {ok:toward>1.5*away&&shaded<.8*open&&gl.getError()===0,toward,away,open,shaded};
+   }finally{r.updateShadow=orig;g.particles.length=0;g.particles.push(...parts);Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
