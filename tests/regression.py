@@ -109,6 +109,18 @@ async def main(args):
     if(prev){worst.light=Math.max(worst.light,Math.hypot(...v.map((x,i)=>x-prev.v[i])));worst.tint=Math.max(worst.tint,Math.hypot(...t.map((x,i)=>x-prev.t[i])));}prev={v,t};steps++;}
     return {ok:worst.light<.06&&worst.tint<.06,steps,...worst};}finally{Object.assign(C,saved);L.update(g,w);}''')
   await check('Glow and Natural light styles both render', '''const saved={...C};try{C.renderScale=.4;C.visualGrid=65;C.sprayRate=0;C.underParticles=0;for(const s of [1,0]){C.lightStyle=s;r.render(g,1/60);if(r.gl.getError()!==0)return false;}const v=l.bench.variants('lightStyle',C);return {ok:v.length===2&&v[0].settings.lightStyle===0&&v[1].settings.lightStyle===1&&r.surfaceReport().lightStyle==='Glow',variants:v.map(x=>x.name)};}finally{Object.assign(C,saved);}''')
+  # M3: the far sea keeps the energy of the waves its LOD fades out as highlight roughness.
+  await check('Far-sea roughness uses the faded wave energy', '''const saved={...C},gl=r.gl;
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,cameraMode:3,orbitAuto:false,orbitRadius:34,orbitHeight:9,dayHour:16.5,timeLighting:true});D.storm.sync();r.camera(g,100);
+    C.farSeaRoughness=false;const off=grab();C.farSeaRoughness=true;const on=grab();let changed=0;for(let i=0;i<on.length;i+=4)if(Math.abs(on[i]-off[i])+Math.abs(on[i+1]-off[i+1])+Math.abs(on[i+2]-off[i+2])>3)changed++;
+    const off0=gl.getActiveUniforms(r.waterProgram.p,gl.getUniformIndices(r.waterProgram.p,['uFarSeaTable[0]','uFarSea']),gl.UNIFORM_OFFSET).map(b=>b/4),f=new Float32Array(r.frameData.byteLength/4);gl.bindBuffer(gl.UNIFORM_BUFFER,r.frameBuffer);gl.getBufferSubData(gl.UNIFORM_BUFFER,0,f);
+    // Independent recompute of the table from the wave modes and the spectrum's mean square wavenumber.
+    const k2=D.spectrum.bands.map(b=>b.k2),spectral=C.fftHeight**2*(k2[0]+k2[1]*C.fftShort**2),mode=D.storm.phases(w.time),sm=(a,b,x)=>{const t=Math.min(1,Math.max(0,(x-a)/(b-a)));return t*t*(3-2*t);};
+    const table=[...Array(16)].map((_,i)=>{const fp=.05*2**(.6*i);let v=0;for(let j=0;j<D.storm.count;j++){const k=D.storm.gpuW[j*4+2],lod=1-sm(.6,3,k*fp);v+=.5*(mode[j*4]*k)**2*(1-lod*lod);}const band=1-sm(.25,1.5,fp);return v+spectral*(1-band*band);});
+    const tableOk=table.every((x,i)=>Math.abs(f[off0[0]+i]-x)<=1e-5*Math.max(1e-3,x))&&table[15]>table[0],v=l.bench.variants('upgradeAudit',C),diff=Object.keys(v[0].settings).filter(k=>v[0].settings[k]!==v[1].settings[k]);
+    return {ok:changed>50&&gl.getError()===0&&k2.every(x=>x>0&&isFinite(x))&&tableOk&&f[off0[1]]===1&&diff.length===D.upgradeFeatures.length&&diff.every(k=>D.upgradeFeatures.includes(k)),changedPixels:changed,k2,table:table.map(x=>+x.toFixed(4)),tableOk,diff};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
