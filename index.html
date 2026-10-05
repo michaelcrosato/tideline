@@ -1109,8 +1109,9 @@ function waveReach(){let a=.6;if(!C.waves)return a;for(let i=0;i<storm.count;i++
 const STORM_KEYS=['waves','waveCount','waveScale','waveSpeed','windYaw','choppiness'];for(let i=0;i<30;i++)for(const k of ['X','Z','K','T','A','Phase'])STORM_KEYS.push('wave'+i+k);
 class Storm {
  // Phases are wrapped in double precision. A float32 uTime*omega drifted from the
- // CPU wave sum, and quantized the animation, in long sessions.
- phases(t){const a=this.gpuMode||(this.gpuMode=new Float32Array(90));for(let i=0;i<30;i++){const o=i*7;a[i*3]=this.table[o+4];a[i*3+1]=(this.table[o+5]-t*this.table[o+3])%TAU;a[i*3+2]=this.table[o+6];}return a;}
+ // CPU wave sum, and quantized the animation, in long sessions. One vec4 per
+ // mode, the uMode stride in the Frame block.
+ phases(t){const a=this.gpuMode||(this.gpuMode=new Float32Array(120));for(let i=0;i<30;i++){const o=i*7;a[i*4]=this.table[o+4];a[i*4+1]=(this.table[o+5]-t*this.table[o+3])%TAU;a[i*4+2]=this.table[o+6];}return a;}
  constructor(){this.table=new Float64Array(30*7);this.gpuW=new Float32Array(30*4);this.gpuA=new Float32Array(30*3);this.signature='';this.count=30;this.qScale=0;this.scratch=new Float64Array(14);this.sync();}
  sync(){const keys=STORM_KEYS,last=this.lastValues||(this.lastValues=[]);let changed=last.length!==keys.length;for(let i=0;i<keys.length;i++){const v=C[keys[i]];if(v!==last[i]){last[i]=v;changed=true;}}if(!changed)return;this.signature=last.join(',');this.count=Math.round(C.waveCount);let sum=0,a=C.windYaw*Math.PI/180,cs=Math.cos(a),sn=Math.sin(a);
   for(let i=0;i<30;i++){const p='wave'+i,o=i*7,x=C[p+'X'],z=C[p+'Z'],len=Math.hypot(x,z)||1;this.table[o]=(x*cs-z*sn)/len;this.table[o+1]=(x*sn+z*cs)/len;this.table[o+2]=C[p+'K'];this.table[o+3]=C[p+'T']*C.waveSpeed;this.table[o+4]=C.waves?C[p+'A']*C.waveScale:0;this.table[o+5]=C[p+'Phase'];if(i<this.count)sum+=this.table[o+4]*this.table[o+2];}
@@ -1457,29 +1458,44 @@ class LightRig{
 }
 const lights=new LightRig();
 
+/* Frame: the shared values every program that includes sharedGLSL reads, in one
+   std140 uniform block. The renderer fills it once per frame and sends it with one
+   bufferSubData (writeFrame). The preparation passes switch their readiness flags
+   and uSunVP within a frame, so those fields come last and are re-sent on their own
+   when one changes (syncFrame). Per-pass values (uVP, uEye, uReflect, uUnder,
+   uClipLevel, uAirCapture) and all samplers stay plain uniforms.
+   Arrays, vectors and matrices start on a vec4. The vec3 members sit between the
+   arrays and a mat4, so no float shares a vec3's last component. */
+const FRAME_FIELDS=[
+ ['float','uTime uGrid uDX uLevel uOcean'],['int','uWaveCount'],
+ ['float','uDepthFade uRogueHeight uRogueWidth uRogueCenter uRogueSpeed uSunStrength uAmbient uCaustics uCausticStrength uCausticSpeed uCausticScale uWetStrength uFog uUnderDensity'],
+ ['float','uMicro uMicroSpeed uRefraction uReflectionWeight uReflectionDistortion uFresnel uFresnelPower uSpecPower uSpecStrength uFoam uFoamWidth uFoamOpacity uFlowFoam uWakeFoam uFoamTexture uCloud uSSS uRoughness'],
+ ['float','uSpectral uSpectrumAlpha uSpectrumN uSpectrumHeight uSpectrumShort uCacheN uShadowN uShadowSoft uShadowBias uShadowStrength uFocusStrength'],
+ ['float','uDaylight uNightAmbient uStars uLocalOn uLocalSpec uBio uLampShadowN uLampBias'],
+ ['float','uCoastOn uReefHeight uReefPeriod uReefSpeed uHarbourShelter uReefWidth uCoastPhase uFoamAging uFreshLife uWaveShadow uWaveShadowStrength'],
+ ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach'],
+ ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8]'],['mat4','uLampVP[2]'],
+ ['vec3','uSun uAbsorb uBody uUnderAbsorb uHaze uSolar uMoon uSunTint'],
+ // Switched by the preparation passes within a frame (frameFlags).
+ ['mat4','uSunVP'],['float','uSkyCacheOn uLampShadowOn uCacheOn uShadowOn uFocusOn uWetReady']
+];
+const FRAME=(()=>{const size={float:1,int:1,vec3:3,vec4:4,mat4:16},offset={},query=[],bytes=[];let at=0,members='';
+ for(const [type,list] of FRAME_FIELDS)for(const item of list.split(' ')){const [,name,count]=item.match(/^(\w+)(?:\[(\d+)\])?$/);
+  if(count||size[type]>1)at=Math.ceil(at/4)*4;offset[name]=at;query.push(count?name+'[0]':name);bytes.push(at*4);
+  at+=count?count*Math.ceil(size[type]/4)*4:size[type];members+=type+' '+item+';';}
+ // Offsets and sizes count 32-bit words; tail is where the per-pass flag range begins.
+ return {offset,query,bytes,floats:Math.ceil(at/4)*4,tail:offset.uSunVP,binding:0,glsl:'layout(std140) uniform Frame{'+members+'};'};
+})();
+
 const sharedGLSL=`
 precision highp float;precision highp sampler2D;
 precision highp int;
+${FRAME.glsl}
 uniform highp sampler2D uFluid;
-uniform float uTime,uGrid,uDX,uLevel,uOcean;
-uniform vec4 uWave[30];uniform vec3 uMode[30];uniform int uWaveCount;
-uniform float uDepthFade,uRogueHeight,uRogueWidth,uRogueCenter,uRogueSpeed;
-uniform vec3 uSun;uniform float uSunStrength,uAmbient,uCaustics,uCausticStrength,uCausticSpeed,uCausticScale,uWetStrength,uFog;
-uniform vec3 uAbsorb,uBody,uUnderAbsorb,uHaze;uniform float uUnderDensity;
-uniform float uMicro,uMicroSpeed,uRefraction,uReflectionWeight,uReflectionDistortion,uFresnel,uFresnelPower,uSpecPower,uSpecStrength;
-uniform float uFoam,uFoamWidth,uFoamOpacity,uFlowFoam,uWakeFoam,uFoamTexture;
-uniform float uCloud,uSSS,uRoughness;
-
 uniform highp sampler2D uSpectrum;
-uniform float uSpectral,uSpectrumAlpha,uSpectrumN,uSpectrumHeight,uSpectrumShort;
-uniform sampler2D uCache0,uCache1,uCache2;uniform float uCacheOn,uCacheN;
-uniform sampler2D uShadowMap,uFocusMap;uniform mat4 uSunVP;
-uniform float uShadowOn,uShadowN,uShadowSoft,uShadowBias,uShadowStrength,uFocusOn,uFocusStrength;
-uniform float uDaylight,uNightAmbient,uStars,uSkyCacheOn,uLocalOn,uLocalSpec,uBio;
-uniform vec3 uSolar,uMoon,uSunTint;
+uniform sampler2D uCache0,uCache1,uCache2;
+uniform sampler2D uShadowMap,uFocusMap;
 uniform sampler2D uSkyMap,uLampShadow;
-uniform vec4 uLampPos[8],uLampColor[8],uLampDir[8];
-uniform mat4 uLampVP[2];uniform float uLampShadowOn,uLampShadowN,uLampBias;
 float lampVisibility(int i,vec3 p){if(i>1||uLampShadowOn<.5)return 1.;vec4 c=uLampVP[i]*vec4(p,1.);vec3 q=c.xyz/c.w*.5+.5;if(c.w<=0.||any(lessThan(q,vec3(.001)))||any(greaterThan(q,vec3(.999))))return 1.;float v=0.;
  for(int yy=-1;yy<=1;yy++)for(int xx=-1;xx<=1;xx++){vec2 tile=clamp(q.xy+vec2(xx,yy)/uLampShadowN,vec2(.001),vec2(.999));vec2 uv=vec2((tile.x+float(i))*.5,tile.y);v+=step(q.z-uLampBias,texture(uLampShadow,uv).r);}return v/9.;}
 vec3 lampFlux(int i,vec3 p,out vec3 L){vec3 d=uLampPos[i].xyz-p;float d2=dot(d,d),range=uLampPos[i].w;L=d*inversesqrt(max(.0001,d2));float edge=max(0.,1.-pow(d2/(range*range),2.));if(edge<=0.||uLampColor[i].w<=.001)return vec3(0.);float cone=1.;if(uLampDir[i].w>-.99)cone=smoothstep(uLampDir[i].w,mix(uLampDir[i].w,1.,.43),dot(-L,uLampDir[i].xyz));vec3 color=uLampColor[i].rgb;
@@ -1509,8 +1525,6 @@ float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 vec2 hash2(vec2 p){return fract(sin(vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))))*43758.5453);}
 float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+1.),f.x),f.y);}
 float fbm(vec2 p){float sum=0.,weight=.5;for(int i=0;i<5;i++){sum+=noise(p)*weight;p=mat2(1.6,-1.2,1.2,1.6)*p+3.7;weight*=.5;}return sum;}
-uniform float uCoastOn,uReefHeight,uReefPeriod,uReefSpeed,uHarbourShelter,uReefWidth,uCoastPhase;
-uniform float uFoamAging,uFreshLife,uWaveShadow,uWaveShadowStrength;
 float coastShelter(vec2 p,out float derivative){float t=clamp((p.y-3.5)/6.,0.,1.);derivative=-(1.-uHarbourShelter)*6.*t*(1.-t)/6.;return 1.-(1.-uHarbourShelter)*t*t*(3.-2.*t);}
 // The reef curve bends shoreward and meets the breakwater near |x|=17. The walls
 // (|x|>5.5, z 4.5-6.5) stop the breaker; only the entrance gap passes it.
@@ -1525,7 +1539,7 @@ vec4 coastWave(vec2 p,float depth){
 
 struct Sea {vec3 d;vec3 n;vec3 velocity;float compression;vec2 gradient;};
 Sea seaRaw(vec2 p,float depth,float footprint){Sea s;vec2 shift=vec2(0.),gradient=vec2(0.),velocityXZ=vec2(0.);float height=0.,vy=0.,mxx=1.,mxz=0.,mzz=1.;float fade=smoothstep(0.,uDepthFade,max(0.,depth));
- for(int i=0;i<30;i++){if(i>=uWaveCount)break;vec4 w=uWave[i];vec3 mode=uMode[i];float lod=1.-smoothstep(.6,3.,w.z*footprint),a=mode.x*fade*lod,q=mode.z*fade*lod,phase=dot(p,w.xy)*w.z+mode.y,sn=sin(phase),cs=cos(phase),derivative=q*w.z*sn;
+ for(int i=0;i<30;i++){if(i>=uWaveCount)break;vec4 w=uWave[i];vec3 mode=uMode[i].xyz;float lod=1.-smoothstep(.6,3.,w.z*footprint),a=mode.x*fade*lod,q=mode.z*fade*lod,phase=dot(p,w.xy)*w.z+mode.y,sn=sin(phase),cs=cos(phase),derivative=q*w.z*sn;
  shift+=q*cs*w.xy;height+=a*sn;gradient+=a*w.z*cs*w.xy;mxx-=derivative*w.x*w.x;mxz-=derivative*w.x*w.y;mzz-=derivative*w.y*w.y;velocityXZ+=q*w.w*sn*w.xy;vy-=a*w.w*cs;}
  if(uRogueHeight>0.){float a=(dot(p,uWave[0].xy)-uRogueCenter)/uRogueWidth,e=exp(-.5*a*a),d=uRogueHeight*fade*e*(a*a*a-3.*a)/uRogueWidth;height+=uRogueHeight*fade*e*(1.-a*a);gradient+=d*uWave[0].xy;vy-=d*uRogueSpeed;}
  vec4 sp=spectralAt(p)*fade;float bandLOD=1.-smoothstep(.25,1.5,footprint);height+=sp.x*bandLOD;gradient+=sp.yz*bandLOD;vy+=sp.w*bandLOD;
@@ -1557,8 +1571,6 @@ float unpackFoam(vec4 c){return dot(c.rg,vec2(256.,1.))*255./65535.;}
 vec4 packFoam(float density,float birth){float v=floor(clamp(density,0.,1.)*65535.);return vec4(floor(v/256.)/255.,mod(v,256.)/255.,birth,1.);}
 `;
 const surfaceGLSL=`
-uniform float uNaturalFoam,uFoamBreakup,uWaveWetness,uWetReady,uWetGloss;
-uniform float uFilteredHighlights,uHighlightVariance,uPathWakes,uPropWash,uWaveReach;
 uniform sampler2D uWetHistory;
 // Column heights use two independent 16-bit UNORM values, valid without HDR targets.
 float wetHeightDecode(vec2 c){return dot(c,vec2(256.,1.))*255./65535.*48.-16.;}
@@ -1915,6 +1927,8 @@ class Renderer{
  }
  async initialize(){const gl=this.gl,water=this.water;
   await BOOT.run('L30','Core shaders',async()=>{
+  this.frameData=new Float32Array(FRAME.floats);this.frameInts=new Int32Array(this.frameData.buffer);this.frameSent=new Float32Array(FRAME.floats);this.frameBlocks=0;
+  this.frameBuffer=gl.createBuffer();gl.bindBuffer(gl.UNIFORM_BUFFER,this.frameBuffer);gl.bufferData(gl.UNIFORM_BUFFER,this.frameData.byteLength,gl.DYNAMIC_DRAW);gl.bindBufferBase(gl.UNIFORM_BUFFER,FRAME.binding,this.frameBuffer);
   this.meshProgram=this.program(meshVS,meshFS);this.waterProgram=this.program(waterVS,waterFS);this.pointProgram=this.program(pointVS,pointFS);
   this.copyProgram=this.program(`#version 300 es
 precision highp float;out vec2 vUV;void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);vUV=p;gl_Position=vec4(p*2.-1.,0.,1.);}`,`#version 300 es
@@ -1934,7 +1948,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   await BOOT.run('L50','Light and optics',async()=>{
    this.initAbyss();this.initBeacon();this.initOptics();await this.verifyPrograms();this.compiling=false;
    gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.disable(gl.CULL_FACE);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
-   BOOT.report.renderer.engine={hdr:this.hdr,traceHierarchy:this.traceSupported,renderSize:[...this.size],shaderPrograms:this.shaderTotal};
+   BOOT.report.renderer.engine={hdr:this.hdr,traceHierarchy:this.traceSupported,renderSize:[...this.size],shaderPrograms:this.shaderTotal,frameBlock:{bytes:this.frameData.byteLength,members:FRAME.query.length,programs:this.frameBlocks}};
   },60000);
   return this;
  }
@@ -1943,7 +1957,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    if(this.parallel)while(!gl.getProgramParameter(item.p,this.parallel.COMPLETION_STATUS_KHR)){if(BOOT.failed)throw BootKit.error('BOOT-CANCELLED','Shader compilation cancelled.');await new Promise(r=>setTimeout(r,25));}
    else await new Promise(r=>setTimeout(r,25));
    const linked=gl.getProgramParameter(item.p,gl.LINK_STATUS);if(!linked){const details=item.shaders.map(sh=>gl.getShaderInfoLog(sh)||'').join('\n')+'\n'+gl.getProgramInfoLog(item.p);throw BootKit.error('GFX-SHADER',name+': '+details);}
-   for(const sh of item.shaders)gl.deleteShader(sh);this.shaderTotal++;
+   for(const sh of item.shaders)gl.deleteShader(sh);this.bindFrame(item.p);this.shaderTotal++;
   }this.pendingPrograms=[];
  }
 
@@ -1952,11 +1966,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   b=new Builder();b.box(0,0,0,.9,.32,.6,[.94,.45,.08]);b.box(0,.23,0,.5,.14,.42,[.12,.21,.28]);for(const xx of [-.45,.45])b.cylinder(xx,-.2,0,.12,.12,.46,[.27,.37,.38],10);this.droneMesh=this.mesh(b);
  }
  useWorld(id){if(this.activeWorld===id)return;let set=this.worldMeshes.get(id);if(!set){set={land:this.mesh(terrainGeometry(this.water)),props:this.mesh(scenery(this.water))};this.worldMeshes.set(id,set);}this.land=set.land;this.props=set.props;this.activeWorld=id;this.reflectionValid=false;this.shadowReady=false;this.cacheReady=false;this.resetEffects();}
- bindBeacon(p){const gl=this.gl,f=(n,v)=>gl.uniform1f(p.name(n),v);
-  f('uDaylight',lights.day);f('uNightAmbient',C.nightAmbient);f('uStars',C.starStrength);f('uSkyCacheOn',+(C.skyCache&&this.skyReady));f('uLocalOn',+(C.localLights&&lights.active>0));f('uLocalSpec',C.localSpecular);f('uBio',C.bioStrength*(1-lights.day));
-  gl.uniform3fv(p.name('uSolar'),lights.solar);gl.uniform3fv(p.name('uMoon'),lights.moon);gl.uniform3fv(p.name('uSunTint'),lights.tint);
-  gl.uniform4fv(p.name('uLampPos[0]'),lights.positions);gl.uniform4fv(p.name('uLampColor[0]'),lights.colors);gl.uniform4fv(p.name('uLampDir[0]'),lights.directions);gl.uniformMatrix4fv(p.name('uLampVP[0]'),false,lights.packedVP);
-  f('uLampShadowOn',+(C.localShadows&&this.lampShadowReady));f('uLampShadowN',C.lampShadowSize);f('uLampBias',C.lampShadowBias);
+ bindBeacon(p){const gl=this.gl;
   for(const [name,tex,unit] of [['uSkyMap',this.skyLUT?.color,12],['uLampShadow',this.lampShadow?.depth,13]]){const loc=p.name(name);if(loc!==null){gl.uniform1i(loc,unit);this.texAt(tex||this.fluidTex,unit);}}
  }
  updateSky(game){if(!C.skyCache){this.skyReady=false;return;}const gl=this.gl;if(!this.skyLUT){this.skyLUT=this.makeTarget(512,256,true);this.texAt(this.skyLUT.color,12);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);}
@@ -1978,8 +1988,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
 
  initAbyss(){const gl=this.gl;this.cacheProgram=this.program(fullVS,cacheFS);this.shadowProgram=this.program(shadowVS,shadowFS);this.focusProgram=this.program(fullVS,focusFS);this.spectrumTex=this.texture(gl.RGBA32F,spectrum.n*2,spectrum.n*2,gl.RGBA,gl.FLOAT,gl.NEAREST);this.spectrumSize=spectrum.n;this.spectrumVersion=-1;this.cacheTargets=null;this.cacheReady=false;this.shadowReady=false;this.sunVP=Mat.identity();this.shadowTarget=null;this.focusTarget=null;this.focusReady=false;this.abyssAllocBytes=0;}
  uploadSpectrum(){const gl=this.gl;if(spectrum.n!==this.spectrumSize){gl.deleteTexture(this.spectrumTex);this.spectrumSize=spectrum.n;this.spectrumTex=this.texture(gl.RGBA32F,spectrum.n*2,spectrum.n*2,gl.RGBA,gl.FLOAT,gl.NEAREST);this.spectrumVersion=-1;}if(this.spectrumVersion!==spectrum.version){this.texAt(this.spectrumTex,6);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,spectrum.n*2,spectrum.n*2,gl.RGBA,gl.FLOAT,spectrum.atlas);this.spectrumVersion=spectrum.version;}}
- bindAbyss(p){const gl=this.gl;const uniform=(name,v)=>gl.uniform1f(p.name(name),v);uniform('uSpectral',+(C.spectral&&C.waves));uniform('uSpectrumN',spectrum.n);uniform('uSpectrumAlpha',spectrum.alpha);uniform('uSpectrumHeight',C.fftHeight);uniform('uSpectrumShort',C.fftShort);uniform('uCacheOn',+(C.waveCache&&this.cacheReady&&this.hdr));uniform('uCacheN',C.cacheSize);
-  uniform('uShadowOn',+(C.sunShadows&&this.shadowReady));uniform('uShadowN',C.shadowSize);uniform('uShadowSoft',C.shadowSoft);uniform('uShadowBias',C.shadowBias);uniform('uShadowStrength',C.shadowStrength);uniform('uFocusOn',+(C.focusedCaustics&&this.focusReady));uniform('uFocusStrength',C.focusStrength);gl.uniformMatrix4fv(p.name('uSunVP'),false,this.sunVP);
+ bindAbyss(p){const gl=this.gl;
   for(const [name,tex,unit] of [['uSpectrum',this.spectrumTex,6],['uCache0',this.cacheTargets?.colors[0],7],['uCache1',this.cacheTargets?.colors[1],8],['uCache2',this.cacheTargets?.colors[2],9],['uShadowMap',this.shadowTarget?.depth,10],['uFocusMap',this.focusTarget?.color,11]]){const loc=p.name(name);if(loc!==null){gl.uniform1i(loc,unit);this.texAt(tex||this.fluidTex,unit);}}
  }
  updateCache(game){this.cacheReady=false;if(!C.waveCache||!this.hdr)return;const gl=this.gl,n=C.cacheSize;if(this.cacheTargets?.n!==n){if(this.cacheTargets){gl.deleteFramebuffer(this.cacheTargets.fbo);for(const t of this.cacheTargets.colors)gl.deleteTexture(t);}const colors=[];for(let i=0;i<3;i++)colors.push(this.texture(gl.RGBA16F,n,n,gl.RGBA,gl.HALF_FLOAT,gl.LINEAR));const fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);colors.forEach((t,i)=>gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0));gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1,gl.COLOR_ATTACHMENT2]);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('The wave cache could not be created. Disable Wave cache.');this.cacheTargets={fbo,colors,n};}
@@ -1994,8 +2003,16 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  program(vs,fs){const gl=this.gl,p=gl.createProgram();if(!p)throw BootKit.error('GFX-ALLOC','No shader program allocation.');const shaders=[];
   for(const [type,src] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){const s=gl.createShader(type);if(!s)throw BootKit.error('GFX-ALLOC','No shader allocation.');shaders.push(s);gl.shaderSource(s,src);gl.compileShader(s);gl.attachShader(p,s);}
   gl.linkProgram(p);const loc={},handle={p,loc,name:n=>Object.hasOwn(loc,n)?loc[n]:(loc[n]=gl.getUniformLocation(p,n))};
-  if(this.compiling)this.pendingPrograms.push({p,shaders,handle,serial:++this.shaderSerial});else{if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw BootKit.error('GFX-SHADER',shaders.map(s=>gl.getShaderInfoLog(s)||'').join('\n')+'\n'+gl.getProgramInfoLog(p));for(const s of shaders)gl.deleteShader(s);}
+  if(this.compiling)this.pendingPrograms.push({p,shaders,handle,serial:++this.shaderSerial});else{if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw BootKit.error('GFX-SHADER',shaders.map(s=>gl.getShaderInfoLog(s)||'').join('\n')+'\n'+gl.getProgramInfoLog(p));for(const s of shaders)gl.deleteShader(s);this.bindFrame(p);}
   return handle;
+ }
+ // Point a linked program's Frame block at the shared buffer. The first program also
+ // checks the driver's std140 offsets against FRAME. The reported block size is a
+ // minimum and may omit the trailing padding, so the buffer only has to cover it.
+ bindFrame(p){const gl=this.gl,block=gl.getUniformBlockIndex(p,'Frame');if(block===gl.INVALID_INDEX)return;gl.uniformBlockBinding(p,block,FRAME.binding);this.frameBlocks++;if(this.frameChecked)return;
+  const size=gl.getActiveUniformBlockParameter(p,block,gl.UNIFORM_BLOCK_DATA_SIZE),index=gl.getUniformIndices(p,FRAME.query),found=FRAME.query.map((_,i)=>i).filter(i=>index[i]!==gl.INVALID_INDEX),offsets=found.length?gl.getActiveUniforms(p,found.map(i=>index[i]),gl.UNIFORM_OFFSET):[],wrong=found.findIndex((i,k)=>offsets[k]!==FRAME.bytes[i]);
+  if(size>this.frameData.byteLength||wrong>=0)throw BootKit.error('GFX-SHADER','Frame uniform block does not match std140: '+(wrong>=0?FRAME.query[found[wrong]]+' at byte '+offsets[wrong]+', expected '+FRAME.bytes[found[wrong]]:size+' bytes, buffer '+this.frameData.byteLength)+'.');
+  this.frameChecked=true;
  }
 
  mesh(b,keepWet=false){let gl=this.gl,vao=gl.createVertexArray();gl.bindVertexArray(vao);let buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.v),gl.STATIC_DRAW);for(let i=0;i<3;i++){gl.enableVertexAttribArray(i);gl.vertexAttribPointer(i,3,gl.FLOAT,false,36,i*12);}gl.bindVertexArray(null);const m={vao,buffer,count:b.v.length/9,bytes:b.v.length*4,solids:b.solids||[]};if(keepWet)this.attachWetVertices(m,b.v);return m;}
@@ -2003,10 +2020,27 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  makeTarget(w,h,hdr=false){let gl=this.gl,color=this.texture(hdr&&this.hdr?gl.RGBA16F:gl.RGBA8,w,h,gl.RGBA,hdr&&this.hdr?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,gl.LINEAR),depth=this.texture(gl.DEPTH_COMPONENT24,w,h,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,gl.NEAREST),fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,depth,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('The graphics device could not create the water render targets.');gl.bindFramebuffer(gl.FRAMEBUFFER,null);return{fbo,color,depth,w,h,bytesPerPixel:hdr&&this.hdr?12:8};}
  deleteTarget(t){if(!t)return;let gl=this.gl;gl.deleteFramebuffer(t.fbo);gl.deleteTexture(t.color);gl.deleteTexture(t.depth);}
  resize(){const gl=this.gl;let ratio=Math.min(devicePixelRatio||1,C.maxDPR)*C.renderScale,w=this.canvas.getBoundingClientRect().width||innerWidth,h=this.canvas.getBoundingClientRect().height||innerHeight;ratio=Math.min(ratio,Math.sqrt(C.maxPixels/(w*h)),this.maxDimension/Math.max(w,h));w=Math.max(2,Math.round(w*ratio));h=Math.max(2,Math.round(h*ratio));const rw=Math.max(2,Math.floor(w*C.reflectionScale)),rh=Math.max(2,Math.floor(h*C.reflectionScale));if(w===this.size[0]&&h===this.size[1]&&this.reflect?.w===rw&&this.reflect?.h===rh)return;this.canvas.width=w;this.canvas.height=h;this.size=[w,h];this.deleteTarget(this.scene);this.deleteTarget(this.reflect);this.deleteTarget(this.final);this.deleteTarget(this.bloom);this.scene=this.makeTarget(w,h,true);this.reflect=this.makeTarget(rw,rh,true);this.final=this.makeTarget(w,h,true);this.bloom=this.makeTarget(Math.max(2,w>>2),Math.max(2,h>>2),true);this.reflectionValid=false;}
- settings(p){this.bindAbyss(p);this.bindBeacon(p);const gl=this.gl;gl.uniform1f(p.name('uGrid'),N);gl.uniform1f(p.name('uDX'),DX);gl.uniform1f(p.name('uLevel'),this.water.level);gl.uniform1i(p.name('uWaveCount'),storm.count);gl.uniform4fv(p.name('uWave[0]'),storm.gpuW);gl.uniform3fv(p.name('uMode[0]'),storm.phases(this.water.time));
-  const singles={uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach()};for(const k in singles)gl.uniform1f(p.name(k),singles[k]);
-  gl.uniform3fv(p.name('uSun'),lights.sun);const clarityScale=Math.pow(4,1-C.waterClarity/50);gl.uniform3f(p.name('uAbsorb'),C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale);const amb=.035+.965*lights.day;gl.uniform3f(p.name('uBody'),C.bodyR*amb,C.bodyG*amb,C.bodyB*amb);gl.uniform3f(p.name('uUnderAbsorb'),C.underR,C.underG,C.underB);gl.uniform3f(p.name('uHaze'),C.hazeR*amb,C.hazeG*amb,C.hazeB*amb);
+ // Per-program sampler units. Shared values live in the Frame block.
+ settings(p){this.bindAbyss(p);this.bindBeacon(p);}
+ frameSet(values){const f=this.frameData,o=FRAME.offset;for(const k in values){if(!(k in o))throw Error('Frame block has no '+k+'.');f[o[k]]=values[k];}}
+ // Values that hold for the whole frame. surface.js adds its own after these.
+ frameValues(){const f=this.frameData,o=FRAME.offset,clarityScale=Math.pow(4,1-C.waterClarity/50),amb=.035+.965*lights.day;
+  this.frameSet({uTime:this.water.time,uGrid:N,uDX:DX,uLevel:this.water.level,
+   uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
+   uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((this.water.time/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:(C.environment===0?C.oceanLevel:WORLD_DEFS[C.environment].level)+C.oceanTide*Math.sin(this.water.time*C.oceanRate),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(this.water.time,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach()});
+  this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(this.water.time),o.uMode);
+  f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
+  f.set(lights.sun,o.uSun);f.set([C.absorbR*clarityScale,C.absorbG*clarityScale,C.absorbB*clarityScale],o.uAbsorb);f.set([C.bodyR*amb,C.bodyG*amb,C.bodyB*amb],o.uBody);f.set([C.underR,C.underG,C.underB],o.uUnderAbsorb);f.set([C.hazeR*amb,C.hazeG*amb,C.hazeB*amb],o.uHaze);
+  f.set(lights.solar,o.uSolar);f.set(lights.moon,o.uMoon);f.set(lights.tint,o.uSunTint);
  }
+ // Readiness flags that the preparation passes switch within a frame, and the sun
+ // shadow matrix that updateShadow replaces. Read again before every pass.
+ frameFlags(){const f=this.frameData,o=FRAME.offset;f[o.uSkyCacheOn]=+(C.skyCache&&this.skyReady);f[o.uLampShadowOn]=+(C.localShadows&&this.lampShadowReady);f[o.uCacheOn]=+(C.waveCache&&this.cacheReady&&this.hdr);f[o.uShadowOn]=+(C.sunShadows&&this.shadowReady);f[o.uFocusOn]=+(C.focusedCaustics&&this.focusReady);f.set(this.sunVP,o.uSunVP);}
+ // Once per frame, before the first pass: the whole block in one bufferSubData.
+ writeFrame(){const gl=this.gl;this.frameValues();this.frameFlags();gl.bindBuffer(gl.UNIFORM_BUFFER,this.frameBuffer);gl.bufferSubData(gl.UNIFORM_BUFFER,0,this.frameData);this.frameSent.set(this.frameData);}
+ // Before each pass: re-send only the flag range, and only when a flag changed.
+ syncFrame(){this.frameFlags();const f=this.frameData,s=this.frameSent,t=FRAME.tail;for(let i=t;i<f.length;i++)if(f[i]!==s[i]){const gl=this.gl;gl.bindBuffer(gl.UNIFORM_BUFFER,this.frameBuffer);gl.bufferSubData(gl.UNIFORM_BUFFER,t*4,f,t,f.length-t);s.set(f.subarray(t),t);return;}}
  makeWaterGrid(){const gl=this.gl,n=Math.round(C.visualGrid);if(n===this.waterGridSetting)return;
   if(this.wvao){gl.deleteVertexArray(this.wvao);gl.deleteBuffer(this.wbuffer);gl.deleteBuffer(this.windex);}
   // Dense test basin with progressively larger outer rings, not a needlessly
@@ -2019,7 +2053,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.wvao=gl.createVertexArray();gl.bindVertexArray(this.wvao);this.wbuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,this.wbuffer);gl.bufferData(gl.ARRAY_BUFFER,v,gl.STATIC_DRAW);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,8,0);this.windex=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,this.windex);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,ix,gl.STATIC_DRAW);this.wcount=ix.length;this.waterGridBytes=v.byteLength+ix.byteLength;this.waterGridSetting=n;this.visualN=n;this.visualTotal=res;gl.bindVertexArray(null);
  }
  texAt(tex,unit){let gl=this.gl;gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tex);}
- common(p,vp,eye,game,reflection=0){let gl=this.gl;gl.useProgram(p.p);gl.uniformMatrix4fv(p.name('uVP'),false,vp);gl.uniform3fv(p.name('uEye'),eye);this.settings(p);gl.uniform1f(p.name('uTime'),this.water.time);gl.uniformMatrix4fv(p.name('uVP'),false,vp);gl.uniform1f(p.name('uUnder'),this.underwater&&!reflection&&!this.capturingAir?1:0);gl.uniform1f(p.name('uAirCapture'),this.capturingAir?1:0);gl.uniform1f(p.name('uReflect'),reflection);gl.uniform1f(p.name('uClipLevel'),this.water.level);gl.uniform1i(p.name('uFluid'),0);this.texAt(this.fluidTex,0);}
+ common(p,vp,eye,game,reflection=0){let gl=this.gl;gl.useProgram(p.p);gl.uniformMatrix4fv(p.name('uVP'),false,vp);gl.uniform3fv(p.name('uEye'),eye);this.settings(p);this.syncFrame();gl.uniform1f(p.name('uUnder'),this.underwater&&!reflection&&!this.capturingAir?1:0);gl.uniform1f(p.name('uAirCapture'),this.capturingAir?1:0);gl.uniform1f(p.name('uReflect'),reflection);gl.uniform1f(p.name('uClipLevel'),this.water.level);gl.uniform1i(p.name('uFluid'),0);this.texAt(this.fluidTex,0);}
  draw(mesh,model=this.identity,glow=0,terrain=0,tint=[1,1,1]){let gl=this.gl,p=this.meshProgram;gl.uniformMatrix4fv(p.name('uModel'),false,model);gl.uniform1f(p.name('uGlow'),glow);gl.uniform3fv(p.name('uEmissiveTint'),tint);gl.uniform1f(p.name('uTerrain'),terrain);gl.uniform1f(p.name('uObjectWet'),mesh.wetValues&&C.waveWetness?1:0);gl.bindVertexArray(mesh.vao);gl.drawArrays(gl.TRIANGLES,0,mesh.count);profiler?.draw(mesh.count/3,0);}
  drawScene(vp,eye,game,reflection=0){let gl=this.gl,p=this.meshProgram;this.common(p,vp,eye,game,reflection);gl.uniform1i(p.name('uWet'),1);this.texAt(this.wetTex,1);this.draw(this.land,this.identity,0,1);if(C.props)this.draw(this.props);
   for(const g of (C.environment===0?this.water.gates:[]))this.draw(this.gate,Mat.model(g.x,g.value*3.65,g.z));
@@ -2054,7 +2088,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  }
  render(game,dt){const gl=this.gl;this.resize();this.makeWaterGrid();this.frame++;lights.update(game,this.water);this.camera(game,dt);profiler?.beginPass('upload');this.uploadSpectrum();
   // Re-pack and upload only after the water changed. Writers outside Water.step set fluidDirty.
-  const ws=this.water;if(this.fluidDirty!==false||ws.time!==this.fluidTime||ws.epoch!==this.fluidEpoch||ws.level!==this.fluidLevel){ws.pack(this.fluidDirty!==false);this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,ws.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,ws.wet);this.fluidTime=ws.time;this.fluidEpoch=ws.epoch;this.fluidLevel=ws.level;this.fluidDirty=false;}profiler?.endPass();
+  const ws=this.water;if(this.fluidDirty!==false||ws.time!==this.fluidTime||ws.epoch!==this.fluidEpoch||ws.level!==this.fluidLevel){ws.pack(this.fluidDirty!==false);this.texAt(this.fluidTex,0);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.FLOAT,ws.tex);this.texAt(this.wetTex,1);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.UNSIGNED_BYTE,ws.wet);this.fluidTime=ws.time;this.fluidEpoch=ws.epoch;this.fluidLevel=ws.level;this.fluidDirty=false;}this.writeFrame();profiler?.endPass();
   if(game.rescue?.active)this.prepareRescueMeshes(game);profiler?.beginPass('skyLight');this.updateSky(game);profiler?.endPass();
   profiler?.beginPass('localShadows');this.updateLampShadows(game);profiler?.endPass();
   profiler?.beginPass('waveCache');this.updateCache(game);profiler?.endPass();
@@ -2489,10 +2523,10 @@ class Profiler{
  window(now=performance.now()){const a=[];for(let i=0;i<this.liveCount;i++){const f=this.live[(this.liveIndex-this.liveCount+i+this.live.length)%this.live.length];if(f&&now-f.t<=10000)a.push(f);}return a;}
  clearLive(){this.live.fill(undefined);this.liveCount=this.liveIndex=0;}
  memory(){
-  const buffers=new Set();for(const value of Object.values(water))if(ArrayBuffer.isView(value))buffers.add(value.buffer);buffers.add(renderer.pdata.buffer);for(const v of [...Object.values(storm),...spectrum.arrays(),game.surfaceRead,game.waveRead])if(ArrayBuffer.isView(v))buffers.add(v.buffer);for(const layout of water.layoutCache.values())for(const v of Object.values(layout))if(ArrayBuffer.isView(v))buffers.add(v.buffer);for(const v of [lights.positions,lights.colors,lights.directions,lights.packedVP,game.flowRead])buffers.add(v.buffer);let arrays=0;for(const b of buffers)arrays+=b.byteLength;
+  const buffers=new Set();for(const value of Object.values(water))if(ArrayBuffer.isView(value))buffers.add(value.buffer);buffers.add(renderer.pdata.buffer);buffers.add(renderer.frameData.buffer);buffers.add(renderer.frameSent.buffer);for(const v of [...Object.values(storm),...spectrum.arrays(),game.surfaceRead,game.waveRead])if(ArrayBuffer.isView(v))buffers.add(v.buffer);for(const layout of water.layoutCache.values())for(const v of Object.values(layout))if(ArrayBuffer.isView(v))buffers.add(v.buffer);for(const v of [lights.positions,lights.colors,lights.directions,lights.packedVP,game.flowRead])buffers.add(v.buffer);let arrays=0;for(const b of buffers)arrays+=b.byteLength;
   let geometry=renderer.waterGridBytes+renderer.pdata.byteLength;for(const k of ['boat','gate','cell','cargo','lampMesh','droneMesh'])geometry+=renderer[k].bytes;for(const a of renderer.worldMeshes.values())geometry+=a.land.bytes+a.props.bytes;
   const targets=[renderer.skyLUT,renderer.lampShadow,renderer.volumeTarget,renderer.shadowTarget,renderer.focusTarget,renderer.scene,renderer.reflect,renderer.final,renderer.bloom].filter(Boolean).reduce((n,t)=>n+t.w*t.h*t.bytesPerPixel,0)+(renderer.foamTargets||[]).reduce((n,t)=>n+t.w*t.h*4,0)+(renderer.foamSaved?renderer.foamSaved.w*renderer.foamSaved.h*4:0),textures=N*N*17+spectrum.n*spectrum.n*4*16+(renderer.cacheTargets?renderer.cacheTargets.n**2*24:0);
-  return{heap:{...this.heap,source:'performance.memory (legacy, approximate)'},ownedArrayBytes:arrays,trackedGPUBytes:geometry+targets+textures,gpuGeometryBytes:geometry,gpuTargetBytes:targets,gpuStateTextureBytes:textures,evidenceCanvasBytes:lab?[...lab.images.values()].reduce((s,c)=>s+c.width*c.height*4,0):0};
+  return{heap:{...this.heap,source:'performance.memory (legacy, approximate)'},ownedArrayBytes:arrays,trackedGPUBytes:geometry+targets+textures+renderer.frameData.byteLength,gpuGeometryBytes:geometry,gpuTargetBytes:targets,gpuStateTextureBytes:textures,evidenceCanvasBytes:lab?[...lab.images.values()].reduce((s,c)=>s+c.width*c.height*4,0):0};
  }
  hardware(){const gl=this.gl,debug=gl.getExtension('WEBGL_debug_renderer_info');return{startup:{id:BOOT.report.id,build:BUILD,renderer:BOOT.report.renderer.selected,checks:BOOT.report.stages.map(s=>({code:s.code,status:s.status,durationMs:s.durationMs})),warnings:BOOT.report.warnings},screenMode:BOOT.screen.snapshot(),cameraFrame:renderer.cameraFrame,environment:C.environment,environmentName:WORLD_DEFS[C.environment].name,lightingHour:lights.hour,localLightCount:lights.active,spotShadowSize:C.lampShadowSize,beamScale:C.beamScale,beamSteps:C.beamSteps,skyCache:C.skyCache,userAgent:navigator.userAgent,platform:navigator.userAgentData?.platform||navigator.platform||null,logicalProcessors:navigator.hardwareConcurrency??null,approxDeviceMemoryGiB:navigator.deviceMemory??null,language:navigator.language,timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone,cssViewport:[innerWidth,innerHeight],renderSize:[...renderer.size],reflectionSize:[renderer.reflect.w,renderer.reflect.h],spectrumSize:spectrum.n,spectrumBands:2,spectrumHz:C.fftHz,waveCacheActive:renderer.cacheReady,waveCacheSize:C.cacheSize,shadowSize:renderer.shadowTarget?.w??0,focusSize:renderer.focusTarget?.w??0,waterMeshSize:renderer.visualN,waveModes:C.waveCount,foamMap:C.foamResolution,hdr:renderer.hdr,devicePixelRatio:devicePixelRatio||1,screenSize:[screen.width,screen.height],webglVendor:debug?gl.getParameter(debug.UNMASKED_VENDOR_WEBGL):gl.getParameter(gl.VENDOR),webglRenderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),webglVersion:gl.getParameter(gl.VERSION),shadingLanguage:gl.getParameter(gl.SHADING_LANGUAGE_VERSION),contextAttributes:gl.getContextAttributes(),capabilities:this.support,protocol:location.protocol,storageAvailable,qualityPreset:phonePresetReport()};}
 }
@@ -3854,11 +3888,18 @@ Renderer.prototype.attachWetVertices=function(mesh,vertices){
  gl.bufferData(gl.ARRAY_BUFFER,mesh.wetValues,gl.DYNAMIC_DRAW);gl.enableVertexAttribArray(3);
  gl.vertexAttribPointer(3,2,gl.FLOAT,false,8,0);gl.bindVertexArray(null);mesh.bytes+=mesh.wetValues.byteLength;
 };
+// Feature values go in the Frame block; the wet-history map is a per-pass sampler.
+const surfaceFrameValues=Renderer.prototype.frameValues;
+Renderer.prototype.frameValues=function(){
+ surfaceFrameValues.call(this);
+ this.frameSet({uNaturalFoam:+C.naturalFoam,uFoamBreakup:C.foamBreakup,uWaveWetness:+C.waveWetness,uWetGloss:C.wetGloss,uFilteredHighlights:+C.filteredHighlights,uHighlightVariance:C.highlightVariance,uPathWakes:+C.persistentWakes,uPropWash:C.propWashFoam});
+};
+// The wet-history pass switches surfaceWetReady within a frame.
+const surfaceFrameFlags=Renderer.prototype.frameFlags;
+Renderer.prototype.frameFlags=function(){surfaceFrameFlags.call(this);this.frameData[FRAME.offset.uWetReady]=+!!this.surfaceWetReady;};
 const surfaceSettingsBase=Renderer.prototype.settings;
 Renderer.prototype.settings=function(p){
  surfaceSettingsBase.call(this,p);const gl=this.gl;
- const values={uNaturalFoam:+C.naturalFoam,uFoamBreakup:C.foamBreakup,uWaveWetness:+C.waveWetness,uWetReady:+!!this.surfaceWetReady,uWetGloss:C.wetGloss,uFilteredHighlights:+C.filteredHighlights,uHighlightVariance:C.highlightVariance,uPathWakes:+C.persistentWakes,uPropWash:C.propWashFoam};
- for(const [key,value]of Object.entries(values))gl.uniform1f(p.name(key),value);
  const loc=p.name('uWetHistory');if(loc!==null){this.texAt(this.surfaceWetTargets?.[this.surfaceWetRead||0]?.color||this.wetTex,15);gl.uniform1i(loc,15);}
 };
 Renderer.prototype.ensureSurfaceWet=function(){

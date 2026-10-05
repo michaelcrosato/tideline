@@ -18,7 +18,7 @@ This is the working plan for the Surface 10.2 upgrade series. Each milestone is 
 | Milestone | Effort | State | PR | Notes |
 |---|---|---|---|---|
 | M0 Phone quality defaults | Medium | Done | [michaelcrosato/tideline#3](https://github.com/michaelcrosato/tideline/pull/3) | `PHONE_PRESET` applied once on first touch-UI run with no saved settings; recorded as `hardware.qualityPreset` in reports; `tests/mobile.py` checks first run, report, apply-once and user override. Not added to the `mGraphics` menu (no way to re-apply it after overriding); `renderer.high` left on. Build ID/CHANGELOG/README deferred to the end of Phase 1. |
-| M1 Shared uniform buffer | Extra high | Not started | | |
+| M1 Shared uniform buffer | Extra high | Done | [michaelcrosato/tideline#4](https://github.com/michaelcrosato/tideline/pull/4) | `Frame` std140 block (126 vec4, 2,016 B) generated from `FRAME_FIELDS`. One full `bufferSubData` per frame. The readiness flags and `uSunVP`, which the prep passes switch mid-frame, sit in a 96 B tail that is re-sent only when one changes (3 per frame in tests). GL calls/frame −54…58% (1,797→815 reduced; 1,518→635 defaults; 1,730→781 phone preset); render submission CPU slightly lower; SwiftShader full-frame time unchanged within noise. 17 reduced-setting and 2 default-setting captures are byte-identical to `main`. New shader values: add a `FRAME_FIELDS` entry and set it in a `frameValues()` wrapper. Left: samplers are still bound per pass (~90 `uniform1i`/frame could be set once per program); no physical-phone timing. Build ID/CHANGELOG/README/`docs/architecture.md` (describe `Frame`) deferred to the end of Phase 1. |
 | M2 Lighting fixes + `lightStyle` | High | Not started | | |
 | M3 Far-sea roughness | Medium | Not started | | |
 | M4 Reef breaker fix | High | Not started | | |
@@ -44,7 +44,7 @@ Constraints set by the project owner:
 
 **Working rules.** These apply to every milestone:
 - Edit `src/engine.js` and `src/surface.js` only, then rebuild with `python tools/build.py`. Never edit `index.html` by hand.
-- Each new feature gets a registry `flag`/`num` and joins a Prior/New comparison. Follow the `SURFACE_FEATURES` pattern in `src/surface.js`, which covers the list, the `settings()` wrapper, the `Benchmark.prototype.variants` mode and `surfaceReport`.
+- Each new feature gets a registry `flag`/`num` and joins a Prior/New comparison. Follow the `SURFACE_FEATURES` pattern in `src/surface.js`, which covers the list, the `frameValues()` wrapper (since M1, shader values are `FRAME_FIELDS` entries in the shared `Frame` block, not per-pass uniforms), the `Benchmark.prototype.variants` mode and `surfaceReport`.
 - No automatic FPS-based quality changes, matching the existing design rule.
 - Simulated state stays deterministic. Render-only smoothing must never feed simulation, benchmark hashes or `water.time`.
 - Bump the build to `TL-SURFACE-2026MMDD.1` / Surface 10.2 when the work is finished. Update CHANGELOG, README, `docs/architecture.md`, `tests/static_checks.py` and `tests/regression.py` to match.

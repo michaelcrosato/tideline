@@ -19,11 +19,18 @@ Renderer.prototype.attachWetVertices=function(mesh,vertices){
  gl.bufferData(gl.ARRAY_BUFFER,mesh.wetValues,gl.DYNAMIC_DRAW);gl.enableVertexAttribArray(3);
  gl.vertexAttribPointer(3,2,gl.FLOAT,false,8,0);gl.bindVertexArray(null);mesh.bytes+=mesh.wetValues.byteLength;
 };
+// Feature values go in the Frame block; the wet-history map is a per-pass sampler.
+const surfaceFrameValues=Renderer.prototype.frameValues;
+Renderer.prototype.frameValues=function(){
+ surfaceFrameValues.call(this);
+ this.frameSet({uNaturalFoam:+C.naturalFoam,uFoamBreakup:C.foamBreakup,uWaveWetness:+C.waveWetness,uWetGloss:C.wetGloss,uFilteredHighlights:+C.filteredHighlights,uHighlightVariance:C.highlightVariance,uPathWakes:+C.persistentWakes,uPropWash:C.propWashFoam});
+};
+// The wet-history pass switches surfaceWetReady within a frame.
+const surfaceFrameFlags=Renderer.prototype.frameFlags;
+Renderer.prototype.frameFlags=function(){surfaceFrameFlags.call(this);this.frameData[FRAME.offset.uWetReady]=+!!this.surfaceWetReady;};
 const surfaceSettingsBase=Renderer.prototype.settings;
 Renderer.prototype.settings=function(p){
  surfaceSettingsBase.call(this,p);const gl=this.gl;
- const values={uNaturalFoam:+C.naturalFoam,uFoamBreakup:C.foamBreakup,uWaveWetness:+C.waveWetness,uWetReady:+!!this.surfaceWetReady,uWetGloss:C.wetGloss,uFilteredHighlights:+C.filteredHighlights,uHighlightVariance:C.highlightVariance,uPathWakes:+C.persistentWakes,uPropWash:C.propWashFoam};
- for(const [key,value]of Object.entries(values))gl.uniform1f(p.name(key),value);
  const loc=p.name('uWetHistory');if(loc!==null){this.texAt(this.surfaceWetTargets?.[this.surfaceWetRead||0]?.color||this.wetTex,15);gl.uniform1i(loc,15);}
 };
 Renderer.prototype.ensureSurfaceWet=function(){
