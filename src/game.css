@@ -360,3 +360,4 @@ body.lab-open #gallery{width:324px}
 #touchApp .lookResetIcon svg{width:16px;height:16px}
 #touchApp .lookResetIcon small{font-size:9px}
 #touchApp .lookScreenReader{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:-1px;white-space:nowrap}
+#gallery .showcase{border-top:1px solid #6c8c9944;margin:6px 0 4px;padding-top:12px}#gallery .showcase .sceneTabs{margin-top:10px}#gallery .showcase .sceneTabs button.selected{outline:1px solid #bddfe5}
