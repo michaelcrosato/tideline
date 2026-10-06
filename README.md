@@ -2,7 +2,7 @@
 
 A water and light lab in one offline HTML file. Sail, tow a disabled boat, change the light, and compare water-rendering features in repeatable tests.
 
-**Current build:** `TL-SURFACE-20261005.1` · Surface 10.1
+**Current build:** `TL-SURFACE-20261006.1` · Surface 10.2
 
 [Source on GitHub](https://github.com/michaelcrosato/tideline) · [Validation workflow](https://github.com/michaelcrosato/tideline/actions/workflows/ci.yml)
 
@@ -27,16 +27,26 @@ Open **`index.html`** in a browser with WebGL2 and graphics acceleration. No ser
 
 The startup screen checks graphics support before loading the game. Choose **Start in game mode** for fullscreen, or **Start in window**. Fullscreen, orientation locking, and keeping the screen awake depend on browser permission and support. A web page cannot block phone calls, notifications, or all system edge gestures.
 
-The five quick controls are **Time of day, Swell height, Water clarity, Surface foam, and Brightness**. Use **Advanced settings** for the full parameter registry and up to ten pinned controls.
+The six quick controls are **Time of day, Swell height, Water clarity, Surface foam, Brightness, and Light style** (Glow or Natural). Use **Advanced settings** for the full parameter registry and up to ten pinned controls.
 
-## This version
+"## This version
+
+Surface 10.2 (phase 1) fixes the remaining lighting and reef issues and adds cheap visual upgrades:
+
+- **Light style:** Glow keeps the teal crest light; Natural filters the sun through the water, so crests turn gold at dawn and dusk. Shadowed reflections, the doubled sun, the dusk light jump and the water colour are fixed in both.
+- **Water:** the far sea keeps highlight roughness instead of a mirror finish; the reef breaker has no edge step, aliasing or trough ridge; spray glows toward the sun and takes shadow.
+- **Scenery and image:** sky-coloured ambient light, baked ambient occlusion, exact sRGB output, an optional AgX-style tone curve, and a wide, smooth highlight glow.
+- **Motion:** boats bob and rock again, and frames are interpolated between physics steps.
+- **Phones:** a first-run Phone preset, and one shared uniform buffer that halves the GL calls per frame.
+
+Earlier surface features remain:
 
 - **Patch foam:** fresh dense patches age into broken trails. Detail is carried with the stored foam. The previous cellular-edge appearance remains available for comparison.
 - **Wave-height wetness:** scenery shading samples the displaced surface. Nearby surfaces keep two height marks: a fast-draining film and a slower damp mark. Each boat also keeps moisture on its model vertices.
 - **Filtered highlights:** normal variation and unresolved small ripples broaden specular highlights. This is an original variance approximation, not a complete LEAN mapping implementation.
 - **Path wakes:** short stern sources follow both boats. The history preserves the route after a turn. Balanced positive and negative impulses also feed the local ripple field. They do not add transported water volume.
 
-Surface 10.1 is a correctness and cost pass: sluice gates work at the default grid, water no longer climbs walls as a translucent sheet, capsized boats right themselves, reef breakers stop at the breakwater, and several shading and per-frame costs are lower. See [changes](CHANGELOG.md).
+Surface 10.1 was a correctness and cost pass: sluice gates work at the default grid, water no longer climbs walls as a translucent sheet, capsized boats right themselves, reef breakers stop at the breakwater, and several shading and per-frame costs are lower. See [changes](CHANGELOG.md).
 
 The default transport grid, visible mesh, and particle ceiling are unchanged from the previous build. There is no automatic FPS-based quality reduction.
 
@@ -52,7 +62,7 @@ Mobile has a separate interface. The first finger on the open scene steers from 
 
 The default **Surface verification** uses three scenes twice, reversing the order on the second pass. Its 60-second limit reserves 57 seconds for setup, warm-up, and recording, plus three seconds for results. Shorter limits and the previous optical, contact, and towing tests remain available.
 
-**Surface comparison** runs Prior / New / New / Prior. It changes four declared switches: foam, wetness, highlight filtering, and path wakes. It uses this executable for both variants; it is not the old executable. The new wakes can alter body motion, so this is **not an identical-image renderer replay**.
+**Surface comparison** runs Prior / New / New / Prior. It changes four declared switches: foam, wetness, highlight filtering, and path wakes. **Surface 10.2 comparison** does the same for the 10.2 switches (far-sea roughness, spray lighting, sky ambient, baked AO, bloom chain), and **Light style comparison** alternates Glow and Natural. It uses this executable for both variants; it is not the old executable. The new wakes can alter body motion, so this is **not an identical-image renderer replay**.
 
 The report pauses the simulation and renderer. Save the PNG, JSON, or complete ZIP. GPU timings use asynchronous queries when available. Main-thread elapsed time is not CPU utilization. Tracked allocations are not total process RAM or VRAM. Short samples and invalid runs remain marked.
 
