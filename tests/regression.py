@@ -212,8 +212,8 @@ async def main(args):
    return new Promise(done=>{let tries=0;const poll=()=>{r.render(g,0);if(!r.gpuCount&&++tries<100){gl.finish();setTimeout(poll,10);return;}
     const t=r.particleTargets,n=256*t.rows*4,a=new Float32Array(n),b=new Float32Array(n),direct=[0,0,0,0];
     gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,a);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,b);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
-    for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(a[s*4+3]>0){direct[Math.round(b[s*4+3])&3]++;direct[3]++;}}
-    const c=r.gpuCount,ok=ringKept&&issued&&!!c&&c.spray===direct[0]&&c.foam===direct[1]&&c.bubble===direct[2]&&c.total===direct[3]&&direct[3]>0&&g.particleCount()===g.particles.length+direct[3]+pool.pending()&&gl.getError()===0;
+    for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(a[s*4+3]>0)direct[Math.round(b[s*4+3])&3]++;}const total=direct.reduce((x,y)=>x+y,0);
+    const c=r.gpuCount,ok=ringKept&&issued&&!!c&&c.spray===direct[0]&&c.foam===direct[1]&&c.bubble===direct[2]&&c.mist===direct[3]&&c.total===total&&total>0&&g.particleCount()===g.particles.length+total+pool.pending()&&gl.getError()===0;
     done({ok,ringKept,tries,readback:c,direct,window:pool.windowCount(),reported:g.particleCount()});};setTimeout(poll,10);});''')
   # The GPU quads use the point path's size law and sprite shading: one cloud drawn both ways matches.
   await check('GPU particle sprites match the CPU point path', '''const saved={...C},gl=r.gl,pool=r.gpuPool,parts=g.particles.slice(),landings=g.landings.slice();
@@ -227,6 +227,44 @@ async def main(args):
     const signal=sum(cpu,bare),gap=sum(gpu,cpu);
     return {ok:drawn===300&&signal>0&&gap<.08*signal&&gl.getError()===0,drawn,signal,gap,ratio:+(gap/signal).toFixed(4)};
    }finally{g.particles.length=0;g.particles.push(...parts);g.landings=landings;Object.assign(C,saved);D.storm.sync();pool.reset();}''')
+  # Streaks: one fast drop drawn as a GPU quad spans its screen motion over the exposure; still drops
+  # and the switch off stay round, and a CPU contact drop is drawn the same way.
+  await check('Spray streaks follow screen motion; still drops stay round', '''const saved={...C},gl=r.gl,pool=r.gpuPool,parts=g.particles.slice(),landings=g.landings.slice();
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   // Extent of the pixels that changed against a bare frame, and the summed change.
+   const box=(a,b)=>{const [w,h]=r.size;let x0=w,x1=-1,y0=h,y1=-1,sum=0;for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=(y*w+x)*4,d=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);sum+=d;if(d>6){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);}}return {w:x1-x0+1,h:y1-y0+1,sum};};
+   try{Object.assign(C,{renderScale:.8,visualGrid:65,sprayRate:0,underParticles:0,particles:true,gpuParticles:true,softParticles:false,timeLighting:false,sunStrength:1.65,cameraMode:3,orbitAuto:false,orbitHeight:6,orbitRadius:24,bloom:false,lensDrops:false,mist:false,sprayStretch:true,sprayStreak:.04,aa:false});D.storm.sync();r.camera(g,100);
+    if(!r.particleActive())return {ok:false,error:'GPU particles inactive'};
+    // A drop 6 m ahead of the eye, moving 8 m/s across the view.
+    const e=r.eye,tg=r.target,f=[0,1,2].map(i=>tg[i]-e[i]),fl=Math.hypot(...f),fw=f.map(v=>v/fl),sl=Math.hypot(fw[0],fw[2]),sd=[-fw[2]/sl,0,fw[0]/sl],p=[0,1,2].map(i=>e[i]+fw[i]*6),fast={vx:sd[0]*8,vz:sd[2]*8,vy:0,life:5,size:.12,y:p[1]};
+    g.particles.length=0;g.landings.length=0;pool.reset();const bare=grab();
+    g.addParticle(p[0],p[2],fast);const streak=box(grab(),bare);C.sprayStretch=false;const off=box(grab(),bare);C.sprayStretch=true;
+    pool.reset();g.addParticle(p[0],p[2],{y:p[1],life:5,size:.12});const still=box(grab(),bare);
+    pool.reset();const cpu=g.addParticle(p[0],p[2],{...fast,cpu:true});const host=box(grab(),bare),hostDrawn=r.particleHost;
+    // Expected length: the screen distance covered in the exposure (the pixel law of the vertex shader).
+    // The streak's alpha holds sqrt(1+1.71s) times the drop's, s = length/diameter, against 1+1.71s unscaled.
+    // Display-space sums run above the first (the tone curve compresses the drop's bright core more).
+    const h=r.size[1],scale=r.proj[5]*h/2,expect=8*C.sprayStreak*scale/6,diameter=.12*h*1.25/6,gain=Math.sqrt(1+1.707*expect/diameter),ratio=streak.sum/off.sum;
+    const ok=!!cpu&&hostDrawn===1&&Math.abs(off.w-off.h)<=1&&Math.abs(still.w-off.w)<=1&&Math.abs(still.h-off.h)<=1&&Math.abs(streak.w-off.w-expect)<.2*expect+2&&Math.abs(streak.h-off.h)<=2
+     &&Math.abs(host.w-streak.w)<=1&&ratio>gain*.75&&ratio<.8*gain*gain&&gl.getError()===0;
+    return {ok,streak,off,still,host,hostDrawn,expectLength:+expect.toFixed(1),diameter:+diameter.toFixed(1),energyRatio:+ratio.toFixed(2),expectedRatio:+gain.toFixed(2)};
+   }finally{g.particles.length=0;g.particles.push(...parts);g.landings=landings;Object.assign(C,saved);D.storm.sync();pool.reset();}''')
+  # Mist uses its own random stream and no ripples: two runs from one snapshot, mist on and off, end in the same state.
+  await check('Mist rises from breakers and slams, floats clear of the water and never changes the simulation', '''const saved={...C},gl=r.gl,pool=r.gpuPool,b=l.bench;
+   const kinds=()=>{const t=r.particleTargets,n=256*t.rows*4,s0=new Float32Array(n),s1=new Float32Array(n);gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,s0);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,s1);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    const k=[0,0,0,0];let clear=Infinity;for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(s0[s*4+3]<=0)continue;const kind=Math.round(s1[s*4+3])&3;k[kind]++;if(kind===3)clear=Math.min(clear,s0[s*4+1]-Math.max(w.motion(s0[s*4],s0[s*4+2])[1],w.bilerp(w.bed,s0[s*4],s0[s*4+2])));}return {k,clear:+clear.toFixed(3)};};
+   const hash=()=>JSON.stringify([g.boat.x,g.boat.y,g.boat.vy,w.time,w.h.reduce((a,b)=>a+b,0),w.rv.reduce((a,b)=>a+b,0),g.landings.length,g.particles.length]);
+   try{l.resultHeld=false;D.chooseWorld(3);l.resultHeld=true;Object.assign(C,{renderScale:.4,visualGrid:65,underParticles:0,particles:true,gpuParticles:true,sprayRate:6000,waveScale:2.2,rogueEnabled:false,renderInterpolation:false,mistDensity:1});D.storm.sync();r.render(g,0);
+    if(!r.particleActive())return {ok:false,error:'GPU particles inactive'};
+    const snaps=[b.snapshot(),b.snapshot()];
+    const run=(on,snap)=>{b.saved=snap;b.restore();C.mist=on;let breakers=0,slam=0;
+     for(let i=0;i<150;i++){g.step(D.DT);if(i%3===2){D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);}}const mid=kinds();
+     const mb=g.mistBurst;g.mistBurst=function(...a){const n=mb.apply(this,a);slam+=n;return n;};try{g.physics.emit(g.boat.x,w.surface(g.boat.x,g.boat.z),g.boat.z,[0,1,0],5,'entry',g.boat,null);}finally{g.mistBurst=mb;}
+     for(let i=0;i<12;i++){g.step(D.DT);if(i%3===2){D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);}}return {hash:hash(),breakerMist:mid.k[3],slam,...kinds()};};
+    const on=run(true,snaps[0]),off=run(false,snaps[1]);
+    const ok=on.hash===off.hash&&on.breakerMist>0&&on.slam>0&&on.k[3]>0&&off.k[3]===0&&off.slam===0&&on.clear>0&&gl.getError()===0;
+    return {ok,sameState:on.hash===off.hash,on:{breakerMist:on.breakerMist,slam:on.slam,kinds:on.k,clear:on.clear},off:{kinds:off.k},report:r.surfaceReport().gpuParticles};
+   }finally{Object.assign(C,saved);D.storm.sync();pool.reset();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

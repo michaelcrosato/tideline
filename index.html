@@ -746,6 +746,8 @@ num('Boat','harbourLevel','Maximum delivery level (m)',1.15,.2,3,.05);
 flag('Particles and wakes','particles','Simulate and draw particles',true,'Also controls procedural underwater particles.');
 num('Particles and wakes','particleLimit','Maximum dynamic particles',26000,0,100000,100,'A ceiling, not a target. Only active spray and foam consume update work.');
 flag('Particles and wakes','gpuParticles','Simulate spray on the GPU',true,'Spray, foam and bubbles live in float textures and land on the full wave surface. Drops that hit scenery stay on the CPU. Without float render targets the CPU path runs.');
+flag('Particles and wakes','mist','Breaker and slam mist',true,'Large, faint, soft-edged puffs from breaking crests and hard impacts. Needs GPU particles. Visual only: its own random stream, no ripples. Off in the phone preset.');
+num('Particles and wakes','mistDensity','Mist amount',1,0,4,.1,'Scales how many puffs breakers and impacts release.');
 num('Particles and wakes','sprayDensity','Splash particle count multiplier',10,1,40,1,'Changes visible droplet count, not the initial water impulse.');
 num('Particles and wakes','wakeDensity','Wake foam count multiplier',8,1,40,1,'Changes foam particle count, not boat thrust or wave height.');
 num('Particles and wakes','particleSize','Dynamic particle size multiplier',1,.1,4,.05);
@@ -858,6 +860,8 @@ num('Hull interaction','slamDamping','Water-entry damping',.45,0,2,.05);
 flag('Spray optics','softParticles','Soft particle intersections',true);
 num('Spray optics','softDepth','Particle depth fade (m)',.30,.03,1,.01);
 flag('Spray optics','sprayLighting','Sunlit spray',true,'Forward scattering toward the sun, one sun-shadow tap per drop, and air haze. Same draw.');
+flag('Spray optics','sprayStretch','Motion-stretched spray',true,'Drops and bubbles are drawn as streaks along their screen-space motion, with the energy of a round drop spread along the streak. Needs GPU particles. Same draw.');
+num('Spray optics','sprayStreak','Streak exposure (s)',.04,.005,.15,.005,'How far back along its motion each streak reaches. Capped at eight drop widths.');
 flag('Spray optics','bubbles','Impact bubble plumes',true);
 num('Spray optics','bubbleCount','Bubbles per hull impact',180,0,1000,20);
 num('Spray optics','bubbleRise','Bubble rise speed (m/s)',.7,.1,2,.05);
@@ -1038,7 +1042,7 @@ function loadSettings(values){if(!values||typeof values!=='object'||Array.isArra
 let storageAvailable=true,savedSettings=false;try{const v=JSON.parse(localStorage.getItem(SETTINGS_KEY)||'null');if(v?.schema===2){loadSettings(v.settings);savedSettings=true;}}catch(e){storageAvailable=false;}
 /* Phones start from an explicit preset on the first run with no saved settings.
    It is applied once, saved like any other choice, and recorded in reports. Not adaptive. */
-const PHONE_PRESET={maxPixels:900000,maxDPR:1.5,visualGrid:257,ssrScale:.5,reflectionEvery:2,foamResolution:256,particleLimit:8000,bloomLevels:2};
+const PHONE_PRESET={maxPixels:900000,maxDPR:1.5,visualGrid:257,ssrScale:.5,reflectionEvery:2,foamResolution:256,particleLimit:8000,bloomLevels:2,mist:false};
 const PHONE_PRESET_KEY='tideline.touch.phonePreset.v1';
 let phonePresetApplied=false;
 if(MOBILE_BRANCH&&!savedSettings){Object.assign(C,PHONE_PRESET);phonePresetApplied=true;store(SETTINGS_KEY,{schema:2,settings:{...C}});store(PHONE_PRESET_KEY,{schema:1,appliedAt:new Date().toISOString(),build:BUILD,settings:{...PHONE_PRESET}});}
@@ -1839,15 +1843,28 @@ uniform mat4 uVP;uniform float uScale;uniform vec3 uEye;uniform float uUnder;out
 ${particleGLSL}
 void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aPosition.xz);Sea s=sea(aPosition.xz,f.y);pos=vec3(aPosition.x,f.x+.055,aPosition.z)+s.d;}gl_Position=uVP*vec4(pos,1.);gl_PointSize=clamp(abs(aSize)*uScale/max(.15,gl_Position.w),1.,55.);vColor=particleLight(pos,aColor,vKind);}
 `;
-// Round sprite with a highlight and a soft depth fade. Points use gl_PointCoord (y down);
-// GPU particle quads pass the same corner coordinate as vCorner.
-const spriteFS=quad=>`#version 300 es
-precision highp float;precision highp sampler2D;in vec4 vColor;in float vKind;${quad?'in vec2 vCorner;':''}uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
-void main(){vec2 p=${quad?'vCorner':'gl_PointCoord*2.-1.'};float radius=length(p);if(radius>1.)discard;float shell=sqrt(max(0.,1.-radius*radius));vec3 color=vColor.rgb*(.72+.35*shell)+vColor.rgb*.45*pow(max(0.,1.-length(p-vec2(-.22,.24))*1.8),6.);float alpha=vColor.a*(1.-smoothstep(.45,1.,radius));if(uSoftOn>.5){vec2 uv=gl_FragCoord.xy/uPointResolution;float sd=100./(500.1-(texture(uSoftDepth,uv).r*2.-1.)*499.9),pd=100./(500.1-(gl_FragCoord.z*2.-1.)*499.9);alpha*=clamp((sd-pd)/uSoftFade,0.,1.);}outColor=vec4(color,alpha);}`;
-const pointFS=spriteFS(false),particleFS=spriteFS(true);
+// Round sprite with a highlight, and the soft depth fade. q is the offset from the sprite centre in
+// radii, y down (gl_PointCoord's direction). Points and GPU particle quads share both.
+const spriteGLSL=`
+vec4 sprite(vec2 q,vec4 c){float radius=length(q);if(radius>1.)discard;float shell=sqrt(max(0.,1.-radius*radius));return vec4(c.rgb*(.72+.35*shell)+c.rgb*.45*pow(max(0.,1.-length(q-vec2(-.22,.24))*1.8),6.),c.a*(1.-smoothstep(.45,1.,radius)));}
+float softDepth(float fade){vec2 uv=gl_FragCoord.xy/uPointResolution;float sd=100./(500.1-(texture(uSoftDepth,uv).r*2.-1.)*499.9),pd=100./(500.1-(gl_FragCoord.z*2.-1.)*499.9);return clamp((sd-pd)/fade,0.,1.);}
+`;
+const pointFS=`#version 300 es
+precision highp float;precision highp sampler2D;in vec4 vColor;in float vKind;uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
+${spriteGLSL}
+void main(){vec4 c=sprite(gl_PointCoord*2.-1.,vColor);if(uSoftOn>.5)c.a*=softDepth(uSoftFade);outColor=c;}`;
+// GPU particle quads. vShape holds the streak axis (y down), the streak half-length in radii and, for
+// mist, the puff radius in metres. A streak is a capsule: the round sprite around its nearest point on
+// the segment. Mist is a soft Gaussian puff whose depth fade spans its own radius.
+const particleFS=`#version 300 es
+precision highp float;precision highp sampler2D;in vec4 vColor;in vec2 vCorner;flat in vec4 vShape;uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
+${spriteGLSL}
+void main(){vec2 q=vCorner-vShape.xy*clamp(dot(vCorner,vShape.xy),-vShape.z,vShape.z);vec4 c;
+ if(vShape.w>0.){float r2=dot(q,q);if(r2>1.)discard;c=vec4(vColor.rgb,vColor.a*exp(-3.*r2)*(1.-r2));}else c=sprite(q,vColor);
+ if(uSoftOn>.5)c.a*=softDepth(max(uSoftFade,vShape.w));outColor=c;}`;
 /* GPU particles (10.2). Spray, foam and bubbles live in two RGBA32F state maps, PARTICLE_ROW
    slots to a row: (x, y, z, life) and (vx, vy, vz, packed kind | size | max life). Kinds: 0 spray,
-   1 foam (stored at its undisplaced surface point, like the CPU path), 2 bubble. The CPU writes
+   1 foam (stored at its undisplaced surface point, like the CPU path), 2 bubble, 3 mist. The CPU writes
    spawn rows; one pass a frame moves every slot, and a second lifts, lights and sizes each live
    particle once, so the four corners of its quad only read the result. */
 const PARTICLE_ROW=256;
@@ -1875,7 +1892,7 @@ void main(){ivec2 c=ivec2(gl_FragCoord.xy);int slot=c.y*${PARTICLE_ROW}+c.x,k=(s
  uint m=uint(s1.w+.5),kind=m&3u;float size=float((m>>2)&2047u)*.001,maxLife=float(m>>13)/64.,life=s0.w-dt;vec3 p=s0.xyz,v=s1.xyz;
  // Spawn heights come from the CPU surface (fastSurface: 6 Gerstner modes, no horizontal
  // displacement). Seat new drops above, and new bubbles below, the full surface they collide with.
- if(k<uSpawnCount&&kind!=1u){float h=surfaceAt(undisplace(p.xz));p.y=kind==0u?max(p.y,h+.04):min(p.y,h-.14);}
+ if(k<uSpawnCount&&kind!=1u){float h=surfaceAt(undisplace(p.xz));p.y=kind==2u?min(p.y,h-.14):max(p.y,h+.04);}
  if(kind==0u){
   // Spray: exact relaxation toward the wind (rate .8/s) and exact gravity over the step.
   float e=exp(-.8*dt);vec2 rel=v.xz-uWind;p.xz+=uWind*dt+rel*(1.-e)/.8;v.xz=uWind+rel*e;p.y+=v.y*dt-.5*uGravity*dt*dt;v.y-=uGravity*dt;
@@ -1886,50 +1903,76 @@ void main(){ivec2 c=ivec2(gl_FragCoord.xy);int slot=c.y*${PARTICLE_ROW}+c.x,k=(s
   else if(maxLife-life>.12&&fluid(p.xz).y>.035){vec2 q=undisplace(p.xz);if(p.y<surfaceAt(q)){uint seed=uint(slot)*2654435761u^m;kind=1u;life=uFoamLife*(.5+.5*rand1(seed));maxLife=life;v.xz*=.2;size=.065+.095*rand1(seed+1u);p.xz=q;}}
  }else if(kind==1u){
   vec4 f=fluid(p.xz);float e=exp(-1.1*dt);vec2 rel=v.xz-f.zw;p.xz+=f.zw*dt+rel*(1.-e)/1.1;v.xz=f.zw+rel*e;if(f.y<.025)life-=dt*5.;
- }else{
+ }else if(kind==2u){
   vec4 f=fluid(p.xz);float e=exp(-1.5*dt),ey=exp(-dt);vec2 rel=v.xz-f.zw;p.xz+=f.zw*dt+rel*(1.-e)/1.5;v.xz=f.zw+rel*e;
   p.y+=uBubbleRise*dt+(v.y-uBubbleRise)*(1.-ey);v.y=uBubbleRise+(v.y-uBubbleRise)*ey;
   vec2 q=undisplace(p.xz);if(p.y>surfaceAt(q)){kind=1u;life=.6;maxLife=.6;size*=1.5;p.xz=q;}
+ }else{
+  // Mist: fine droplets take the wind quickly (2/s), lose their launch speed (1.5/s) and settle at
+  // 0.12 m/s. A puff hangs 0.2 m clear of the water (sampled under its centre) and the bed, and never lands.
+  float e=exp(-2.*dt),ey=exp(-1.5*dt);vec2 rel=v.xz-uWind;p.xz+=uWind*dt+rel*(1.-e)*.5;v.xz=uWind+rel*e;
+  p.y+=-.12*dt+(v.y+.12)*(1.-ey)/1.5;v.y=-.12+(v.y+.12)*ey;
+  float low=max(surfaceAt(p.xz),bedAt(p.xz))+.2;if(p.y<low){p.y=low;v.y=max(v.y,0.);}
  }
  if(any(greaterThan(abs(p.xz),vec2(180.))))life=0.;
  outState0=vec4(p,life);outState1=vec4(v,float(kind|uint(clamp(round(size*1000.),0.,2047.))<<2u|uint(clamp(round(maxLife*64.),0.,2047.))<<13u));
 }`;
-// Lift, light and size each live particle once. Rows past the state hold the underwater motes.
+// Lift, light and size each live particle once. Rows [0, uRows) mirror the state ring; the next uHostRows
+// hold the CPU particles (contact drops), two texels each in uHost; the rest are the underwater motes.
+// Outputs: position and signed size (negative for foam), lit colour, and velocity with the kind (4: mote).
 const particlePrepFS=`#version 300 es
 ${sharedGLSL}
 ${particleMapGLSL}
-uniform vec3 uEye;uniform float uUnder;uniform int uRows,uMotes;uniform float uParticleSize,uUnderAlpha,uUnderSize;
-layout(location=0)out vec4 outPosition;layout(location=1)out vec4 outColor;
+uniform highp sampler2D uHost;uniform vec3 uEye;uniform float uUnder;uniform int uRows,uHostRows,uHostCount,uMotes;uniform float uParticleSize,uUnderAlpha,uUnderSize;
+layout(location=0)out vec4 outPosition;layout(location=1)out vec4 outColor;layout(location=2)out vec4 outMotion;
 ${particleGLSL}
-void main(){ivec2 c=ivec2(gl_FragCoord.xy);outPosition=vec4(0.);outColor=vec4(0.);
- if(c.y<uRows){vec4 s0=texelFetch(uState0,c,0);if(s0.w<=0.)return;
-  uint m=uint(texelFetch(uState1,c,0).w+.5),kind=m&3u;float foam=kind==1u?1.:0.,size=float((m>>2)&2047u)*.001*uParticleSize,alpha=clamp(s0.w/max(float(m>>13)/64.,.001),0.,1.)*(foam>.5?.42:.65);
-  vec3 pos=s0.xyz;if(foam>.5){vec4 f=fluid(pos.xz);Sea s=sea(pos.xz,f.y);pos=vec3(pos.x,f.x+.055,pos.z)+s.d;size=-size;}
-  outColor=particleLight(pos,kind==2u?vec4(.25,.62,.73,alpha):vec4(.72,.88,.95,alpha),foam);outPosition=vec4(pos,size);return;}
+void main(){ivec2 c=ivec2(gl_FragCoord.xy);outPosition=vec4(0.);outColor=vec4(0.);outMotion=vec4(0.);
+ if(c.y<uRows+uHostRows){vec4 s0,s1;
+  if(c.y<uRows){s0=texelFetch(uState0,c,0);s1=texelFetch(uState1,c,0);}
+  else{if((c.y-uRows)*${PARTICLE_ROW}+c.x>=uHostCount)return;ivec2 h=ivec2(c.x*2,c.y-uRows);s0=texelFetch(uHost,h,0);s1=texelFetch(uHost,h+ivec2(1,0),0);}
+  if(s0.w<=0.)return;
+  uint m=uint(s1.w+.5),kind=m&3u;float maxLife=max(float(m>>13)/64.,.001),foam=kind==1u?1.:0.,size=float((m>>2)&2047u)*.001*uParticleSize,alpha=clamp(s0.w/maxLife,0.,1.)*(foam>.5?.42:.65);
+  vec3 pos=s0.xyz;vec4 color=kind==2u?vec4(.25,.62,.73,alpha):vec4(.72,.88,.95,alpha);
+  if(foam>.5){vec4 f=fluid(pos.xz);Sea s=sea(pos.xz,f.y);pos=vec3(pos.x,f.x+.055,pos.z)+s.d;size=-size;}
+  else if(kind==3u){
+   // Mist grows as it spreads (45%/s of its launch size), fades in over the first 15% of its life and
+   // out over the rest. The billboard moves half its size toward the eye, so it does not cut into the
+   // water or scenery right behind its centre.
+   float age=maxLife-s0.w,t=clamp(age/maxLife,0.,1.);size*=1.+.45*age;color=vec4(.86,.9,.93,.16*smoothstep(0.,.15,t)*(1.-t));
+   vec3 e=uEye-pos;float d=length(e);pos+=e/max(d,.001)*min(.5*size,max(0.,d-.3));}
+  outColor=particleLight(pos,color,foam);outPosition=vec4(pos,size);outMotion=vec4(s1.xyz,float(kind));return;}
  // Suspended motes around the camera, the CPU path's pattern with hashed phases.
- int i=(c.y-uRows)*${PARTICLE_ROW}+c.x;if(i>=uMotes)return;uint n=uint(i)*3u;
+ int i=(c.y-uRows-uHostRows)*${PARTICLE_ROW}+c.x;if(i>=uMotes)return;uint n=uint(i)*3u;
  vec3 pos=vec3(uEye.x+sin(6.2831853*rand1(n))*13.,uLevel-3.7+sin(6.2831853*rand1(n+2u)+uTime*.06)*4.8,uEye.z+sin(6.2831853*rand1(n+1u))*13.);
  if(pos.y>uLevel+.2||pos.y<bedAt(pos.xz))return;
- outColor=particleLight(pos,vec4(.40,.71,.82,uUnderAlpha),0.);outPosition=vec4(pos,uUnderSize);
+ outColor=particleLight(pos,vec4(.40,.71,.82,uUnderAlpha),0.);outPosition=vec4(pos,uUnderSize);outMotion=vec4(0.,0.,0.,4.);
 }`;
-// Live particles by kind in each state row, inside the ring window. For reports only.
+// Live particles by kind (spray, foam, bubble, mist) in each state row, inside the ring window. For reports only.
 const particleCountFS=`#version 300 es
 precision highp float;precision highp int;precision highp sampler2D;
 uniform highp sampler2D uState0,uState1;uniform int uFirst,uCount,uCap;out vec4 outCount;
 void main(){int y=int(gl_FragCoord.y);vec4 n=vec4(0.);
- for(int x=0;x<${PARTICLE_ROW};x++){int slot=y*${PARTICLE_ROW}+x;if(slot>=uCap||(slot-uFirst+uCap)%uCap>=uCount||texelFetch(uState0,ivec2(x,y),0).w<=0.)continue;n[int(uint(texelFetch(uState1,ivec2(x,y),0).w+.5)&3u)]+=1.;n.w+=1.;}
+ for(int x=0;x<${PARTICLE_ROW};x++){int slot=y*${PARTICLE_ROW}+x;if(slot>=uCap||(slot-uFirst+uCap)%uCap>=uCount||texelFetch(uState0,ivec2(x,y),0).w<=0.)continue;n[int(uint(texelFetch(uState1,ivec2(x,y),0).w+.5)&3u)]+=1.;}
  outCount=n;}`;
 // Quads, six vertices each from gl_VertexID (no buffers, no instancing: small instances are slow on some
-// drivers). Quads [0,uCount) are the live ring window from uFirst, the rest are motes.
+// drivers). Quads [0,uCount) are the live ring window from uFirst, the next uHost the CPU particles, the rest motes.
 const particleVS=`#version 300 es
 precision highp float;precision highp int;precision highp sampler2D;
-uniform highp sampler2D uPrep0;uniform sampler2D uPrep1;uniform mat4 uVP;uniform float uScale;uniform vec2 uPointResolution;uniform int uFirst,uCount,uCap,uRows;
-out vec4 vColor;out float vKind;out vec2 vCorner;
-void main(){int i=gl_VertexID/6,v=gl_VertexID%6,slot=(uFirst+i)%uCap;ivec2 c=i<uCount?ivec2(slot%${PARTICLE_ROW},slot/${PARTICLE_ROW}):ivec2((i-uCount)%${PARTICLE_ROW},uRows+(i-uCount)/${PARTICLE_ROW});
- vec4 p=texelFetch(uPrep0,c,0);vColor=texelFetch(uPrep1,c,0);vKind=step(p.w,0.);vCorner=vec2(0.);if(p.w==0.){gl_Position=vec4(2.,2.,2.,1.);return;}
- // The point path's size law: diameter in pixels, clamped to 1-55.
- vec4 clip=uVP*vec4(p.xyz,1.);float px=clamp(abs(p.w)*uScale/max(.15,clip.w),1.,55.);int q=v<3?v:v==3?2:v==4?1:3;vec2 corner=vec2(float(q&1),float(q>>1))*2.-1.;
- clip.xy+=corner*px/uPointResolution*clip.w;gl_Position=clip;vCorner=vec2(corner.x,-corner.y);}`;
+uniform highp sampler2D uPrep0;uniform sampler2D uPrep1,uPrep2;uniform mat4 uVP;uniform float uScale,uStreak,uMistPixels;uniform vec2 uPointResolution;uniform int uFirst,uCount,uCap,uRows,uHost,uHostRows;
+out vec4 vColor;out vec2 vCorner;flat out vec4 vShape;
+void main(){int i=gl_VertexID/6,v=gl_VertexID%6,j=i-uCount-uHost;ivec2 c;
+ if(i<uCount){int slot=(uFirst+i)%uCap;c=ivec2(slot%${PARTICLE_ROW},slot/${PARTICLE_ROW});}else if(j<0){j+=uHost;c=ivec2(j%${PARTICLE_ROW},uRows+j/${PARTICLE_ROW});}else c=ivec2(j%${PARTICLE_ROW},uRows+uHostRows+j/${PARTICLE_ROW});
+ vec4 p=texelFetch(uPrep0,c,0),m=texelFetch(uPrep2,c,0);vColor=texelFetch(uPrep1,c,0);vCorner=vec2(0.);vShape=vec4(1.,0.,0.,0.);if(p.w==0.){gl_Position=vec4(2.,2.,2.,1.);return;}
+ // The point path's size law: diameter in pixels, clamped to 1-55 (mist to uMistPixels).
+ bool mist=m.w==3.;vec4 clip=uVP*vec4(p.xyz,1.);float px=clamp(abs(p.w)*uScale/max(.15,clip.w),1.,mist?uMistPixels:55.),s=0.;vec2 axis=vec2(1.,0.);
+ // Spray and bubbles streak along their screen motion: the quad covers the drop and the point it held
+ // uStreak seconds earlier, at most eight widths back. The sprite's alpha integrates to 1.70 r^2 over the
+ // drop and 1.45 r per unit length along a streak, so a streak of half-length s radii holds 1+1.71s times
+ // the drop's. Alpha divides by the square root of that: between exact energy and a visible streak.
+ if(uStreak>0.&&(m.w==0.||m.w==2.)&&clip.w>.15){vec4 tail=uVP*vec4(p.xyz-m.xyz*uStreak,1.);if(tail.w>.15){vec2 d=(clip.xy/clip.w-tail.xy/tail.w)*.5*uPointResolution;float L=min(length(d),8.*px);if(L>.25){axis=normalize(d);s=L/px;vColor.a*=inversesqrt(1.+1.707*s);}}}
+ // The quad's centre sits half the streak behind the drop; vCorner is relative to it, in radii, y down.
+ int q=v<3?v:v==3?2:v==4?1:3;vec2 corner=vec2(float(q&1),float(q>>1))*2.-1.,local=axis*corner.x*(1.+s)+vec2(-axis.y,axis.x)*corner.y;
+ clip.xy+=(local-axis*s)*px/uPointResolution*clip.w;gl_Position=clip;vCorner=vec2(local.x,-local.y);vShape=vec4(axis.x,-axis.y,s,mist?.5*abs(p.w):0.);}`;
 // Kind (2 bits), size in mm (11 bits) and max life in 1/64 s (11 bits): an integer below 2^24, exact in a float.
 const packParticle=(kind,size,maxLife)=>kind+4*Math.min(2047,Math.max(0,Math.round(size*1000)))+8192*Math.min(2047,Math.max(0,Math.round(maxLife*64)));
 /* CPU side of the GPU particles: spawn rows and ring bookkeeping only, no GL calls. Slots are
@@ -2380,36 +2423,38 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   profiler?.beginPass('bloom');let bloomTex=this.bloom.color,bloomScale=0;if(C.bloom){if(C.bloomChain){bloomTex=this.bloomChain();bloomScale=1/this.bloomLevels.length;}else{const p=this.bloomProgram;gl.bindFramebuffer(gl.FRAMEBUFFER,this.bloom.fbo);gl.viewport(0,0,this.bloom.w,this.bloom.h);gl.useProgram(p.p);this.texAt(this.final.color,2);gl.uniform1i(p.name('uColor'),2);gl.uniform2f(p.name('uTexel'),1/this.size[0],1/this.size[1]);this.full(p);}}profiler?.endPass();
   profiler?.beginPass('post');gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,...this.size);const p=this.postProgram;this.common(p,this.vp,this.eye,game);this.texAt(this.final.color,2);this.texAt(this.final.depth,3);this.texAt(bloomTex,4);gl.uniform1f(p.name('uBloomChainScale'),bloomScale);gl.uniform1i(p.name('uColor'),2);gl.uniform1i(p.name('uDepth'),3);gl.uniform1i(p.name('uBloom'),4);this.texAt(this.volumeTarget?.color||this.bloom.color,14);gl.uniform1i(p.name('uLightVolume'),14);gl.uniform1f(p.name('uVolumeOn'),+this.volumeReady);gl.uniform2f(p.name('uVolumeSize'),this.volumeTarget?.w||2,this.volumeTarget?.h||2);gl.uniformMatrix4fv(p.name('uInverseVP'),false,this.invVP);gl.uniform2fv(p.name('uResolution'),this.size);gl.uniform1f(p.name('uAA'),+C.aa);gl.uniform1f(p.name('uAAStrength'),C.aaStrength);gl.uniform1f(p.name('uExposure'),C.exposure);gl.uniform1f(p.name('uBloomStrength'),C.bloom?C.bloomStrength:0);this.lensWet*=Math.exp(-Math.min(dt,.1)*.4);gl.uniform1f(p.name('uLens'),C.lensDrops?this.lensWet:0);gl.uniform1f(p.name('uRays'),+C.lightShafts);gl.uniform1f(p.name('uRayStrength'),C.rayStrength);gl.uniform1i(p.name('uRaySteps'),C.raySteps);this.full(p);profiler?.endPass();gl.depthMask(true);gl.enable(gl.DEPTH_TEST);gl.bindVertexArray(null);
  }
- drawParticles(game){const gl=this.gl,p=this.pointProgram,a=this.pdata;let k=0;
+ // With GPU particles every sprite, CPU contact drops included, is a GPU quad; otherwise the 10.1 points.
+ drawParticles(game){if(this.particleActive()){this.drawParticleSprites();return;}const gl=this.gl,p=this.pointProgram,a=this.pdata;let k=0;
   for(const pt of game.particles){if(k+8>a.length)break;const alpha=clamp(pt.life/pt.maxLife,0,1);a[k++]=pt.x;a[k++]=pt.y;a[k++]=pt.z;a[k++]=pt.bubble?.25:.72;a[k++]=pt.bubble?.62:.88;a[k++]=pt.bubble?.73:.95;a[k++]=alpha*(pt.foam?.42:.65);a[k++]=pt.size*C.particleSize*(pt.foam?-1:1);}
-  if(this.underwater&&!this.particleActive()){for(let i=0;i<C.underParticles&&k+8<a.length;i++){const x=this.eye[0]+Math.sin(i*73.31)*13,z=this.eye[2]+Math.sin(i*39.77)*13,y=this.water.level-3.7+Math.sin(i*17.4+this.water.time*.06)*4.8;const bed=this.water.bilerp(this.water.bed,x,z);if(y>this.water.level+.2||y<bed)continue;a[k++]=x;a[k++]=y;a[k++]=z;a[k++]=.40;a[k++]=.71;a[k++]=.82;a[k++]=C.underAlpha;a[k++]=C.underSize;}}
+  if(this.underwater){for(let i=0;i<C.underParticles&&k+8<a.length;i++){const x=this.eye[0]+Math.sin(i*73.31)*13,z=this.eye[2]+Math.sin(i*39.77)*13,y=this.water.level-3.7+Math.sin(i*17.4+this.water.time*.06)*4.8;const bed=this.water.bilerp(this.water.bed,x,z);if(y>this.water.level+.2||y<bed)continue;a[k++]=x;a[k++]=y;a[k++]=z;a[k++]=.40;a[k++]=.71;a[k++]=.82;a[k++]=C.underAlpha;a[k++]=C.underSize;}}
   if(k){this.common(p,this.vp,this.eye,game);this.texAt(this.scene.depth,3);gl.uniform1i(p.name('uSoftDepth'),3);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.bindVertexArray(this.pvao);gl.bindBuffer(gl.ARRAY_BUFFER,this.pbuffer);gl.bufferSubData(gl.ARRAY_BUFFER,0,a.subarray(0,k));gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);gl.drawArrays(gl.POINTS,0,k/8);profiler?.draw(0,k/8);gl.depthMask(true);gl.disable(gl.BLEND);}
-  this.drawParticleSprites();
  }
  // GPU particles: programs, maps and the per-frame passes. Without float colour targets the CPU path runs.
- initParticles(){const gl=this.gl;this.gpuPool=new ParticlePool();this.gpuCount=null;this.countSync=null;this.particleTargets=null;this.particleTime=0;this.particleGeneration=-1;this.particleDraw=0;this.particleMotes=0;this.particleUploads=0;this.bedWorld=-1;
+ initParticles(){const gl=this.gl;this.gpuPool=new ParticlePool();this.gpuCount=null;this.countSync=null;this.particleTargets=null;this.particleTime=0;this.particleGeneration=-1;this.particleDraw=0;this.particleHost=0;this.particleMotes=0;this.particleUploads=0;this.bedWorld=-1;
   this.particleGPU=this.hdr;this.particleFallback=this.hdr?null:'No float colour targets (EXT_color_buffer_float).';if(!this.particleGPU)return;
   this.particleSimProgram=this.program(fullVS,particleSimFS);this.particlePrepProgram=this.program(fullVS,particlePrepFS);this.particleDrawProgram=this.program(particleVS,particleFS);this.particleCountProgram=this.program(fullVS,particleCountFS);
   this.bedTex=this.texture(gl.R32F,N,N,gl.RED,gl.FLOAT,gl.NEAREST);}
  particleActive(){return !!(this.particleGPU&&C.gpuParticles&&C.particles&&C.particleLimit>=1);}
- freeParticleMaps(){const t=this.particleTargets;if(!t)return;const gl=this.gl;for(const m of [...t.state,t.prep]){gl.deleteFramebuffer(m.fbo);for(const c of m.colors)gl.deleteTexture(c);}gl.deleteTexture(t.spawn);gl.deleteFramebuffer(t.count.fbo);gl.deleteTexture(t.count.color);gl.deleteBuffer(t.count.buffer);if(this.countSync){gl.deleteSync(this.countSync);this.countSync=null;}this.gpuCount=null;this.particleTargets=null;}
+ freeParticleMaps(){const t=this.particleTargets;if(!t)return;const gl=this.gl;for(const m of [...t.state,t.prep]){gl.deleteFramebuffer(m.fbo);for(const c of m.colors)gl.deleteTexture(c);}gl.deleteTexture(t.spawn);gl.deleteTexture(t.host);gl.deleteFramebuffer(t.count.fbo);gl.deleteTexture(t.count.color);gl.deleteBuffer(t.count.buffer);if(this.countSync){gl.deleteSync(this.countSync);this.countSync=null;}this.gpuCount=null;this.particleTargets=null;}
  // State ping-pong (2 x RGBA32F), spawn rows and the count target follow particleLimit; changing it
- // clears the ring. The preparation target (RGBA32F position + RGBA16F colour) also holds the mote
- // rows, so a new mote count only replaces it: it is rebuilt every frame and holds no state.
- particleMaps(){const W=PARTICLE_ROW,cap=Math.max(1,Math.round(C.particleLimit)),rows=Math.ceil(cap/W),motes=Math.ceil(Math.max(0,Math.round(C.underParticles))/W),gl=this.gl,f32=[gl.RGBA32F,gl.FLOAT];let t=this.particleTargets;
-  if(t?.cap===cap&&t.motes===motes)return t;
+ // clears the ring. The preparation target (RGBA32F position, RGBA16F colour and motion) also holds the
+ // CPU-particle and mote rows, so new counts only replace it (and the CPU-particle texture, which grows
+ // in powers of two): both are rebuilt every frame and hold no state.
+ particleMaps(host=0){const W=PARTICLE_ROW,cap=Math.max(1,Math.round(C.particleLimit)),rows=Math.ceil(cap/W),motes=Math.ceil(Math.max(0,Math.round(C.underParticles))/W),need=Math.min(rows,Math.ceil(host/W)),gl=this.gl,f32=[gl.RGBA32F,gl.FLOAT],f16=[gl.RGBA16F,gl.HALF_FLOAT];let t=this.particleTargets;
+  if(t?.cap===cap&&t.motes===motes&&t.hostRows>=need)return t;
   const mrt=(formats,h)=>{const fbo=gl.createFramebuffer(),colors=formats.map(([internal,type])=>this.texture(internal,W,h,gl.RGBA,type,gl.NEAREST));gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
    colors.forEach((c,i)=>gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,c,0));gl.drawBuffers(colors.map((_,i)=>gl.COLOR_ATTACHMENT0+i));return {fbo,colors,h,ok:gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE};};
   const fresh=t?.cap!==cap;
-  if(fresh){this.freeParticleMaps();t={cap,rows,state:[mrt([f32,f32],rows),mrt([f32,f32],rows)],spawn:this.texture(gl.RGBA32F,W*3,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),read:0};
+  if(fresh){this.freeParticleMaps();t={cap,rows,state:[mrt([f32,f32],rows),mrt([f32,f32],rows)],spawn:this.texture(gl.RGBA32F,W*3,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),read:0,hostRows:0};
    const color=this.texture(gl.RGBA32F,1,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),fbo=gl.createFramebuffer(),buffer=gl.createBuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,buffer);gl.bufferData(gl.PIXEL_PACK_BUFFER,rows*16,gl.STREAM_READ);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);t.count={color,fbo,buffer,data:new Float32Array(rows*4),ok:gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE};this.particleTargets=t;}
   else{gl.deleteFramebuffer(t.prep.fbo);for(const c of t.prep.colors)gl.deleteTexture(c);}
-  t.motes=motes;t.prep=mrt([f32,[gl.RGBA16F,gl.HALF_FLOAT]],rows+motes);t.bytes=W*rows*(4*16+16*3)+W*(rows+motes)*24+rows*32;gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  if(fresh||need>t.hostRows){let h=Math.max(1,t.hostRows);while(h<need)h*=2;h=Math.min(h,rows);if(t.host)gl.deleteTexture(t.host);t.hostRows=h;t.host=this.texture(gl.RGBA32F,W*2,h,gl.RGBA,gl.FLOAT,gl.NEAREST);t.hostData=new Float32Array(W*h*8);}
+  t.motes=motes;t.prep=mrt([f32,f16,f16],rows+t.hostRows+motes);t.bytes=W*rows*(4*16+16*3)+W*t.hostRows*32+W*(rows+t.hostRows+motes)*32+rows*32;gl.bindFramebuffer(gl.FRAMEBUFFER,null);
   if(![...t.state,t.prep,t.count].every(m=>m.ok)){this.freeParticleMaps();this.particleGPU=false;this.particleFallback='Float particle targets are incomplete on this device.';this.gpuPool.reset();return null;}
   if(fresh){this.gpuPool.resize(cap);this.gpuPool.reset();}return t;}
  // One update pass (new spawns, motion, landing) and one preparation pass a frame, before the scene.
- updateParticleState(game){const pool=this.gpuPool;this.particleDraw=this.particleMotes=0;if(!pool)return;
-  if(!this.particleActive()){if(pool.head)pool.reset();return;}const t=this.particleMaps();if(!t)return;
+ updateParticleState(game){const pool=this.gpuPool;this.particleDraw=this.particleHost=this.particleMotes=0;if(!pool)return;
+  if(!this.particleActive()){if(pool.head)pool.reset();return;}const list=game.particles,t=this.particleMaps(list.length);if(!t)return;
   const gl=this.gl,W=PARTICLE_ROW,T=this.renderTime??this.water.time;
   if(this.bedWorld!==this.water.worldId){this.texAt(this.bedTex,19);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.FLOAT,this.water.bed);this.bedWorld=this.water.worldId;}
   // A reset, a restored snapshot or time running backwards clears the maps. Interpolation starting
@@ -2428,19 +2473,23 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uSpawnFirst'),pool.sent%t.cap);gl.uniform1i(p.name('uSpawnCount'),n);gl.uniform1f(p.name('uStep'),dt);gl.uniform1f(p.name('uFoamLife'),C.foamLife);gl.uniform1f(p.name('uGravity'),C.sprayGravity);gl.uniform1f(p.name('uBubbleRise'),C.bubbleRise);gl.uniform2f(p.name('uWind'),storm.table[0]*C.sprayWind,storm.table[1]*C.sprayWind);
    this.particlePass(p,this.particleRows(t,pool.tail,due));t.read=1-t.read;pool.sent=due;}
   this.particleTime=Math.max(this.particleTime,T);pool.advance(this.particleTime);
-  const count=pool.windowCount(),motes=this.underwater?Math.min(Math.max(0,Math.round(C.underParticles)),t.motes*W):0;
-  if(count+motes>0){const p=this.particlePrepProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
-   this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19]]);gl.uniform3fv(p.name('uEye'),this.eye);gl.uniform1f(p.name('uUnder'),this.underwater&&!this.capturingAir?1:0);
-   gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uMotes'),motes);gl.uniform1f(p.name('uParticleSize'),C.particleSize);gl.uniform1f(p.name('uUnderAlpha'),C.underAlpha);gl.uniform1f(p.name('uUnderSize'),C.underSize);this.particlePass(p,[...this.particleRows(t,pool.tail,pool.sent),...(motes?[[t.rows,t.rows+Math.ceil(motes/W)-1]]:[])]);}
-  this.particleDraw=count;this.particleMotes=motes;this.countParticles(t);gl.enable(gl.DEPTH_TEST);
+  // CPU particles (contact drops) are drawn with the GPU ones: two texels each, written every frame.
+  const count=pool.windowCount(),host=Math.min(list.length,t.hostRows*W),motes=this.underwater?Math.min(Math.max(0,Math.round(C.underParticles)),t.motes*W):0;
+  if(host){const a=t.hostData;for(let i=0;i<host;i++){const q=list[i],o=i*8;a[o]=q.x;a[o+1]=q.y;a[o+2]=q.z;a[o+3]=q.life;a[o+4]=q.vx;a[o+5]=q.vy;a[o+6]=q.vz;a[o+7]=packParticle(q.foam?1:q.bubble?2:0,q.size,q.maxLife);}
+   this.texAt(t.host,20);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,W*2,Math.ceil(host/W),gl.RGBA,gl.FLOAT,a);}
+  if(count+host+motes>0){const p=this.particlePrepProgram,src=t.state[t.read],base=t.rows+t.hostRows;gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+   this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19],['uHost',t.host,20]]);gl.uniform3fv(p.name('uEye'),this.eye);gl.uniform1f(p.name('uUnder'),this.underwater&&!this.capturingAir?1:0);
+   gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uHostRows'),t.hostRows);gl.uniform1i(p.name('uHostCount'),host);gl.uniform1i(p.name('uMotes'),motes);gl.uniform1f(p.name('uParticleSize'),C.particleSize);gl.uniform1f(p.name('uUnderAlpha'),C.underAlpha);gl.uniform1f(p.name('uUnderSize'),C.underSize);
+   this.particlePass(p,[...this.particleRows(t,pool.tail,pool.sent),...(host?[[t.rows,t.rows+Math.ceil(host/W)-1]]:[]),...(motes?[[base,base+Math.ceil(motes/W)-1]]:[])]);}
+  this.particleDraw=count;this.particleHost=host;this.particleMotes=motes;this.countParticles(t);gl.enable(gl.DEPTH_TEST);
  }
  // Live particles by kind, for reports only: the row reduction is read back through a fenced pixel
  // buffer at most twice a second and collected once the GPU has finished, so nothing waits on it.
  countParticles(t){const gl=this.gl,pool=this.gpuPool;
   if(this.countSync&&gl.getSyncParameter(this.countSync,gl.SYNC_STATUS)===gl.SIGNALED){gl.deleteSync(this.countSync);this.countSync=null;const a=t.count.data,k=[0,0,0,0];gl.bindBuffer(gl.PIXEL_PACK_BUFFER,t.count.buffer);gl.getBufferSubData(gl.PIXEL_PACK_BUFFER,0,a);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);for(let i=0;i<a.length;i++)k[i%4]+=a[i];
-   if(this.countGeneration===pool.generation)this.gpuCount={spray:k[0],foam:k[1],bubble:k[2],total:k[3],generation:pool.generation};}
+   if(this.countGeneration===pool.generation)this.gpuCount={spray:k[0],foam:k[1],bubble:k[2],mist:k[3],total:k[0]+k[1]+k[2]+k[3],generation:pool.generation};}
   const now=performance.now();if(this.countSync||now-(this.countAt??-1e9)<500)return;this.countAt=now;this.countGeneration=pool.generation;
-  if(!pool.windowCount()){this.gpuCount={spray:0,foam:0,bubble:0,total:0,generation:pool.generation};return;}
+  if(!pool.windowCount()){this.gpuCount={spray:0,foam:0,bubble:0,mist:0,total:0,generation:pool.generation};return;}
   const p=this.particleCountProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.count.fbo);gl.viewport(0,0,1,t.rows);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
   this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17]]);
   gl.uniform1i(p.name('uFirst'),pool.tail%t.cap);gl.uniform1i(p.name('uCount'),pool.windowCount());gl.uniform1i(p.name('uCap'),t.cap);this.full(p);
@@ -2454,8 +2503,10 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  // Rows holding ring positions [from, to): one range, two when the interval wraps, all rows when full.
  particleRows(t,from,to){const W=PARTICLE_ROW;if(to<=from)return [];if(to-from>=t.cap)return [[0,t.rows-1]];const a=from%t.cap,b=(to-1)%t.cap,r0=Math.floor(a/W),r1=Math.floor(b/W);return a<=b?[[r0,r1]]:[[r0,t.rows-1],[0,r1]];}
  particlePass(p,ranges){const gl=this.gl;for(const [r0,r1] of ranges){gl.viewport(0,r0,PARTICLE_ROW,r1-r0+1);this.full(p);}}
- drawParticleSprites(){const n=this.particleDraw+this.particleMotes,t=this.particleTargets;if(!n||!t)return;const gl=this.gl,p=this.particleDrawProgram;this.particleUse(p,[['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uSoftDepth',this.scene.depth,3]]);
-  gl.uniformMatrix4fv(p.name('uVP'),false,this.vp);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1i(p.name('uFirst'),this.gpuPool.tail%t.cap);gl.uniform1i(p.name('uCount'),this.particleDraw);gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uRows'),t.rows);
+ drawParticleSprites(){const n=this.particleDraw+this.particleHost+this.particleMotes,t=this.particleTargets;if(!n||!t)return;const gl=this.gl,p=this.particleDrawProgram;this.particleUse(p,[['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uPrep2',t.prep.colors[2],18],['uSoftDepth',this.scene.depth,3]]);
+  gl.uniformMatrix4fv(p.name('uVP'),false,this.vp);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1i(p.name('uFirst'),this.gpuPool.tail%t.cap);gl.uniform1i(p.name('uCount'),this.particleDraw);gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uHost'),this.particleHost);gl.uniform1i(p.name('uHostRows'),t.hostRows);
+  // Streak exposure, and the largest mist puff on screen (a quarter of the height bounds its fill cost).
+  gl.uniform1f(p.name('uStreak'),C.sprayStretch?C.sprayStreak:0);gl.uniform1f(p.name('uMistPixels'),this.size[1]*.25);
   gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.bindVertexArray(this.copyVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
   gl.drawArrays(gl.TRIANGLES,0,6*n);profiler?.draw(0,n);gl.depthMask(true);gl.disable(gl.BLEND);}
  project(x,y,z){const p=Mat.transform(this.vp,[x,y,z]);return{x:(p[0]*.5+.5)*innerWidth,y:(-.5*p[1]+.5)*innerHeight,z:p[2],visible:p[2]>-1&&p[2]<1};}
@@ -2668,6 +2719,8 @@ class ContactPhysics{
  for(let i=0;i<count&&this.g.particles.length<C.particleLimit;i++){const angle=rand()*TAU,side=(rand()-.5)*strength*.75,radial=(.3+rand()*.7)*Math.min(2.4,strength*.28),vx=entry?Math.cos(angle)*radial:nx*radial-nz*side,vz=entry?Math.sin(angle)*radial:nz*radial+nx*side;
   const p=this.g.addParticle(x+nx*.10+(rand()-.5)*.12,z+nz*.10+(rand()-.5)*.12,{y:y+.04+rand()*.10,vx:vx+(b?.vx||0)*.12,vz:vz+(b?.vz||0)*.12,vy:.5+rand()*Math.min(3.6,strength*.40),size:.018+rand()*.035,life:.55+rand()*.85,impulseScale:.01,cpu:true});if(p){p.contactDrop=true;p.collisionMark=0;this.stats.splashParticles++;}}
  const m=w.motion(x+nx*.2,z+nz*.2,this.g.surfaceRead),ax=m[12],az=m[13];for(let i=0;i<Math.min(8,Math.floor(count/5));i++)this.g.addParticle(ax+(rand()-.5)*.45,az+(rand()-.5)*.45,{foam:true,vx:nx*.15,vz:nz*.15,size:.11+rand()*.11,life:1.0+rand()*1.5});
+ // Hull slams and wave strikes on walls release mist with their strength.
+ if(entry||kind==='wave')this.g.mistBurst(x,y+.3,z,(b?.vx||0)*.3+nx*.6,.6,(b?.vz||0)*.3+nz*.6,Math.max(0,strength-1)*.6,.5,.9);
  if(entry&&C.bubbles){for(let i=0;i<Math.min(32,C.bubbleCount);i++)this.g.addParticle(x+(rand()-.5)*.5,z+(rand()-.5)*.5,{bubble:true,y:y-.14-rand()*.25,vy:C.bubbleRise*.7,life:1.3+rand(),size:.018+rand()*.03});}
  }
  wallSpray(dt){if(!C.contactSplashes||!C.waveContactSplashes)return;const t0=performance.now(),w=this.g.water,world=this.world;world.probeClock+=dt;if(world.probeClock<1/C.wallSplashHz)return;world.probeClock%=1/C.wallSplashHz;
@@ -2684,7 +2737,7 @@ class ContactPhysics{
 
 class Game{
  constructor(water,renderer,sound){this.flowRead=new Float64Array(3);this.skyClock=0;this.orbitClock=0;this.pool=[];this.sprayClock=0;this.sprayCursor=0;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.surfaceRead=new Float64Array(14);this.waveRead=new Float64Array(14);this.water=water;this.renderer=renderer;this.sound=sound;this.started=false;this.paused=false;this.free=false;this.dive=false;this.showFlow=false;this.result=null;this.elapsed=0;this.gateMoves=0;this.collected=0;this.particles=[];this.uiTick=0;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.frames=0;this.resetState();}
- resetState(){this.skyClock=0;this.orbitClock=0;this.sprayClock=0;this.sprayCursor=0;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.boat={x:-5.1,z:7.65,y:.37,vy:0,vx:0,vz:0,yaw:.15,pitch:0,roll:0,pitchV:0,rollV:0,yawV:0,wetFraction:1,heaveG:1,airborne:false,anchor:false,hull:100,hitCooldown:0,wakeClock:0,distance:0};this.cells=[{x:-11,z:4,got:false},{x:-9,z:-5,got:false},{x:9,z:-7,got:false}];this.home={x:-5.15,z:7.65};this.collected=0;this.elapsed=0;this.gateMoves=0;for(const p of this.particles)this.pool.push(p);this.particles=[];this.landings=[];this.renderer?.gpuPool?.reset();this.result=null;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.water.reset();if(C.environment!==0){const a=WORLD_DEFS[C.environment].boat;this.boat.x=a[0];this.boat.z=a[1];this.home={x:a[0],z:a[1]};}spectrum.sync(0);this.boat.y=this.water.surface(this.boat.x,this.boat.z)+.06;this.rescue=new Rescue(this);this.physics=new ContactPhysics(this);}
+ resetState(){this.skyClock=0;this.orbitClock=0;this.sprayClock=0;this.sprayCursor=0;this.mistSeed=0x2545f491;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.boat={x:-5.1,z:7.65,y:.37,vy:0,vx:0,vz:0,yaw:.15,pitch:0,roll:0,pitchV:0,rollV:0,yawV:0,wetFraction:1,heaveG:1,airborne:false,anchor:false,hull:100,hitCooldown:0,wakeClock:0,distance:0};this.cells=[{x:-11,z:4,got:false},{x:-9,z:-5,got:false},{x:9,z:-7,got:false}];this.home={x:-5.15,z:7.65};this.collected=0;this.elapsed=0;this.gateMoves=0;for(const p of this.particles)this.pool.push(p);this.particles=[];this.landings=[];this.renderer?.gpuPool?.reset();this.result=null;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.water.reset();if(C.environment!==0){const a=WORLD_DEFS[C.environment].boat;this.boat.x=a[0];this.boat.z=a[1];this.home={x:a[0],z:a[1]};}spectrum.sync(0);this.boat.y=this.water.surface(this.boat.x,this.boat.z)+.06;this.rescue=new Rescue(this);this.physics=new ContactPhysics(this);}
  start(free=false){this.resetState();this.started=true;this.paused=false;this.free=free;if(free){this.boat.x=WORLD_DEFS[C.environment].boat[0];this.boat.z=WORLD_DEFS[C.environment].boat[1];applyBasinLevel(WORLD_DEFS[C.environment].level);water.gates.forEach(g=>g.value=g.target=0);this.renderer.resetEffects();}this.dive=false;document.body.classList.remove('prestart','diving');$('intro').classList.add('hidden');for(let id of['help','pause','finish'])$(id).classList.add('hidden');this.sound.toggle(true);clearInput();this.updateTools();this.updateUI();toast(free?'BEACON reset. G sends a rogue wave. B changes the camera. F7 starts the selected test.':'Open intake [1] + close outlet [2] to flood the high shoals.',6);}
  toggleGate(i){if(!this.started||this.paused)return;let g=this.water.gates[i];g.target=g.target>.5?0:1;this.gateMoves++;this.sound.chime('gate');toast((i===0?'Mountain intake':'Ocean outlet')+(g.target?' opening.':' closing.'),2.4);this.updateUI();}
  toggleAnchor(){if(!this.started||this.paused)return;this.boat.anchor=!this.boat.anchor;this.updateTools();toast(this.boat.anchor?'Anchor down. Take a moment. Steer to raise it.':'Anchor raised. Follow the water.',2.3);}
@@ -2724,6 +2777,13 @@ class Game{
  spawnGPU(x,z,opt){const life=opt.life??1.8,kind=opt.foam?1:opt.bubble?2:0,y=opt.y??(opt.foam?this.water.level+.07:this.water.fastSurface(x,z)+.07),vx=opt.vx||0,vy=opt.vy||0,vz=opt.vz||0,n=this.sprayCursor++;
   this.renderer.gpuPool.spawn(this.water.time,x,y,z,vx,vy,vz,life,kind,opt.size||.07,life+(kind===0?C.foamLife:kind===2?.6:0));
   if(kind===0&&n%3===0)this.predictLanding(x,y,z,vx,vy,vz,life,.018*(opt.impulseScale??1));}
+ // Mist puffs (GPU particles only): a mean of `expected` puffs scattered over `spread` metres, launch
+ // diameter `size`. They draw from their own random stream and make no ripples, so the switch never
+ // changes the simulation.
+ mistBurst(x,y,z,vx,vy,vz,expected,spread,size){if(!C.mist||!C.particles||!(C.mistDensity>0)||!this.renderer?.particleActive?.())return 0;
+  const r=()=>{this.mistSeed=(Math.imul(this.mistSeed,1664525)+1013904223)>>>0;return this.mistSeed/4294967296;},e=expected*C.mistDensity,n=Math.floor(e)+(r()<e%1?1:0);
+  for(let i=0;i<n;i++){const life=1.6+1.4*r(),a=r()*TAU,o=spread*Math.sqrt(r());this.renderer.gpuPool.spawn(this.water.time,x+Math.cos(a)*o,y+.1*r(),z+Math.sin(a)*o,vx+Math.cos(a)*o,vy*(.6+.8*r()),vz+Math.sin(a)*o,life,3,size*(.7+.6*r()),life);}
+  return n;}
  // Ballistic flight to the water height under the spawn point, with the drop's wind relaxation.
  predictLanding(x,y,z,vx,vy,vz,life,amount){const g=C.sprayGravity,wx=storm.table[0]*C.sprayWind,wz=storm.table[1]*C.sprayWind,drop=y-this.water.fastSurface(x,z);
   const t=Math.max(.12,drop>0?(vy+Math.sqrt(vy*vy+2*g*drop))/g:0);if(t>=life)return;const e=(1-Math.exp(-.8*t))/.8;
@@ -2742,6 +2802,8 @@ class Game{
    const slope=Math.hypot(m[9],m[10]),breaking=(m[11]<C.sprayThreshold&&m[1]>.1)||(slope>1&&m[1]>.5);if(!breaking)continue;
    const px=x+m[0],pz=z+m[2],y=this.water.bilerp(this.water.bed,x,z)+depth+m[1]+.04,count=2+(m[11]<.6?2:0);
    for(let j=0;j<count;j++){const life=(.45+rand()*.55)*C.sprayLifetime;this.addParticle(px+(rand()-.5)*.12,pz+(rand()-.5)*.12,{y:y+rand()*.08,vx:m[6]+windx*.3+(rand()-.5)*1.4,vz:m[8]+windz*.3+(rand()-.5)*1.4,vy:Math.max(0,m[7])*.38+C.sprayLaunch*(.22+rand()*.8),life,size:.018+Math.pow(rand(),2)*.056,impulseScale:.01});}
+   // A compressed (plunging) crest sheds more mist than a merely steep one.
+   this.mistBurst(px,y+.25,pz,m[6]*.5+windx*.5,.5,m[8]*.5+windz*.5,m[11]<.6?.3:.12,.3,.7);
   }
  }
  updateParticles(dt){const a=this.particles,w=this.water,windx=storm.table[0]*C.sprayWind,windz=storm.table[1]*C.sprayWind,damp=1-Math.exp(-dt*.8),gpu=this.renderer?.particleActive?.()?this.renderer.gpuPool:null;
@@ -3383,7 +3445,7 @@ class Rescue{
   // Bodies, contact pairs and the tow line were advanced together in ContactPhysics.
   const tug=this.game.boat;
   this.emitClock+=dt;if(this.emitClock>.16){this.emitClock=0;const b=this.target,v=Math.hypot(b.vx,b.vz);if(!C.persistentWakes&&v>.35&&b.wetFraction>.2){const x=b.x+Math.sin(b.yaw)*1.35,z=b.z+Math.cos(b.yaw)*1.35;this.game.water.impulse(x,z,Math.min(.45,v*.1),.65);for(let i=0;i<3;i++)this.game.addParticle(x+(rand()-.5)*.7,z,{foam:true,size:.18,life:4,vx:b.vx*.15,vz:b.vz*.15});}
-   if(C.coastalWaves&&C.particles){for(let i=0;i<6;i++){const x=rand()*30-15,z=-5.8+.038*x*x+(rand()-.5)*6,c=coastalSample(x,z,this.game.water.time,this.game.water.bilerp(this.game.water.h,x,z));if(c[2]>.65&&Math.abs(c[4])>.2)this.game.addParticle(x,z,{y:this.game.water.fastSurface(x,z)+.1,vy:1.4+rand(),vx:(rand()-.5)*.8,vz:.8+rand(),life:1.4,size:.045});}}
+   if(C.coastalWaves&&C.particles){for(let i=0;i<6;i++){const x=rand()*30-15,z=-5.8+.038*x*x+(rand()-.5)*6,c=coastalSample(x,z,this.game.water.time,this.game.water.bilerp(this.game.water.h,x,z));if(c[2]>.65&&Math.abs(c[4])>.2){this.game.addParticle(x,z,{y:this.game.water.fastSurface(x,z)+.1,vy:1.4+rand(),vx:(rand()-.5)*.8,vz:.8+rand(),life:1.4,size:.045});this.game.mistBurst(x,this.game.water.fastSurface(x,z)+.35,z,0,.5,.9,.25,.4,.8);}}}
   }
   const dist=Math.hypot(this.target.x+7,this.target.z-15);this.distance=dist;
   if(this.mission&&!this.complete){const safe=dist<3&&this.target.z>9&&Math.hypot(this.target.vx,this.target.vz)<1.2&&Math.hypot(tug.vx,tug.vz)<1.6;this.dwell=safe?this.dwell+dt:0;if(this.dwell>=3){this.complete=true;this.attached=false;this.tension=0;this.game.sound.chime();toast('Rescue complete. The workboat is safe. Continue in the water lab.',7);profiler?.note('rescue-complete',{elapsed:this.game.elapsed,breaks:this.breaks,peakTension:this.peakTension});}}
@@ -4261,7 +4323,7 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles'];
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles','sprayStretch','mist'];
 PASS_NAMES.push('wetHistory','particleSim');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU','particleSim');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
@@ -4427,10 +4489,10 @@ Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=
  for(const mesh of [renderer.boat,renderer.workboatMesh])if(mesh?.wetValues)for(const k of ['wetPositions','wetIndex','wetSamples','wetValues'])array+=mesh[k].byteLength;
  for(const k of ['bodyWetRead','wakeSourceRead','wakeSegmentData','wakeInfoData'])array+=renderer[k]?.byteLength||0;
  const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0)+(renderer.particleTargets?.bytes||0)+(renderer.bedTex?N*N*4:0);
- const pool=renderer.gpuPool;if(pool?.staging)array+=pool.staging.byteLength+pool.birth.byteLength+pool.expiry.byteLength;
+ const pool=renderer.gpuPool;if(pool?.staging)array+=pool.staging.byteLength+pool.birth.byteLength+pool.expiry.byteLength;if(renderer.particleTargets?.hostData)array+=renderer.particleTargets.hostData.byteLength;
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,gpuParticles:{active:this.particleActive(),fallback:this.particleFallback||null,capacity:this.particleTargets?.cap||0,live:this.gpuCount?{spray:this.gpuCount.spray,foam:this.gpuCount.foam,bubble:this.gpuCount.bubble}:null,window:this.gpuPool?.windowCount()||0,pending:this.gpuPool?.pending()||0,uploadedLastFrame:this.particleUploads||0,motes:this.particleMotes||0,cpuParticles:game?.particles.length||0,predictedLandings:game?.landings?.length||0},notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,gpuParticles:{active:this.particleActive(),fallback:this.particleFallback||null,capacity:this.particleTargets?.cap||0,live:this.gpuCount?{spray:this.gpuCount.spray,foam:this.gpuCount.foam,bubble:this.gpuCount.bubble,mist:this.gpuCount.mist}:null,window:this.gpuPool?.windowCount()||0,pending:this.gpuPool?.pending()||0,uploadedLastFrame:this.particleUploads||0,motes:this.particleMotes||0,cpuParticles:game?.particles.length||0,cpuDrawnAsQuads:this.particleHost||0,streaks:!!(C.sprayStretch&&this.particleActive()),mist:!!(C.mist&&this.particleActive()),predictedLandings:game?.landings?.length||0},notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;
