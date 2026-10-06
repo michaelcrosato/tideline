@@ -180,6 +180,53 @@ async def main(args):
     const halves=sizes.length===4&&sizes.every((s,i)=>s[0]===Math.max(1,w>>(i+1))&&s[1]===Math.max(1,h>>(i+1)));
     return {ok:halves&&count2===2&&diff(four,two)>20&&diff(four,single)>20&&gl.getError()===0,sizes,frame:[w,h],levelChange:diff(four,two),chainChange:diff(four,single),phoneLevels:D.phonePreset.bloomLevels};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # M9: GPU particles land on the full wave surface, bubbles surface as foam, and the water never reads GPU state.
+  await check('GPU spray lands on the full surface; rendering never changes the simulation', '''const saved={...C},gl=r.gl,pool=r.gpuPool;
+   const slotState=s=>{const t=r.particleTargets,a=new Float32Array(4),b=new Float32Array(4),x=s%256,y=Math.floor(s/256);gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,a);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);const m=Math.round(b[3]);return {p:[a[0],a[1],a[2]],life:a[3],kind:m&3,maxLife:(m>>13)/64};};
+   const advance=dt=>{w.time+=dt;D.storm.sync();D.spectrum.sync(w.time);r.render(g,dt);};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,gpuParticles:true,waves:true,spectral:true,waveScale:1.6,rogueEnabled:false,sprayWind:0,renderInterpolation:false});D.storm.sync();D.spectrum.sync(w.time,true);r.render(g,0);
+    if(!r.particleActive())return {ok:false,error:'GPU particles inactive',fallback:r.particleFallback};
+    let x=0,z=0;for(const [cx,cz] of [[0,0],[-6,2],[6,-4],[3,6],[-8,-6]])if(w.bilerp(w.h,cx,cz)>1.2){x=cx;z=cz;break;}
+    g.particles.length=0;g.landings.length=0;pool.reset();r.render(g,0);g.sprayCursor=0;
+    // A still drop 0.6 m above the full surface, with the CPU landing ripple predicted at its spawn.
+    const top=w.motion(x,z)[1]+.6,t0=w.time,fast0=w.fastSurface(x,z);g.addParticle(x,z,{y:top,vy:0,life:2,size:.05});const drop=(pool.head-1)%pool.cap,ripple=g.landings[0];
+    g.addParticle(x+.5,z,{bubble:true,y:w.motion(x+.5,z)[1]-.8,vy:.5,life:4,size:.03});const bubble=(pool.head-1)%pool.cap;
+    let prev=null,landed=null,surfaced=null,frames=0;
+    for(let f=0;f<150&&!(landed&&surfaced);f++){advance(1/60);frames++;const d=slotState(drop),b=slotState(bubble);
+     if(!landed){if(d.kind===1){const m=w.motion(x,z);landed={y:d.p[1],prevY:prev.y,prevFull:prev.full,full:m[1],fast:w.fastSurface(x,z),q:[d.p[0],d.p[2]],cpuQ:[m[12],m[13]],t:w.time-t0,life:d.life,maxLife:d.maxLife};}else prev={y:d.p[1],full:w.motion(x,z)[1]};}
+     if(!surfaced&&b.kind===1)surfaced={t:w.time-t0,life:b.life};}
+    // Rendering is the only GPU work: it must not change the simulated state or the predicted landings.
+    const hash=()=>JSON.stringify([g.boat.x,g.boat.y,g.boat.vy,w.time,w.h.reduce((a,b)=>a+b,0),w.rv.reduce((a,b)=>a+b,0),g.landings.length]);let changed=0;
+    let scheduled=0;g.splash(x,z,8,.7);for(let i=0;i<20;i++){scheduled=Math.max(scheduled,g.landings.length);g.step(D.DT);const h=hash();D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);if(hash()!==h)changed++;}
+    // The ripple's flight time uses the CPU surface at the spawn point, as Game.predictLanding does.
+    const fall=Math.max(.12,Math.sqrt(2*(top-fast0)/C.sprayGravity)),ok=!!landed&&!!surfaced&&landed.prevY>=landed.prevFull-.06&&landed.y<=landed.full+.06&&Math.hypot(landed.q[0]-landed.cpuQ[0],landed.q[1]-landed.cpuQ[1])<.08&&landed.life>0&&landed.life<=C.foamLife
+     &&!!ripple&&Math.abs(ripple.t-t0-fall)<1e-6&&Math.hypot(ripple.x-x,ripple.z-z)<1e-6&&surfaced.t>.4&&surfaced.t<2.5&&changed===0&&scheduled>0&&gl.getError()===0;
+    return {ok,frames,fall:+fall.toFixed(3),landed,surfaced,ripple:ripple&&{dt:+(ripple.t-t0).toFixed(3),x:ripple.x-x,z:ripple.z-z},renderChangedState:changed,predictedLandings:scheduled,report:r.surfaceReport().gpuParticles};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # Sync objects signal only between tasks, so this check yields to the event loop while it waits.
+  await check('GPU live count for reports matches the particle state', '''const gl=r.gl,pool=r.gpuPool;
+   if(!r.particleActive())return {ok:false,error:'GPU particles inactive'};
+   // The previous check restored underParticles: a new mote count rebuilds only the preparation rows, not the ring.
+   const generation=pool.generation;g.splash(0,0,8,.7);g.step(D.DT);D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);const ringKept=pool.generation===generation&&pool.windowCount()>0;
+   gl.finish();r.gpuCount=null;r.countSync&&gl.deleteSync(r.countSync);r.countSync=null;r.countAt=-1e9;r.render(g,0);const issued=!!r.countSync;
+   return new Promise(done=>{let tries=0;const poll=()=>{r.render(g,0);if(!r.gpuCount&&++tries<100){gl.finish();setTimeout(poll,10);return;}
+    const t=r.particleTargets,n=256*t.rows*4,a=new Float32Array(n),b=new Float32Array(n),direct=[0,0,0,0];
+    gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,a);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,b);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(a[s*4+3]>0){direct[Math.round(b[s*4+3])&3]++;direct[3]++;}}
+    const c=r.gpuCount,ok=ringKept&&issued&&!!c&&c.spray===direct[0]&&c.foam===direct[1]&&c.bubble===direct[2]&&c.total===direct[3]&&direct[3]>0&&g.particleCount()===g.particles.length+direct[3]+pool.pending()&&gl.getError()===0;
+    done({ok,ringKept,tries,readback:c,direct,window:pool.windowCount(),reported:g.particleCount()});};setTimeout(poll,10);});''')
+  # The GPU quads use the point path's size law and sprite shading: one cloud drawn both ways matches.
+  await check('GPU particle sprites match the CPU point path', '''const saved={...C},gl=r.gl,pool=r.gpuPool,parts=g.particles.slice(),landings=g.landings.slice();
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   const sum=(a,b)=>{let t=0;for(let i=0;i<a.length;i+=4)t+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);return t;};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,softParticles:false,timeLighting:false,sunStrength:1.65,cameraMode:3,orbitAuto:false,orbitHeight:6,orbitRadius:24,bloom:false,lensDrops:false});D.storm.sync();r.camera(g,100);
+    const e=r.eye,tg=r.target,d=[tg[0]-e[0],0,tg[2]-e[2]],l=Math.hypot(...d),cloud=[];for(let i=0;i<300;i++)cloud.push({x:e[0]+d[0]/l*6+Math.sin(i*1.7)*1.5,y:e[1]-1+Math.sin(i*2.3),z:e[2]+d[2]/l*6+Math.cos(i*1.3)*1.5,size:.06+.06*Math.abs(Math.sin(i))});
+    g.particles.length=0;C.gpuParticles=true;pool.reset();const bare=grab();
+    for(const c of cloud)g.addParticle(c.x,c.z,{y:c.y,life:5,size:c.size});const gpu=grab(),drawn=r.particleDraw;
+    C.gpuParticles=false;r.render(g,0);for(const c of cloud)g.particles.push({x:c.x,y:c.y,z:c.z,vx:0,vy:0,vz:0,life:5,maxLife:5,size:c.size});const cpu=grab();
+    const signal=sum(cpu,bare),gap=sum(gpu,cpu);
+    return {ok:drawn===300&&signal>0&&gap<.08*signal&&gl.getError()===0,drawn,signal,gap,ratio:+(gap/signal).toFixed(4)};
+   }finally{g.particles.length=0;g.particles.push(...parts);g.landings=landings;Object.assign(C,saved);D.storm.sync();pool.reset();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
