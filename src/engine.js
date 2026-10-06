@@ -1304,15 +1304,16 @@ uniform highp sampler2D uState0,uState1;uniform int uFirst,uCount,uCap;out vec4 
 void main(){int y=int(gl_FragCoord.y);vec4 n=vec4(0.);
  for(int x=0;x<${PARTICLE_ROW};x++){int slot=y*${PARTICLE_ROW}+x;if(slot>=uCap||(slot-uFirst+uCap)%uCap>=uCount||texelFetch(uState0,ivec2(x,y),0).w<=0.)continue;n[int(uint(texelFetch(uState1,ivec2(x,y),0).w+.5)&3u)]+=1.;n.w+=1.;}
  outCount=n;}`;
-// Instanced quads: instances [0,uCount) are the live ring window from uFirst, the rest are motes.
+// Quads, six vertices each from gl_VertexID (no buffers, no instancing: small instances are slow on some
+// drivers). Quads [0,uCount) are the live ring window from uFirst, the rest are motes.
 const particleVS=`#version 300 es
 precision highp float;precision highp int;precision highp sampler2D;
 uniform highp sampler2D uPrep0;uniform sampler2D uPrep1;uniform mat4 uVP;uniform float uScale;uniform vec2 uPointResolution;uniform int uFirst,uCount,uCap,uRows;
 out vec4 vColor;out float vKind;out vec2 vCorner;
-void main(){int i=gl_InstanceID,slot=(uFirst+i)%uCap;ivec2 c=i<uCount?ivec2(slot%${PARTICLE_ROW},slot/${PARTICLE_ROW}):ivec2((i-uCount)%${PARTICLE_ROW},uRows+(i-uCount)/${PARTICLE_ROW});
+void main(){int i=gl_VertexID/6,v=gl_VertexID%6,slot=(uFirst+i)%uCap;ivec2 c=i<uCount?ivec2(slot%${PARTICLE_ROW},slot/${PARTICLE_ROW}):ivec2((i-uCount)%${PARTICLE_ROW},uRows+(i-uCount)/${PARTICLE_ROW});
  vec4 p=texelFetch(uPrep0,c,0);vColor=texelFetch(uPrep1,c,0);vKind=step(p.w,0.);vCorner=vec2(0.);if(p.w==0.){gl_Position=vec4(2.,2.,2.,1.);return;}
  // The point path's size law: diameter in pixels, clamped to 1-55.
- vec4 clip=uVP*vec4(p.xyz,1.);float px=clamp(abs(p.w)*uScale/max(.15,clip.w),1.,55.);vec2 corner=vec2(float(gl_VertexID&1),float(gl_VertexID>>1))*2.-1.;
+ vec4 clip=uVP*vec4(p.xyz,1.);float px=clamp(abs(p.w)*uScale/max(.15,clip.w),1.,55.);int q=v<3?v:v==3?2:v==4?1:3;vec2 corner=vec2(float(q&1),float(q>>1))*2.-1.;
  clip.xy+=corner*px/uPointResolution*clip.w;gl_Position=clip;vCorner=vec2(corner.x,-corner.y);}`;
 // Kind (2 bits), size in mm (11 bits) and max life in 1/64 s (11 bits): an integer below 2^24, exact in a float.
 const packParticle=(kind,size,maxLife)=>kind+4*Math.min(2047,Math.max(0,Math.round(size*1000)))+8192*Math.min(2047,Math.max(0,Math.round(maxLife*64)));
@@ -1836,7 +1837,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   gl.uniformMatrix4fv(p.name('uVP'),false,this.vp);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1i(p.name('uFirst'),this.gpuPool.tail%t.cap);gl.uniform1i(p.name('uCount'),this.particleDraw);gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uRows'),t.rows);
   for(const [name,tex,unit] of [['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uSoftDepth',this.scene.depth,3]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
   gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.bindVertexArray(this.copyVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
-  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,n);profiler?.draw(0,n);gl.depthMask(true);gl.disable(gl.BLEND);}
+  gl.drawArrays(gl.TRIANGLES,0,6*n);profiler?.draw(0,n);gl.depthMask(true);gl.disable(gl.BLEND);}
  project(x,y,z){const p=Mat.transform(this.vp,[x,y,z]);return{x:(p[0]*.5+.5)*innerWidth,y:(-.5*p[1]+.5)*innerHeight,z:p[2],visible:p[2]>-1&&p[2]<1};}
  pickPlane(sx,sy,level){
   // Ray-plane intersection from the current camera basis; no inverse matrix or
