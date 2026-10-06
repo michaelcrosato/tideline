@@ -53,7 +53,7 @@ The additional world-wetness pass runs after wave-cache generation. Hull-moistur
 
 The default mesh, transport grid, and particle limit did not increase. There is no hidden dynamic quality setting. New features have independent switches in Advanced settings and in the Surface comparison plan.
 
-"## Surface 10.2 additions
+## Surface 10.2 additions
 
 ### Frame uniform block
 
@@ -73,8 +73,22 @@ Each fixed step records the poses it starts from. A frame blends the previous an
 
 The highlight glow is a dual-filter chain: a thresholded half-resolution pass, further halving passes, and additive tent upsamples back to half resolution. Its depth is `bloomLevels` (the phone preset uses 2). The post pass tone-maps (ACES fit or an AgX-style curve), applies the vignette, then encodes exact sRGB.
 
+### Particles
+
+With `gpuParticles`, spray, foam, bubbles and mist live in two RGBA32F ping-pong maps, 256 slots a row: (x, y, z, life) and (vx, vy, vz, kind | size | maximum life packed as an integer below 2^24). The CPU hands out ring slots (`ParticlePool`) and writes spawn rows with their birth time; it never reads the maps back. One update pass a frame moves the live window with exact wind relaxation and gravity, lands spray on the full displaced surface (all modes, the FFT field and the reef breaker, undisplaced by two fixed-point steps) and turns it into foam there; bubbles surface as foam; mist drifts and settles above the water. A preparation pass lifts, lights and sizes each live particle once (position, colour, and velocity with the kind), together with the CPU contact drops (two texels each, written every frame) and the underwater motes. Sprites are quads of six vertices from `gl_VertexID` in one draw; a drop stretches into a capsule along its screen motion over the streak exposure, and a mist puff is a Gaussian billboard with its own depth fade. Contact drops stay on the CPU (`world.cast`) and hand their landing foam to the GPU. The water never reads GPU state: every third spray drop's landing ripple is predicted ballistically at spawn (`game.landings`, saved in snapshots). Mist draws from its own random stream and makes no ripples. A row reduction read back through a fenced pixel buffer (at most twice a second, never waited on) gives reports their live counts. Without float render targets the 10.1 CPU path and point sprites run.
+
+Bow spray samples each bow corner on the hull flare once a step: the hull-relative water speed across the flare above a threshold throws drops along the flare at a rate growing with its square, and a corner entering the water faster than the slam speed releases a burst (within `contactSprayBurst`) and mist.
+
+### Foam material
+
+`foamLight()` in the shared shader code shades foam on the water and on the reef crest sheet: dense foam is bright and rough (GGX alpha 0.6), thin foam darker and more translucent (wrap lighting and light from behind), and thin edges cover less. On the water the foam normal follows the gradient of the foam history.
+
+### Beams
+
+With `stableBeams`, the lamp-beam march (and underwater light shafts, moved from the post pass) jitter their samples by a golden-ratio step each frame. A history pass reprojects the previous result through the point where each pixel's ray ends, rejects it where last frame's ray ended elsewhere, and clamps it to the current neighbourhood. History restarts on size, world or beam-setting changes, time jumps and large eye jumps.
+
 ## Restore and export
 
-Benchmark snapshots include water arrays, scalar counters, body state, old foam/optics state, world wetness, boat moisture, and previous stern positions. Returning from a result restores the voyage and history. Resetting a scene clears old marks so they cannot leak between environments.
+Benchmark snapshots include water arrays, scalar counters, body state, old foam/optics state, world wetness, boat moisture, previous stern positions and the predicted spray landings. GPU particles and the beam history restart empty after a restore. Returning from a result restores the voyage and history. Resetting a scene clears old marks so they cannot leak between environments.
 
 Recorded and live reports include `surfaceDetail`. Frames contain wake-source counts and signed-source error. CSV includes those fields. The reports explicitly state the approximations. The live field is not a substitute for repeated benchmark samples.

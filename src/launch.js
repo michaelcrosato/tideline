@@ -1,5 +1,5 @@
 (function(){
-var boot=window.TIDELINE_BOOT=BootKit.create({name:'TIDELINE',version:'SURFACE / 10.2',build:'TL-SURFACE-20261006.1',storageId:'tideline',host:'sb-root',
+var boot=window.TIDELINE_BOOT=BootKit.create({name:'TIDELINE',version:'SURFACE / 10.2',build:'TL-SURFACE-20261006.2',storageId:'tideline',host:'sb-root',
  renderers:[{id:'webgl2',attributes:{alpha:false,antialias:false,depth:true,powerPreference:'high-performance'},limits:{MAX_TEXTURE_SIZE:2048,MAX_RENDERBUFFER_SIZE:2048,MAX_TEXTURE_IMAGE_UNITS:16,MAX_VERTEX_TEXTURE_IMAGE_UNITS:8,MAX_COMBINED_TEXTURE_IMAGE_UNITS:32,MAX_DRAW_BUFFERS:3,MAX_COLOR_ATTACHMENTS:3}}],
  load:function(b){
   var style=document.createElement('style');style.id='game-active-style';style.textContent=document.getElementById('game-style').textContent;document.head.appendChild(style);

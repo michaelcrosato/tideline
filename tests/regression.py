@@ -302,6 +302,28 @@ async def main(args):
     for(let i=0;i<60;i++)g.step(D.DT);D.storm.sync();D.spectrum.sync(w.time);C.foamMaterial=false;const off=grab();C.foamMaterial=true;const on=grab();let diff=0;for(let i=0;i<on.px.length;i++)if(Math.abs(on.px[i]-off.px[i])>4)diff++;
     return {ok:diff>0&&Math.abs(on.mean-off.mean)<.15*off.mean&&gl.getError()===0,changed:diff,meanOff:+off.mean.toFixed(1),meanOn:+on.mean.toFixed(1)};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # Beams at a fixed time and camera: a 32-sample march is the reference; history over 8-sample jittered
+  # frames must land closer to it than one fixed-dither 8-sample frame, also right after a small turn.
+  await check('Lamp beams: per-frame jitter, history settles the noise and follows a turn', '''const saved={...C},gl=r.gl;
+   const read=()=>{const t=r.volumeTarget,a=new Float32Array(t.w*t.h*4);const fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,r.volumeOut,0);gl.readPixels(0,0,t.w,t.h,gl.RGBA,gl.FLOAT,a);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(fbo);return a;};
+   const err=(a,b)=>{let e=0,n=0;for(let i=0;i<a.length;i+=4){const s=b[i]+b[i+1]+b[i+2];if(s<=1e-4)continue;e+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);n+=s;}return n?e/n:NaN;};
+   const frames=(k,set)=>{Object.assign(C,set);let out=null;for(let i=0;i<k;i++){r.camera(g,100);r.render(g,0);out=read();}return out;};
+   try{l.resultHeld=false;D.chooseWorld(1);l.resultHeld=true;Object.assign(C,{renderScale:.5,visualGrid:65,sprayRate:0,underParticles:0,dayHour:0,timeLighting:true,localLights:true,localFog:true,cameraMode:3,orbitAuto:false,orbitYaw:24,orbitRadius:20,orbitHeight:7,renderInterpolation:false,beamHistory:.88});D.storm.sync();r.camera(g,100);r.render(g,0);
+    if(!r.volumeReady)return {ok:false,error:'no beams in this scene',lights:D.lights.active};
+    const ref=frames(1,{stableBeams:false,beamSteps:32}),fixed=frames(2,{beamSteps:8}),same=frames(1,{})
+    ;const a=frames(1,{stableBeams:true}),b=frames(1,{}),moved=err(a,b)>0,settled=frames(24,{});
+    // A 3 degree turn: one frame later the history has followed the view.
+    const ref2=frames(1,{stableBeams:false,beamSteps:32,orbitYaw:27}),fixed2=frames(1,{beamSteps:8});frames(1,{stableBeams:true});frames(1,{orbitYaw:24});frames(23,{});const turned=frames(1,{orbitYaw:27});
+    const e={fixed:err(fixed,ref),settled:err(settled,ref),fixedTurn:err(fixed2,ref2),turned:err(turned,ref2)};
+    const ok=err(fixed,same)===0&&moved&&e.settled<.7*e.fixed&&e.turned<e.fixedTurn&&r.beamValid&&gl.getError()===0;
+    return {ok,errors:Object.fromEntries(Object.entries(e).map(([k,v])=>[k,+v.toFixed(4)])),staticDitherRepeats:err(fixed,same)===0,jitterMoves:moved};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
+  await check('Underwater light shafts share the beam pass and its history', '''const saved={...C};
+   try{l.resultHeld=false;D.chooseWorld(3);l.resultHeld=true;Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,dayHour:12,lightShafts:true,stableBeams:true,cameraMode:1,diveDepth:1.2});D.storm.sync();g.dive=true;
+    for(let i=0;i<3;i++){g.step(D.DT);r.camera(g,1);r.render(g,D.DT);}const on={under:r.underwater,ready:r.volumeReady,rays:r.volumeRays,valid:r.beamValid};
+    C.stableBeams=false;r.render(g,D.DT);const off={ready:r.volumeReady,rays:r.volumeRays};
+    return {ok:on.under&&on.ready&&on.rays&&on.valid&&!off.rays&&r.gl.getError()===0,on,off};
+   }finally{g.dive=false;Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
@@ -311,7 +333,7 @@ async def main(args):
   await check('Memory accounting includes the added maps','const m=D.profiler.memory();return {ok:m.gpuTargetBytes>2*128*128*4&&m.ownedArrayBytes>0,extraMapBytes:2*128*128*4};')
   record('No JavaScript exceptions',not errors,errors)
   record('No external runtime requests',not [u for u in network if u.startswith('http')],network)
-  result={'build':'TL-SURFACE-20261006.1','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
+  result={'build':'TL-SURFACE-20261006.2','testEnvironment':'Chromium / software graphics / reduced settings / '+('in-memory HTML' if args.in_memory else 'local HTML'), 'seconds':round(time.monotonic()-t,2),'passed':sum(r['passed'] for r in rows),'total':len(rows),'tests':rows,'limitations':['Not tested on physical Android/iOS or RTX hardware.','These checks are not a performance rating.']}
   Path(args.output).write_text(json.dumps(result,indent=2))
   print(json.dumps({k:result[k] for k in ['passed','total','seconds']},indent=2))
   if not args.cdp:await browser.close()
