@@ -203,6 +203,18 @@ async def main(args):
      &&!!ripple&&Math.abs(ripple.t-t0-fall)<1e-6&&Math.hypot(ripple.x-x,ripple.z-z)<1e-6&&surfaced.t>.4&&surfaced.t<2.5&&changed===0&&scheduled>0&&gl.getError()===0;
     return {ok,frames,fall:+fall.toFixed(3),landed,surfaced,ripple:ripple&&{dt:+(ripple.t-t0).toFixed(3),x:ripple.x-x,z:ripple.z-z},renderChangedState:changed,predictedLandings:scheduled,report:r.surfaceReport().gpuParticles};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # Sync objects signal only between tasks, so this check yields to the event loop while it waits.
+  await check('GPU live count for reports matches the particle state', '''const gl=r.gl,pool=r.gpuPool;
+   if(!r.particleActive())return {ok:false,error:'GPU particles inactive'};
+   // The previous check restored underParticles: a new mote count rebuilds only the preparation rows, not the ring.
+   const generation=pool.generation;g.splash(0,0,8,.7);g.step(D.DT);D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);const ringKept=pool.generation===generation&&pool.windowCount()>0;
+   gl.finish();r.gpuCount=null;r.countSync&&gl.deleteSync(r.countSync);r.countSync=null;r.countAt=-1e9;r.render(g,0);const issued=!!r.countSync;
+   return new Promise(done=>{let tries=0;const poll=()=>{r.render(g,0);if(!r.gpuCount&&++tries<100){gl.finish();setTimeout(poll,10);return;}
+    const t=r.particleTargets,n=256*t.rows*4,a=new Float32Array(n),b=new Float32Array(n),direct=[0,0,0,0];
+    gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,a);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(0,0,256,t.rows,gl.RGBA,gl.FLOAT,b);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(a[s*4+3]>0){direct[Math.round(b[s*4+3])&3]++;direct[3]++;}}
+    const c=r.gpuCount,ok=ringKept&&issued&&!!c&&c.spray===direct[0]&&c.foam===direct[1]&&c.bubble===direct[2]&&c.total===direct[3]&&direct[3]>0&&g.particleCount()===g.particles.length+direct[3]+pool.pending()&&gl.getError()===0;
+    done({ok,ringKept,tries,readback:c,direct,window:pool.windowCount(),reported:g.particleCount()});};setTimeout(poll,10);});''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

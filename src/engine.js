@@ -1297,6 +1297,13 @@ void main(){ivec2 c=ivec2(gl_FragCoord.xy);outPosition=vec4(0.);outColor=vec4(0.
  if(pos.y>uLevel+.2||pos.y<bedAt(pos.xz))return;
  outColor=particleLight(pos,vec4(.40,.71,.82,uUnderAlpha),0.);outPosition=vec4(pos,uUnderSize);
 }`;
+// Live particles by kind in each state row, inside the ring window. For reports only.
+const particleCountFS=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform highp sampler2D uState0,uState1;uniform int uFirst,uCount,uCap;out vec4 outCount;
+void main(){int y=int(gl_FragCoord.y);vec4 n=vec4(0.);
+ for(int x=0;x<${PARTICLE_ROW};x++){int slot=y*${PARTICLE_ROW}+x;if(slot>=uCap||(slot-uFirst+uCap)%uCap>=uCount||texelFetch(uState0,ivec2(x,y),0).w<=0.)continue;n[int(uint(texelFetch(uState1,ivec2(x,y),0).w+.5)&3u)]+=1.;n.w+=1.;}
+ outCount=n;}`;
 // Instanced quads: instances [0,uCount) are the live ring window from uFirst, the rest are motes.
 const particleVS=`#version 300 es
 precision highp float;precision highp int;precision highp sampler2D;
@@ -1764,21 +1771,26 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.drawParticleSprites();
  }
  // GPU particles: programs, maps and the per-frame passes. Without float colour targets the CPU path runs.
- initParticles(){const gl=this.gl;this.gpuPool=new ParticlePool();this.particleTargets=null;this.particleTime=0;this.particleGeneration=-1;this.particleDraw=0;this.particleMotes=0;this.particleUploads=0;this.bedWorld=-1;
+ initParticles(){const gl=this.gl;this.gpuPool=new ParticlePool();this.gpuCount=null;this.countSync=null;this.particleTargets=null;this.particleTime=0;this.particleGeneration=-1;this.particleDraw=0;this.particleMotes=0;this.particleUploads=0;this.bedWorld=-1;
   this.particleGPU=this.hdr;this.particleFallback=this.hdr?null:'No float colour targets (EXT_color_buffer_float).';if(!this.particleGPU)return;
-  this.particleSimProgram=this.program(fullVS,particleSimFS);this.particlePrepProgram=this.program(fullVS,particlePrepFS);this.particleDrawProgram=this.program(particleVS,particleFS);
+  this.particleSimProgram=this.program(fullVS,particleSimFS);this.particlePrepProgram=this.program(fullVS,particlePrepFS);this.particleDrawProgram=this.program(particleVS,particleFS);this.particleCountProgram=this.program(fullVS,particleCountFS);
   this.bedTex=this.texture(gl.R32F,N,N,gl.RED,gl.FLOAT,gl.NEAREST);}
  particleActive(){return !!(this.particleGPU&&C.gpuParticles&&C.particles&&C.particleLimit>=1);}
- freeParticleMaps(){const t=this.particleTargets;if(!t)return;const gl=this.gl;for(const m of [...t.state,t.prep]){gl.deleteFramebuffer(m.fbo);for(const c of m.colors)gl.deleteTexture(c);}gl.deleteTexture(t.spawn);this.particleTargets=null;}
- // State ping-pong (2 x RGBA32F), preparation (RGBA32F position + RGBA16F colour, plus mote rows) and spawn rows.
- particleMaps(){const W=PARTICLE_ROW,cap=Math.max(1,Math.round(C.particleLimit)),rows=Math.ceil(cap/W),motes=Math.ceil(Math.max(0,Math.round(C.underParticles))/W),sig=cap+'/'+motes;
-  if(this.particleTargets?.sig===sig)return this.particleTargets;this.freeParticleMaps();const gl=this.gl,f32=[gl.RGBA32F,gl.FLOAT];
+ freeParticleMaps(){const t=this.particleTargets;if(!t)return;const gl=this.gl;for(const m of [...t.state,t.prep]){gl.deleteFramebuffer(m.fbo);for(const c of m.colors)gl.deleteTexture(c);}gl.deleteTexture(t.spawn);gl.deleteFramebuffer(t.count.fbo);gl.deleteTexture(t.count.color);gl.deleteBuffer(t.count.buffer);if(this.countSync){gl.deleteSync(this.countSync);this.countSync=null;}this.gpuCount=null;this.particleTargets=null;}
+ // State ping-pong (2 x RGBA32F), spawn rows and the count target follow particleLimit; changing it
+ // clears the ring. The preparation target (RGBA32F position + RGBA16F colour) also holds the mote
+ // rows, so a new mote count only replaces it: it is rebuilt every frame and holds no state.
+ particleMaps(){const W=PARTICLE_ROW,cap=Math.max(1,Math.round(C.particleLimit)),rows=Math.ceil(cap/W),motes=Math.ceil(Math.max(0,Math.round(C.underParticles))/W),gl=this.gl,f32=[gl.RGBA32F,gl.FLOAT];let t=this.particleTargets;
+  if(t?.cap===cap&&t.motes===motes)return t;
   const mrt=(formats,h)=>{const fbo=gl.createFramebuffer(),colors=formats.map(([internal,type])=>this.texture(internal,W,h,gl.RGBA,type,gl.NEAREST));gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
    colors.forEach((c,i)=>gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,c,0));gl.drawBuffers(colors.map((_,i)=>gl.COLOR_ATTACHMENT0+i));return {fbo,colors,h,ok:gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE};};
-  const t={sig,cap,rows,motes,state:[mrt([f32,f32],rows),mrt([f32,f32],rows)],prep:mrt([f32,[gl.RGBA16F,gl.HALF_FLOAT]],rows+motes),spawn:this.texture(gl.RGBA32F,W*3,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),read:0};
-  t.bytes=W*rows*(4*16+16*3)+W*(rows+motes)*24;gl.bindFramebuffer(gl.FRAMEBUFFER,null);this.particleTargets=t;
-  if(![...t.state,t.prep].every(m=>m.ok)){this.freeParticleMaps();this.particleGPU=false;this.particleFallback='Float particle targets are incomplete on this device.';this.gpuPool.reset();return null;}
-  this.gpuPool.resize(cap);this.gpuPool.reset();return t;}
+  const fresh=t?.cap!==cap;
+  if(fresh){this.freeParticleMaps();t={cap,rows,state:[mrt([f32,f32],rows),mrt([f32,f32],rows)],spawn:this.texture(gl.RGBA32F,W*3,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),read:0};
+   const color=this.texture(gl.RGBA32F,1,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),fbo=gl.createFramebuffer(),buffer=gl.createBuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,buffer);gl.bufferData(gl.PIXEL_PACK_BUFFER,rows*16,gl.STREAM_READ);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);t.count={color,fbo,buffer,data:new Float32Array(rows*4),ok:gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE};this.particleTargets=t;}
+  else{gl.deleteFramebuffer(t.prep.fbo);for(const c of t.prep.colors)gl.deleteTexture(c);}
+  t.motes=motes;t.prep=mrt([f32,[gl.RGBA16F,gl.HALF_FLOAT]],rows+motes);t.bytes=W*rows*(4*16+16*3)+W*(rows+motes)*24+rows*32;gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  if(![...t.state,t.prep,t.count].every(m=>m.ok)){this.freeParticleMaps();this.particleGPU=false;this.particleFallback='Float particle targets are incomplete on this device.';this.gpuPool.reset();return null;}
+  if(fresh){this.gpuPool.resize(cap);this.gpuPool.reset();}return t;}
  // One update pass (new spawns, motion, landing) and one preparation pass a frame, before the scene.
  updateParticleState(game){const pool=this.gpuPool;this.particleDraw=this.particleMotes=0;if(!pool)return;
   if(!this.particleActive()){if(pool.head)pool.reset();return;}const t=this.particleMaps();if(!t)return;
@@ -1804,8 +1816,19 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   if(count+motes>0){const p=this.particlePrepProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);
    for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
    gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uMotes'),motes);gl.uniform1f(p.name('uParticleSize'),C.particleSize);gl.uniform1f(p.name('uUnderAlpha'),C.underAlpha);gl.uniform1f(p.name('uUnderSize'),C.underSize);this.particlePass(p,[...this.particleRows(t,pool.tail,pool.sent),...(motes?[[t.rows,t.rows+Math.ceil(motes/W)-1]]:[])]);}
-  this.particleDraw=count;this.particleMotes=motes;gl.enable(gl.DEPTH_TEST);
+  this.particleDraw=count;this.particleMotes=motes;this.countParticles(t);gl.enable(gl.DEPTH_TEST);
  }
+ // Live particles by kind, for reports only: the row reduction is read back through a fenced pixel
+ // buffer at most twice a second and collected once the GPU has finished, so nothing waits on it.
+ countParticles(t){const gl=this.gl,pool=this.gpuPool;
+  if(this.countSync&&gl.getSyncParameter(this.countSync,gl.SYNC_STATUS)===gl.SIGNALED){gl.deleteSync(this.countSync);this.countSync=null;const a=t.count.data,k=[0,0,0,0];gl.bindBuffer(gl.PIXEL_PACK_BUFFER,t.count.buffer);gl.getBufferSubData(gl.PIXEL_PACK_BUFFER,0,a);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);for(let i=0;i<a.length;i++)k[i%4]+=a[i];
+   if(this.countGeneration===pool.generation)this.gpuCount={spray:k[0],foam:k[1],bubble:k[2],total:k[3],generation:pool.generation};}
+  const now=performance.now();if(this.countSync||now-(this.countAt??-1e9)<500)return;this.countAt=now;this.countGeneration=pool.generation;
+  if(!pool.windowCount()){this.gpuCount={spray:0,foam:0,bubble:0,total:0,generation:pool.generation};return;}
+  const p=this.particleCountProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.count.fbo);gl.viewport(0,0,1,t.rows);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.useProgram(p.p);
+  for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+  gl.uniform1i(p.name('uFirst'),pool.tail%t.cap);gl.uniform1i(p.name('uCount'),pool.windowCount());gl.uniform1i(p.name('uCap'),t.cap);this.full(p);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER,t.count.buffer);gl.readPixels(0,0,1,t.rows,gl.RGBA,gl.FLOAT,0);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);this.countSync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);}
  // Rows holding ring positions [from, to): one range, two when the interval wraps, all rows when full.
  particleRows(t,from,to){const W=PARTICLE_ROW;if(to<=from)return [];if(to-from>=t.cap)return [[0,t.rows-1]];const a=from%t.cap,b=(to-1)%t.cap,r0=Math.floor(a/W),r1=Math.floor(b/W);return a<=b?[[r0,r1]]:[[r0,t.rows-1],[0,r1]];}
  particlePass(p,ranges){const gl=this.gl;for(const [r0,r1] of ranges){gl.viewport(0,r0,PARTICLE_ROW,r1-r0+1);this.full(p);}}
@@ -2072,8 +2095,9 @@ class Game{
  addParticle(x,z,opt={}){if(!C.particles||this.particles.length>=C.particleLimit)return null;if(!opt.cpu&&this.renderer?.particleActive?.()){this.spawnGPU(x,z,opt);return null;}const p=this.pool.pop()||{},life=opt.life??1.8;
   p.contactDrop=false;p.castX=p.castY=p.castZ=undefined;p.x=x;p.z=z;p.y=opt.y??(opt.foam?this.water.level+.07:this.water.fastSurface(x,z)+.07);p.vx=opt.vx||0;p.vz=opt.vz||0;p.vy=opt.vy||0;p.foam=!!opt.foam;p.bubble=!!opt.bubble;p.size=opt.size||.07;p.impulseScale=opt.impulseScale??1;p.life=p.maxLife=life;p.age=0;p.tick=this.sprayCursor++%4;this.particles.push(p);return p;
  }
- // CPU particles plus the GPU slots that can be alive (an upper bound) and the spawns not yet sent.
- particleCount(){const g=this.renderer?.particleActive?.()?this.renderer.gpuPool:null;return this.particles.length+(g?g.windowCount()+g.pending():0);}
+ // CPU particles, the GPU's last live count (or, before one arrives, the slots that can be alive)
+ // and the spawns not yet sent. Reports only.
+ particleCount(){const r=this.renderer,g=r?.particleActive?.()?r.gpuPool:null;return this.particles.length+(g?(r.gpuCount?.generation===g.generation?r.gpuCount.total:g.windowCount())+g.pending():0);}
  // GPU path: the same spawn values as the CPU path, written as a spawn row. The water never reads
  // GPU state, so every third drop's landing ripple (the CPU path's tick%12 share) is predicted here.
  spawnGPU(x,z,opt){const life=opt.life??1.8,kind=opt.foam?1:opt.bubble?2:0,y=opt.y??(opt.foam?this.water.level+.07:this.water.fastSurface(x,z)+.07),vx=opt.vx||0,vy=opt.vy||0,vz=opt.vz||0,n=this.sprayCursor++;
