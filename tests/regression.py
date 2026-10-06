@@ -265,6 +265,25 @@ async def main(args):
     const ok=on.hash===off.hash&&on.breakerMist>0&&on.slam>0&&on.k[3]>0&&off.k[3]===0&&off.slam===0&&on.clear>0&&gl.getError()===0;
     return {ok,sameState:on.hash===off.hash,on:{breakerMist:on.breakerMist,slam:on.slam,kinds:on.k,clear:on.clear},off:{kinds:off.k},report:r.surfaceReport().gpuParticles};
    }finally{Object.assign(C,saved);D.storm.sync();pool.reset();}''')
+  # Bow spray: the boat is posed, not stepped, and bowSpray runs directly; spawns are read from the GPU spawn rows.
+  await check('Bow spray: a flare sheet when pushing, a burst and mist on a slam, nothing at rest', '''const saved={...C},pool=r.gpuPool;let b=g.boat,pose={...b};
+   const spawned=from=>{const out=[];for(let i=from;i<pool.head;i++){const o=(i%pool.cap)*12,a=pool.staging;out.push({x:a[o],y:a[o+1],z:a[o+2],vx:a[o+4],vy:a[o+5],vz:a[o+6],kind:Math.round(a[o+7])&3});}return out;};
+   try{l.resultHeld=false;D.chooseWorld(1);l.resultHeld=true;Object.assign(C,{waveScale:0,waves:false,spectral:false,fftHeight:0,rogueEnabled:false,coastalWaves:false,wallIncident:0,ripples:false,simulation:false,renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,gpuParticles:true,mist:true,mistDensity:1,bowSpray:true,contactSplashes:true});D.storm.sync();D.spectrum.sync(w.time,true);r.render(g,0);
+    if(!r.particleActive())return {ok:false,error:'GPU particles inactive'};
+    // A world change replaces the boat and the contact solver. Float the boat at rest, heading -z (yaw 0: the bow is local -z).
+    const P=g.physics;b=g.boat;pose={...b};
+    Object.assign(b,{yaw:0,pitch:0,roll:0,vx:0,vy:0,vz:0,yawV:0,pitchV:0,rollV:0});b.y=w.surface(b.x,b.z)+.06;g.particles.length=0;pool.reset();
+    const run=(n,set)=>{Object.assign(b,set);const st=P.state(b);st.bow=undefined;const head=pool.head,d0=P.stats.bowDrops,s0=P.stats.bowSlams;for(let i=0;i<n;i++)P.bowSpray(D.DT);return {drops:P.stats.bowDrops-d0,slams:P.stats.bowSlams-s0,spawns:spawned(head)};};
+    const rest=run(30,{vx:0,vz:0,vy:0}),astern=run(30,{vz:4}),ahead=run(30,{vz:-4}),hard=run(30,{vz:-12});
+    // Slam: the corners were above the water a step ago and the bow drops at 3 m/s.
+    const restY=b.y;Object.assign(b,{vz:0,vy:-3,y:restY-.12});const st=P.state(b);st.bow={clock:[0,0],depth:[-.1,-.1],cool:[0,0]};const head=pool.head,d0=P.stats.bowDrops,s0=P.stats.bowSlams;P.bowSpray(D.DT);const slam={drops:P.stats.bowDrops-d0,slams:P.stats.bowSlams-s0,spawns:spawned(head)};
+    b.y=restY;C.bowSpray=false;const off=run(30,{vy:0,vz:-4});C.bowSpray=true;
+    // Sheet drops start on the forward flare, both sides, and leave outward and upward relative to the hull.
+    const drops=ahead.spawns.filter(p=>p.kind===0),fwd=drops.every(p=>p.z-b.z<-.15&&Math.abs(p.x-b.x)<.6),sides=drops.some(p=>p.x<b.x)&&drops.some(p=>p.x>b.x),out=drops.every(p=>(p.vx)*Math.sign(p.x-b.x)>-.3&&p.vy>0);
+    const cap=Math.max(1,C.contactSprayBurst>>2),ok=rest.drops===0&&astern.drops===0&&ahead.drops>0&&fwd&&sides&&out&&hard.drops>ahead.drops&&hard.drops<=30*2*cap
+     &&slam.slams===2&&slam.drops>=2*Math.min(C.contactSprayBurst,20)&&slam.spawns.some(p=>p.kind===3)&&off.drops===0&&r.gl.getError()===0;
+    return {ok,rest:rest.drops,astern:astern.drops,ahead:ahead.drops,hard:hard.drops,cap:30*2*cap,slam:{drops:slam.drops,slams:slam.slams,mist:slam.spawns.filter(p=>p.kind===3).length},off:off.drops,fwd,sides,out};
+   }finally{Object.assign(b,pose);Object.assign(C,saved);D.storm.sync();pool.reset();g.particles.length=0;}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

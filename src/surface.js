@@ -6,7 +6,7 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles','sprayStretch','mist'];
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles','sprayStretch','mist','bowSpray'];
 PASS_NAMES.push('wetHistory','particleSim');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU','particleSim');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
