@@ -144,6 +144,22 @@ async def main(args):
     const shaded=light(d[0]/l,d[2]/l);
     return {ok:toward>1.5*away&&shaded<.8*open&&gl.getError()===0,toward,away,open,shaded};
    }finally{r.updateShadow=orig;g.particles.length=0;g.particles.push(...parts);Object.assign(C,saved);D.storm.sync();}''')
+  # M6: lighter hull damping lets a displaced boat ring a few times; interpolation is render-only.
+  await check('A 0.3 m heave offset rings 2-4 times, then settles', '''const saved={...C};try{D.chooseWorld(1);Object.assign(C,{waveScale:0,waves:false,spectral:false,fftHeight:0,rogueEnabled:false,coastalWaves:false,wallIncident:0,ripples:false,hullPressure:false,simulation:false,dayCycle:false,sprayRate:0});D.storm.sync();D.spectrum.sync(w.time,true);
+   const b=g.boat;b.x=0;b.z=5;b.vx=b.vz=0;for(let i=0;i<900;i++)g.step(D.DT);const eq=b.y;b.y-=.3;b.vy=0;const xs=[];for(let i=0;i<720;i++){g.step(D.DT);xs.push(b.y-eq);}
+   const peaks=[];for(let i=1;i<xs.length-1;i++)if(Math.abs(xs[i])>Math.abs(xs[i-1])&&Math.abs(xs[i])>=Math.abs(xs[i+1])&&Math.abs(xs[i])>.005)peaks.push(+xs[i].toFixed(4));
+   return {ok:peaks.length>=2&&peaks.length<=4&&Math.abs(xs[xs.length-1])<.005,oscillations:peaks.length,peaks,final:xs[xs.length-1],damping:C.bodyDamping,angularDrag:C.bodyAngularDrag};
+  }finally{Object.assign(C,saved);D.chooseWorld(saved.environment,false);Object.assign(C,saved);D.storm.sync();}''')
+  await check('Render interpolation never changes the simulated state', '''const saved={...C},render=r.render;try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,renderInterpolation:true,cameraMode:1,cameraFollow:1});D.storm.sync();l.resultHeld=false;g.paused=false;
+   const hash=()=>JSON.stringify([g.boat.x,g.boat.y,g.boat.z,g.boat.vx,g.boat.vy,g.boat.vz,g.boat.yaw,g.boat.pitch,g.boat.roll,w.time,w.h.reduce((a,b)=>a+b,0),...(g.rescue?[g.rescue.target.x,g.rescue.target.y,g.rescue.target.yaw]:[])]);
+   const drawn=[],raw=[];let acc=0,changed=0,blended=0;r.render=function(game,dt){drawn.push(game.boat.x);if(this.renderTime!==undefined&&this.renderTime<w.time)blended++;return render.call(this,game,dt);};
+   g.boat.vx=2.5;g.boat.vz=0;
+   // A 45 Hz frame clock over 60 Hz physics: one or two steps per frame.
+   for(let f=0;f<36;f++){acc+=1/45;while(acc+1e-9>=D.DT){g.step(D.DT);acc=Math.max(0,acc-D.DT);}raw.push(g.boat.x);const before=hash();D.renderInterpolated(g,acc/D.DT,()=>r.render(g,1/45));if(hash()!==before)changed++;}
+   // Mean absolute second difference: the frame-to-frame jerk of the drawn position.
+   const spread=a=>{let t=0;for(let i=2;i<a.length;i++)t+=Math.abs(a[i]-2*a[i-1]+a[i-2]);return t/(a.length-2);};
+   return {ok:changed===0&&blended>20&&spread(drawn)<.5*spread(raw),changed,blended,drawnJerk:spread(drawn),rawJerk:spread(raw)};
+  }finally{r.render=render;l.resultHeld=true;Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

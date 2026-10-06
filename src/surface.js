@@ -145,6 +145,27 @@ Renderer.prototype.bindWakeSources=function(p,game){
  const gl=this.gl;gl.uniform4fv(p.name('uWakeSegment[0]'),data);gl.uniform4fv(p.name('uWakeInfo[0]'),info);
 };
 
+/* Render interpolation (10.2). Each fixed step records the poses it starts from. A frame
+   blends the previous and current poses by alpha=accumulator/DT and draws the analytic waves
+   at the matching time, water.time-(1-alpha)·DT. Poses are put back after the frame, so
+   nothing here feeds the simulation, benchmark hashes or water.time. */
+const POSE_KEYS=['x','y','z','yaw','pitch','roll'];
+function poseBodies(g){return g.rescue?[g.boat,g.rescue.target,...g.rescue.objects]:[g.boat];}
+const interpolationStep=Game.prototype.step;
+Game.prototype.step=function(dt){for(const b of poseBodies(this)){const p=b.renderPrev||(b.renderPrev={});for(const k of POSE_KEYS)p[k]=b[k];}this.renderPrevTime=this.water.time;return interpolationStep.call(this,dt);};
+function interpolationOn(g){return !!C.renderInterpolation&&!g.paused&&!lab.bench.active&&!lab.resultHeld&&!contactStudySaved;}
+function shortTurn(a,b){let d=(b-a)%TAU;if(d>Math.PI)d-=TAU;else if(d<-Math.PI)d+=TAU;return d;}
+function renderInterpolated(g,alpha,draw){
+ const w=g.water;renderer.renderTime=undefined;
+ // Only between two consecutive steps: a reset, pause or skipped step draws the current state.
+ if(!interpolationOn(g)||!(alpha>=0&&alpha<1)||Math.abs(w.time-(g.renderPrevTime??-1e9)-DT)>1e-6)return draw();
+ const saved=[];
+ for(const b of poseBodies(g)){const p=b.renderPrev;if(!p||Math.hypot(b.x-p.x,b.y-p.y,b.z-p.z)>3)continue;saved.push([b,POSE_KEYS.map(k=>b[k])]);
+  for(const k of ['x','y','z'])b[k]=p[k]+(b[k]-p[k])*alpha;for(const k of ['yaw','pitch','roll'])b[k]=p[k]+shortTurn(p[k],b[k])*alpha;}
+ renderer.renderTime=w.time-(1-alpha)*DT;
+ try{return draw();}finally{for(const [b,v] of saved)POSE_KEYS.forEach((k,i)=>b[k]=v[i]);renderer.renderTime=undefined;}
+}
+
 /* Reports include the small additional allocations, not invented GPU memory. */
 const surfaceMemory=Profiler.prototype.memory;
 Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=0;
@@ -153,7 +174,7 @@ Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=
  const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0);
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;
