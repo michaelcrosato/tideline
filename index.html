@@ -2423,14 +2423,14 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    if(n>0){const a=pool.staging,first=pool.sent%t.cap,last=(due-1)%t.cap,put=(r0,r1)=>gl.texSubImage2D(gl.TEXTURE_2D,0,0,r0,W*3,r1-r0+1,gl.RGBA,gl.FLOAT,a,r0*W*12);
     for(let i=pool.sent;i<due;i++){const k=i%t.cap;a[k*12+8]=Math.max(0,T-pool.birth[k]);}
     this.texAt(t.spawn,18);if(n>=t.cap)put(0,t.rows-1);else if(first<=last)put(Math.floor(first/W),Math.floor(last/W));else{put(Math.floor(first/W),t.rows-1);put(0,Math.floor(last/W));}}
-   const src=t.state[t.read],p=this.particleSimProgram;gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[1-t.read].fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);
-   for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uSpawn',t.spawn,18],['uBed',this.bedTex,19]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+   const src=t.state[t.read],p=this.particleSimProgram;gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[1-t.read].fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+   this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uSpawn',t.spawn,18],['uBed',this.bedTex,19]]);
    gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uSpawnFirst'),pool.sent%t.cap);gl.uniform1i(p.name('uSpawnCount'),n);gl.uniform1f(p.name('uStep'),dt);gl.uniform1f(p.name('uFoamLife'),C.foamLife);gl.uniform1f(p.name('uGravity'),C.sprayGravity);gl.uniform1f(p.name('uBubbleRise'),C.bubbleRise);gl.uniform2f(p.name('uWind'),storm.table[0]*C.sprayWind,storm.table[1]*C.sprayWind);
    this.particlePass(p,this.particleRows(t,pool.tail,due));t.read=1-t.read;pool.sent=due;}
   this.particleTime=Math.max(this.particleTime,T);pool.advance(this.particleTime);
   const count=pool.windowCount(),motes=this.underwater?Math.min(Math.max(0,Math.round(C.underParticles)),t.motes*W):0;
-  if(count+motes>0){const p=this.particlePrepProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);
-   for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+  if(count+motes>0){const p=this.particlePrepProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+   this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19]]);gl.uniform3fv(p.name('uEye'),this.eye);gl.uniform1f(p.name('uUnder'),this.underwater&&!this.capturingAir?1:0);
    gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uMotes'),motes);gl.uniform1f(p.name('uParticleSize'),C.particleSize);gl.uniform1f(p.name('uUnderAlpha'),C.underAlpha);gl.uniform1f(p.name('uUnderSize'),C.underSize);this.particlePass(p,[...this.particleRows(t,pool.tail,pool.sent),...(motes?[[t.rows,t.rows+Math.ceil(motes/W)-1]]:[])]);}
   this.particleDraw=count;this.particleMotes=motes;this.countParticles(t);gl.enable(gl.DEPTH_TEST);
  }
@@ -2441,16 +2441,21 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    if(this.countGeneration===pool.generation)this.gpuCount={spray:k[0],foam:k[1],bubble:k[2],total:k[3],generation:pool.generation};}
   const now=performance.now();if(this.countSync||now-(this.countAt??-1e9)<500)return;this.countAt=now;this.countGeneration=pool.generation;
   if(!pool.windowCount()){this.gpuCount={spray:0,foam:0,bubble:0,total:0,generation:pool.generation};return;}
-  const p=this.particleCountProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.count.fbo);gl.viewport(0,0,1,t.rows);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.useProgram(p.p);
-  for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+  const p=this.particleCountProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.count.fbo);gl.viewport(0,0,1,t.rows);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+  this.particleUse(p,[['uState0',src.colors[0],16],['uState1',src.colors[1],17]]);
   gl.uniform1i(p.name('uFirst'),pool.tail%t.cap);gl.uniform1i(p.name('uCount'),pool.windowCount());gl.uniform1i(p.name('uCap'),t.cap);this.full(p);
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER,t.count.buffer);gl.readPixels(0,0,1,t.rows,gl.RGBA,gl.FLOAT,0);gl.bindBuffer(gl.PIXEL_PACK_BUFFER,null);this.countSync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);}
+ // Particle programs bind only the shared maps their shaders read (a missing map falls back to the fluid
+ // map, as bindAbyss does) plus their own. Sampler units never change, so they are set once per program.
+ particleUse(p,maps){const gl=this.gl;gl.useProgram(p.p);this.syncFrame();
+  const all=[['uFluid',this.fluidTex,0],['uSpectrum',this.spectrumTex,6],['uCache0',this.cacheTargets?.colors[0],7],['uCache1',this.cacheTargets?.colors[1],8],['uCache2',this.cacheTargets?.colors[2],9],['uShadowMap',this.shadowTarget?.depth,10],['uFocusMap',this.focusTarget?.color,11],['uSkyMap',this.skyLUT?.color,12],['uLampShadow',this.lampShadow?.depth,13],['uSkyAmbient',this.skyAmbient?.color,14],...maps];
+  if(!p.unitsSet){for(const [name,,unit] of all){const loc=p.name(name);if(loc!==null)gl.uniform1i(loc,unit);}p.unitsSet=true;}
+  for(const [name,tex,unit] of all)if(p.name(name)!==null)this.texAt(tex||this.fluidTex,unit);}
  // Rows holding ring positions [from, to): one range, two when the interval wraps, all rows when full.
  particleRows(t,from,to){const W=PARTICLE_ROW;if(to<=from)return [];if(to-from>=t.cap)return [[0,t.rows-1]];const a=from%t.cap,b=(to-1)%t.cap,r0=Math.floor(a/W),r1=Math.floor(b/W);return a<=b?[[r0,r1]]:[[r0,t.rows-1],[0,r1]];}
  particlePass(p,ranges){const gl=this.gl;for(const [r0,r1] of ranges){gl.viewport(0,r0,PARTICLE_ROW,r1-r0+1);this.full(p);}}
- drawParticleSprites(){const n=this.particleDraw+this.particleMotes,t=this.particleTargets;if(!n||!t)return;const gl=this.gl,p=this.particleDrawProgram;gl.useProgram(p.p);
+ drawParticleSprites(){const n=this.particleDraw+this.particleMotes,t=this.particleTargets;if(!n||!t)return;const gl=this.gl,p=this.particleDrawProgram;this.particleUse(p,[['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uSoftDepth',this.scene.depth,3]]);
   gl.uniformMatrix4fv(p.name('uVP'),false,this.vp);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1i(p.name('uFirst'),this.gpuPool.tail%t.cap);gl.uniform1i(p.name('uCount'),this.particleDraw);gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uRows'),t.rows);
-  for(const [name,tex,unit] of [['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uSoftDepth',this.scene.depth,3]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
   gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.bindVertexArray(this.copyVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
   gl.drawArrays(gl.TRIANGLES,0,6*n);profiler?.draw(0,n);gl.depthMask(true);gl.disable(gl.BLEND);}
  project(x,y,z){const p=Mat.transform(this.vp,[x,y,z]);return{x:(p[0]*.5+.5)*innerWidth,y:(-.5*p[1]+.5)*innerHeight,z:p[2],visible:p[2]>-1&&p[2]<1};}
