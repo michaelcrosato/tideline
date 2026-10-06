@@ -122,7 +122,7 @@ async def main(args):
     return {ok:changed>50&&gl.getError()===0&&k2.every(x=>x>0&&isFinite(x))&&tableOk&&f[off0[1]]===1&&diff.length===D.upgradeFeatures.length&&diff.every(k=>D.upgradeFeatures.includes(k)),changedPixels:changed,k2,table:table.map(x=>+x.toFixed(4)),tableOk,diff};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
   # M4 reef: CPU and GPU breaker agree across the basin edge, with no step and no trough ridge.
-  await check('Reef breaker matches on CPU and GPU across the basin edge', '''const saved={...C};try{Object.assign(C,{environment:3,coastalWaves:true,waves:true,renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0});if(D.water.worldId!==3)D.chooseWorld(3,false);D.storm.sync();r.render(g,0);
+  await check('Reef breaker matches on CPU and GPU across the basin edge', '''const saved={...C};try{Object.assign(C,{environment:3,coastalWaves:true,waves:true,renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0});if(D.water.worldId!==3){l.resultHeld=false;D.chooseWorld(3,false);l.resultHeld=true;}D.storm.sync();r.render(g,0);
    const zb=x=>-5.8+.038*x*x+.6,pts=[[-25.9,zb(25.9)],[25.9,zb(25.9)],[-26.1,zb(26.1)],[26.1,zb(26.1)],[0,-5.8],[9,-2.2],[5.1,5.2],[-5.3,4.9]];
    const gpu=r.probeCoast(pts),t=w.time,cpu=pts.map(([x,z])=>Array.from(D.coastalSample(x,z,t,w.bilerp(w.h,x,z)).slice(2,6)));
    let worst=0;for(let i=0;i<pts.length;i++)for(let k=0;k<4;k++)worst=Math.max(worst,Math.abs(gpu[i][k]-cpu[i][k])/(1+Math.abs(cpu[i][k])));
@@ -145,11 +145,11 @@ async def main(args):
     return {ok:toward>1.5*away&&shaded<.8*open&&gl.getError()===0,toward,away,open,shaded};
    }finally{r.updateShadow=orig;g.particles.length=0;g.particles.push(...parts);Object.assign(C,saved);D.storm.sync();}''')
   # M6: lighter hull damping lets a displaced boat ring a few times; interpolation is render-only.
-  await check('A 0.3 m heave offset rings 2-4 times, then settles', '''const saved={...C};try{D.chooseWorld(1);Object.assign(C,{waveScale:0,waves:false,spectral:false,fftHeight:0,rogueEnabled:false,coastalWaves:false,wallIncident:0,ripples:false,hullPressure:false,simulation:false,dayCycle:false,sprayRate:0});D.storm.sync();D.spectrum.sync(w.time,true);
+  await check('A 0.3 m heave offset rings 2-4 times, then settles', '''const saved={...C};try{l.resultHeld=false;const moved=D.chooseWorld(1);l.resultHeld=true;if(!moved||w.worldId!==1)return {ok:false,error:'world 1 not selected'};Object.assign(C,{waveScale:0,waves:false,spectral:false,fftHeight:0,rogueEnabled:false,coastalWaves:false,wallIncident:0,ripples:false,hullPressure:false,simulation:false,dayCycle:false,sprayRate:0});D.storm.sync();D.spectrum.sync(w.time,true);
    const b=g.boat;b.x=0;b.z=5;b.vx=b.vz=0;for(let i=0;i<900;i++)g.step(D.DT);const eq=b.y;b.y-=.3;b.vy=0;const xs=[];for(let i=0;i<720;i++){g.step(D.DT);xs.push(b.y-eq);}
    const peaks=[];for(let i=1;i<xs.length-1;i++)if(Math.abs(xs[i])>Math.abs(xs[i-1])&&Math.abs(xs[i])>=Math.abs(xs[i+1])&&Math.abs(xs[i])>.005)peaks.push(+xs[i].toFixed(4));
    return {ok:peaks.length>=2&&peaks.length<=4&&Math.abs(xs[xs.length-1])<.005,oscillations:peaks.length,peaks,final:xs[xs.length-1],damping:C.bodyDamping,angularDrag:C.bodyAngularDrag};
-  }finally{Object.assign(C,saved);D.chooseWorld(saved.environment,false);Object.assign(C,saved);D.storm.sync();}''')
+  }finally{Object.assign(C,saved);l.resultHeld=false;D.chooseWorld(saved.environment,false);l.resultHeld=true;Object.assign(C,saved);D.storm.sync();}''')
   await check('Render interpolation never changes the simulated state', '''const saved={...C},render=r.render;try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,renderInterpolation:true,cameraMode:1,cameraFollow:1});D.storm.sync();l.resultHeld=false;g.paused=false;
    const hash=()=>JSON.stringify([g.boat.x,g.boat.y,g.boat.z,g.boat.vx,g.boat.vy,g.boat.vz,g.boat.yaw,g.boat.pitch,g.boat.roll,w.time,w.h.reduce((a,b)=>a+b,0),...(g.rescue?[g.rescue.target.x,g.rescue.target.y,g.rescue.target.yaw]:[])]);
    const drawn=[],raw=[];let acc=0,changed=0,blended=0;r.render=function(game,dt){drawn.push(game.boat.x);if(this.renderTime!==undefined&&this.renderTime<w.time)blended++;return render.call(this,game,dt);};
@@ -160,6 +160,16 @@ async def main(args):
    const spread=a=>{let t=0;for(let i=2;i<a.length;i++)t+=Math.abs(a[i]-2*a[i-1]+a[i-2]);return t/(a.length-2);};
    return {ok:changed===0&&blended>20&&spread(drawn)<.5*spread(raw),changed,blended,drawnJerk:spread(drawn),rawJerk:spread(raw)};
   }finally{r.render=render;l.resultHeld=true;Object.assign(C,saved);D.storm.sync();}''')
+  # M7: baked occlusion is sane; hemispheric ambient and both tone curves render and change the image.
+  await check('Baked AO, sky ambient and both tone curves', '''const saved={...C},gl=r.gl;
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   const diff=(a,b)=>{let n=0;for(let i=0;i<a.length;i+=4)if(Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2])>3)n++;return n;};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,dayHour:15,timeLighting:true,skyCache:true});D.storm.sync();
+    const stats=m=>{const a=m.ao;let lo=1,sum=0,dark=0;for(const v of a){lo=Math.min(lo,v);sum+=v;if(v<.7)dark++;}return {n:a.length,min:+lo.toFixed(3),mean:+(sum/a.length).toFixed(3),dark};},land=stats(r.land),props=stats(r.props);
+    const base=grab();C.vertexAO=false;const noAO=grab();C.vertexAO=true;C.hemiAmbient=false;const flat=grab();C.hemiAmbient=true;C.tonemap=1;const agx=grab();C.tonemap=0;
+    const ok=land.n===r.land.count&&props.n===r.props.count&&land.min>=.15&&props.mean<.97&&props.dark>0&&diff(base,noAO)>50&&diff(base,flat)>50&&diff(base,agx)>200&&gl.getError()===0;
+    return {ok,land,props,aoPixels:diff(base,noAO),ambientPixels:diff(base,flat),tonePixels:diff(base,agx)};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

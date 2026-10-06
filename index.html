@@ -693,6 +693,8 @@ num('Caustics and light','sunY','Sun direction Y',.48,.05,1,.01);
 num('Caustics and light','sunZ','Sun direction Z',.26,-1,1,.01);
 num('Caustics and light','sunStrength','Direct light strength',1.65,0,6,.05);
 num('Caustics and light','ambientStrength','Ambient light strength',.85,.1,3,.05);
+flag('Caustics and light','hemiAmbient','Sky and ground ambient',true,'Ambient light takes its colour and direction from the cached sky: brighter from above, a darker ground bounce from below. Needs the sky cache.');
+flag('Caustics and light','vertexAO','Baked ambient occlusion',true,'Per-vertex occlusion from the bed and prop shapes, baked once per scene. Darkens ambient light only.');
 num('Caustics and light','fogDensity','Air haze density',.006,0,.05,.001);
 num('Underwater','underDensity','Underwater absorption multiplier',1,0,4,.05);
 num('Underwater','underR','Underwater red absorption',.23,0,1,.005);
@@ -858,6 +860,7 @@ num('Spray optics','bubbleCount','Bubbles per hull impact',180,0,1000,20);
 num('Spray optics','bubbleRise','Bubble rise speed (m/s)',.7,.1,2,.05);
 flag('Final image','aa','Edge anti-aliasing',true,'Spatial edge filter. No temporal ghosting or hidden resolution change.');
 num('Final image','aaStrength','Edge filter strength',.65,0,1,.05);
+num('Final image','tonemap','Tone curve: 0 ACES / 1 AgX-style',0,0,1,1,'AgX-style has a gentler highlight shoulder and keeps bright colours from skewing. Same cost.');
 num('Benchmark analysis','minGPUSamples','Minimum GPU samples per segment',80,20,500,10);
 num('Benchmark analysis','repeatTolerance','Allowed repeat variation (%)',15,5,40,1);
 num('Benchmark analysis','stutterFactor','Slow-frame median multiplier',2.0,1.5,4,.1);
@@ -1385,6 +1388,31 @@ class Builder{
  rock(x,y,z,sx,sy,sz,col){this.solids.push({type:'rock',x,y,z,rx:sx,hy:sy,rz:sz});let rings=5,seg=9,p=[];for(let j=0;j<=rings;j++){let a=j/rings*Math.PI;for(let i=0;i<seg;i++){let t=i/seg*TAU,r=(j===0||j===rings)?1:.86+rand()*.26;p.push([x+Math.sin(a)*Math.cos(t)*sx*r,y+Math.cos(a)*sy,z+Math.sin(a)*Math.sin(t)*sz*r]);}}for(let j=0;j<rings;j++)for(let i=0;i<seg;i++){let a=j*seg+i,b=j*seg+(i+1)%seg,c=(j+1)*seg+i,d=(j+1)*seg+(i+1)%seg;this.tri(p[a],p[b],p[c],col);this.tri(p[b],p[d],p[c],col);}}
  tree(x,y,z,s=1){this.cylinder(x,y,z,.07*s,.04*s,1.1*s,[.32,.29,.19],7);this.cylinder(x,y+.55*s,z,.66*s,0,1.65*s,[.28,.42,.29],8);this.cylinder(x,y+1.1*s,z,.5*s,0,1.4*s,[.36,.49,.31],8);this.cylinder(x,y+1.68*s,z,.31*s,0,.92*s,[.46,.56,.34],8);}
 }
+/* Ambient occlusion baked once per world mesh (10.2). Each unique vertex sends 8 rays over its
+   normal hemisphere, 4 samples out to 1.5 m, against the bed and the props' collision shapes
+   (boxes, cylinders, rocks), found through a 2 m grid. The result is a vertex attribute. */
+function bakeVertexAO(builder,water,solids){
+ const v=builder.v,count=v.length/9,ao=new Float32Array(count),memo=new Map(),grid=new Map(),cell=2,key=(i,j)=>(i+512)*1024+j+512;
+ for(const s of solids){const r=s.type==='box'?Math.hypot(s.hx,s.hz):s.type==='rock'?Math.max(s.rx,s.rz):s.r;
+  for(let i=Math.floor((s.x-r)/cell);i<=Math.floor((s.x+r)/cell);i++)for(let j=Math.floor((s.z-r)/cell);j<=Math.floor((s.z+r)/cell);j++){const k=key(i,j);if(!grid.has(k))grid.set(k,[]);grid.get(k).push(s);}}
+ const inside=(s,x,y,z)=>{const dx=x-s.x,dy=y-s.y,dz=z-s.z;
+  if(s.type==='box'){if(Math.abs(dy)>s.hy)return false;const c=Math.cos(s.yaw||0),n=Math.sin(s.yaw||0);return Math.abs(c*dx-n*dz)<s.hx&&Math.abs(n*dx+c*dz)<s.hz;}
+  // Rock vertices are jittered to 0.86-1.12 of the proxy radius; test a 0.8 core so a rock does not occlude itself.
+  if(s.type==='rock')return (dx/s.rx)**2+(dy/s.hy)**2+(dz/s.rz)**2<.64;
+  if(Math.abs(dy)>s.hy)return false;const r=lerp(s.rBottom??s.r,s.rTop??s.r,(dy+s.hy)/(2*s.hy||1));return dx*dx+dz*dz<r*r;};
+ const blocked=(x,y,z)=>{if(y<water.bilerp(water.bed,x,z)-.02)return true;const list=grid.get(key(Math.floor(x/cell),Math.floor(z/cell)));if(list)for(const s of list)if(inside(s,x,y,z))return true;return false;};
+ const dirs=[];for(let k=0;k<8;k++){const a=k*Math.PI/4+(k&1)*.39,e=k&1?.55:1.05;dirs.push([Math.cos(a)*Math.cos(e),Math.sin(e),Math.sin(a)*Math.cos(e)]);}
+ const steps=[.12,.35,.75,1.5];
+ for(let i=0;i<count;i++){const o=i*9,x=v[o],y=v[o+1],z=v[o+2],nx=v[o+3],ny=v[o+4],nz=v[o+5],id=[x,y,z].map(q=>Math.round(q*200)).join()+'/'+[nx,ny,nz].map(q=>Math.round(q*50)).join();
+  let a=memo.get(id);
+  if(a===undefined){// Tangent frame around the normal; rays start 2 cm off the surface.
+   const t=Math.abs(ny)<.9?norm(cross([0,1,0],[nx,ny,nz])):[1,0,0],b=cross([nx,ny,nz],t);let occ=0;
+   for(const d of dirs){const wx=t[0]*d[0]+nx*d[1]+b[0]*d[2],wy=t[1]*d[0]+ny*d[1]+b[1]*d[2],wz=t[2]*d[0]+nz*d[1]+b[2]*d[2];
+    for(const s of steps)if(blocked(x+nx*.02+wx*s,y+ny*.02+wy*s,z+nz*.02+wz*s)){occ+=1-s/2;break;}}
+   a=1-.85*occ/8;memo.set(id,a);}
+  ao[i]=a;}
+ builder.ao=ao;return builder;
+}
 function terrainGeometry(water){let b=new Builder(),pos=[],nor=[],cols=[];
  for(let j=0;j<N;j++)for(let i=0;i<N;i++){
   let k=j*N+i,x=i*DX-HALF,z=j*DX-HALF,y=water.bed[k];pos.push([x,y,z]);
@@ -1488,7 +1516,7 @@ const FRAME_FIELDS=[
  ['float','uSpectral uSpectrumAlpha uSpectrumN uSpectrumHeight uSpectrumShort uCacheN uShadowN uShadowSoft uShadowBias uShadowStrength uFocusStrength'],
  ['float','uDaylight uNightAmbient uStars uLocalOn uLocalSpec uBio uLampShadowN uLampBias'],
  ['float','uCoastOn uReefHeight uReefPeriod uReefSpeed uHarbourShelter uReefWidth uCoastPhase uFoamAging uFreshLife uWaveShadow uWaveShadowStrength'],
- ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle uFarSea uSprayLight'],
+ ['float','uNaturalFoam uFoamBreakup uWaveWetness uWetGloss uFilteredHighlights uHighlightVariance uPathWakes uPropWash uWaveReach uLightStyle uFarSea uSprayLight uHemiAmbient uVertexAO uTonemap'],
  ['vec4','uWave[30] uMode[30] uLampPos[8] uLampColor[8] uLampDir[8] uFarSeaTable[4]'],['mat4','uLampVP[2]'],
  ['vec3','uSun uAbsorb uBody uUnderAbsorb uHaze uSolar uMoon uSunTint'],
  // Switched by the preparation passes within a frame (frameFlags).
@@ -1635,14 +1663,24 @@ float filteredWaterRoughness(vec2 anchor,vec3 n,float r){
 `;
 
 const meshVS=`#version 300 es
-precision highp float;precision highp sampler2D;layout(location=0)in vec3 aPosition;layout(location=1)in vec3 aNormal;layout(location=2)in vec3 aColor;layout(location=3)in vec2 aWet;
-out vec2 vBodyWet;uniform mat4 uVP;uniform mat4 uModel;out vec3 vP;out vec3 vN;out vec3 vC;
-void main(){vec4 p=uModel*vec4(aPosition,1.);vP=p.xyz;vN=mat3(uModel)*aNormal;vC=aColor;vBodyWet=aWet;gl_Position=uVP*p;}`;
+${sharedGLSL}
+layout(location=0)in vec3 aPosition;layout(location=1)in vec3 aNormal;layout(location=2)in vec3 aColor;layout(location=3)in vec2 aWet;layout(location=4)in float aAO;
+uniform sampler2D uSkyAmbient;out vec2 vBodyWet;out float vAO;out vec3 vAmbient;uniform mat4 uVP;uniform mat4 uModel;out vec3 vP;out vec3 vN;out vec3 vC;
+// Hemispheric ambient, per vertex: the sky panorama averaged to 4x2 sectors gives the sky above
+// along the normal's azimuth and a darker ground bounce below. The panorama sets hue and direction;
+// the ambient control still sets the level (up-facing surfaces get 1.15x the old flat ambient).
+vec3 hemiAmbient(vec3 n){vec3 flat3=vec3(.33,.44,.55);if(uHemiAmbient<.5||uSkyCacheOn<.5)return flat3;
+ float x=(atan(n.z,n.x)/6.2831853+.5)*4.-.5,f=fract(x);int i=int(floor(x)),i0=(i+4)%4,i1=(i+5)%4;
+ vec3 sky=mix(texelFetch(uSkyAmbient,ivec2(i0,1),0).rgb,texelFetch(uSkyAmbient,ivec2(i1,1),0).rgb,f),low=mix(texelFetch(uSkyAmbient,ivec2(i0,0),0).rgb,texelFetch(uSkyAmbient,ivec2(i1,0),0).rgb,f);
+ vec3 up=.25*(texelFetch(uSkyAmbient,ivec2(0,1),0).rgb+texelFetch(uSkyAmbient,ivec2(1,1),0).rgb+texelFetch(uSkyAmbient,ivec2(2,1),0).rgb+texelFetch(uSkyAmbient,ivec2(3,1),0).rgb);
+ vec3 c=mix(low*vec3(.30,.27,.22),sky,smoothstep(-.85,.85,n.y));
+ return c*(1.15*dot(flat3,vec3(.2126,.7152,.0722))/max(dot(up,vec3(.2126,.7152,.0722)),1e-5));}
+void main(){vec4 p=uModel*vec4(aPosition,1.);vP=p.xyz;vN=mat3(uModel)*aNormal;vC=aColor;vBodyWet=aWet;vAO=aAO;vAmbient=hemiAmbient(normalize(vN));gl_Position=uVP*p;}`;
 const meshFS=`#version 300 es
 ${sharedGLSL}
 ${surfaceGLSL}
 uniform sampler2D uWet;uniform vec3 uEye,uEmissiveTint;uniform float uUnder,uReflect,uClipLevel,uGlow,uTerrain,uAirCapture,uObjectWet;
-in vec3 vP;in vec3 vN;in vec3 vC;in vec2 vBodyWet;out vec4 outColor;
+in vec3 vP;in vec3 vN;in vec3 vC;in vec2 vBodyWet;in float vAO;in vec3 vAmbient;out vec4 outColor;
 void main(){vec4 f=fluid(vP.xz);float surface=f.x;
  // Waves cannot reach scenery farther than uWaveReach from the local water level.
  if((uWaveWetness>.5||uAirCapture>.5)&&abs(vP.y-f.x)<uWaveReach)surface=surfaceWorld(vP.xz+normalize(vN).xz*.20).y;
@@ -1664,7 +1702,8 @@ void main(){vec4 f=fluid(vP.xz);float surface=f.x;
  vec3 albedo=pow(vC,vec3(2.2));
  if(uWaveWetness>.5)albedo*=1.-(.24*damp+.10*film);
  else if(uTerrain>.5)albedo*=1.-uWetStrength*wet;
- vec3 col=albedo*(vec3(.33,.44,.55)*uAmbient+uSunTint*nl*uSunStrength+localDiffuse(vP,n));
+ float ao=mix(1.,clamp(vAO,0.,1.),uVertexAO);
+ vec3 col=albedo*(vAmbient*uAmbient*ao+uSunTint*nl*uSunStrength+localDiffuse(vP,n)*mix(1.,ao,.5));
  if(depth>.025&&uCaustics>.5){vec2 p=vP.xz-sun.xz*depth/max(.1,sun.y);float ca=uFocusOn>.5&&all(lessThan(abs(vP.xz),vec2(25.8)))?texture(uFocusMap,(vP.xz+26.)/52.).r*uFocusStrength:causticNet(p)+.38*causticNet(p*1.62+3.);col+=vec3(.12,.30,.27)*ca*uCausticStrength*exp(-depth*.10)*max(.06,n.y)*shadow;}
  if(uTerrain>.5)col*=.87+noise(vP.xz*8.+vP.y*.4)*.19;
  // Restrained clear-film highlights. Emissive lamp geometry is not made brighter.
@@ -1848,6 +1887,13 @@ const postFS=`#version 300 es
 ${sharedGLSL}
 in vec2 vUV;uniform sampler2D uColor,uDepth,uBloom,uLightVolume;uniform float uVolumeOn;uniform vec2 uVolumeSize;uniform mat4 uInverseVP;uniform vec3 uEye;uniform vec2 uResolution;uniform float uUnder,uBloomStrength,uExposure,uLens,uRays,uRayStrength,uAA,uAAStrength;uniform int uRaySteps;out vec4 outColor;
 vec3 filmic(vec3 x){return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0.,1.);}
+// AgX-style curve: log2 encoding, a sigmoid fit and the AgX inset/outset matrices. Returns linear display light.
+vec3 agx(vec3 c){const mat3 inset=mat3(.842479062253094,.0423282422610123,.0423756549057051,.0784335999999992,.878468636469772,.0784336,.0792237451477643,.0791661274605434,.879142973793104);
+ const mat3 outset=mat3(1.19687900512017,-.0528968517574562,-.0529716355144438,-.0980208811401368,1.15190312990417,-.0980434501171241,-.0990297440797205,-.0989611768448433,1.15107367264116);
+ c=clamp((log2(max(inset*c,vec3(1e-10)))+12.47393)/16.5,0.,1.);vec3 x2=c*c,x4=x2*x2;c=15.5*x4*x2-40.14*x4*c+31.96*x4-6.868*x2*c+.4298*x2+.1191*c-.00232;
+ return pow(clamp(outset*c,0.,1.),vec3(2.2));}
+// Exact sRGB transfer, not a plain 2.2 power.
+vec3 srgbEncode(vec3 c){c=clamp(c,0.,1.);return mix(c*12.92,1.055*pow(c,vec3(1./2.4))-.055,step(.0031308,c));}
 void main(){vec2 uv=vUV,offset=vec2(0.);float lensHighlight=0.;if(uLens>.015){for(int i=0;i<14;i++){float a=float(i),start=hash(vec2(a,7.)),r=.012+hash(vec2(a,3.))*.023;vec2 center=vec2(hash(vec2(a,13.)),fract(start-uTime*.024));vec2 p=(uv-center)*vec2(uResolution.x/uResolution.y,1.);float d=length(p)/r,mask=1.-smoothstep(.65,1.,d);offset+=p*mask*uLens*.55;lensHighlight+=mask*max(0.,p.y/r)*.07*uLens;}}
  if(uUnder>.5)offset+=vec2(sin(uv.y*22.+uTime*1.3),sin(uv.x*21.-uTime*.8))*.0018;uv=clamp(uv+offset,vec2(.001),vec2(.999));vec3 color=texture(uColor,uv).rgb;
  if(uAA>.5){vec2 pixel=1./uResolution;vec3 left=texture(uColor,uv-vec2(pixel.x,0)).rgb,right=texture(uColor,uv+vec2(pixel.x,0)).rgb,up=texture(uColor,uv+vec2(0,pixel.y)).rgb,down=texture(uColor,uv-vec2(0,pixel.y)).rgb;vec3 lum=vec3(.2126,.7152,.0722);float lo=min(dot(color,lum),min(min(dot(left,lum),dot(right,lum)),min(dot(up,lum),dot(down,lum)))),hi=max(dot(color,lum),max(max(dot(left,lum),dot(right,lum)),max(dot(up,lum),dot(down,lum))));if(hi-lo>max(.035,hi*.22))color=mix(color,(left+right+up+down)*.25,uAAStrength*.6);}
@@ -1855,7 +1901,9 @@ void main(){vec2 uv=vUV,offset=vec2(0.);float lensHighlight=0.;if(uLens>.015){fo
  if(uUnder>.5&&uRays>.5){float depth=texture(uDepth,uv).r;vec4 h=uInverseVP*vec4(uv*2.-1.,depth*2.-1.,1.);vec3 world=h.xyz/h.w,delta=world-uEye;float reach=min(length(delta),35.);vec3 ray=normalize(delta),sun=normalize(uSun),sum=vec3(0.);float stepSize=reach/float(uRaySteps);
  for(int i=0;i<48;i++){if(i>=uRaySteps)break;float t=(float(i)+.5)*stepSize;vec3 pos=uEye+ray*t;float below=max(0.,uLevel-pos.y),ca=uFocusOn>.5?texture(uFocusMap,clamp((pos.xz+26.)/52.,vec2(.001),vec2(.999))).r:causticNet(pos.xz-sun.xz*below/max(.12,sun.y));float density=exp(-below*.13)*(.09+ca*.7);sum+=vec3(.05,.20,.18)*density*exp(-vec3(.17,.065,.04)*t)*stepSize;}color+=sum*uRayStrength*uSunStrength;}
  if(uVolumeOn>.5){float d=texture(uDepth,uv).r;vec4 hp=uInverseVP*vec4(uv*2.-1.,d*2.-1.,1.);float dist=min(length(hp.xyz/hp.w-uEye),80.);vec3 beam=vec3(0.);float total=0.;for(int j=0;j<2;j++)for(int i=0;i<2;i++){vec4 b=texture(uLightVolume,uv+(vec2(i,j)-.5)/uVolumeSize);float weight=exp(-abs(b.a*80.-dist)/max(.3,dist*.04));beam+=b.rgb*weight;total+=weight;}color+=beam/max(.001,total);}
- color+=lensHighlight;float vig=1.-.12*dot((vUV-.5)*1.4,(vUV-.5)*1.4);color=pow(filmic(color*uExposure*vig),vec3(1./2.2));outColor=vec4(color,1.);
+ color+=lensHighlight;float vig=1.-.12*dot((vUV-.5)*1.4,(vUV-.5)*1.4);
+ // Tone curve first, then the vignette on display light, then sRGB encoding.
+ color=(uTonemap>.5?agx(color*uExposure*1.4):filmic(color*uExposure))*vig;outColor=vec4(srgbEncode(color),1.);
 }`;
 const cacheFS=`#version 300 es
 ${sharedGLSL}
@@ -1875,6 +1923,13 @@ void main(){vec2 target=vUV*52.-26.;vec4 f=fluid(target);if(f.y<.03){outColor=ve
  float h=.11;vec2 a=(landing(p+vec2(h,0),bed)-landing(p-vec2(h,0),bed))/(2.*h),b=(landing(p+vec2(0,h),bed)-landing(p-vec2(0,h),bed))/(2.*h);float det=abs(a.x*b.y-a.y*b.x),error=length(landing(p,bed)-target);float focus=min(5.,1./(det+uFocusSpread))*exp(-error*1.0)*exp(-min(f.y,uFocusDepth)*.055);
  outColor=vec4(focus*.6,0.,0.,1.);}`;
 
+// Solid-angle-weighted mean of each 90-degree sector of the sky panorama, upper row above the horizon.
+const skyAmbientFS=`#version 300 es
+${sharedGLSL}
+out vec4 outColor;
+void main(){ivec2 q=ivec2(gl_FragCoord.xy);vec3 sum=vec3(0.);float total=0.;
+ for(int j=0;j<8;j++)for(int i=0;i<8;i++){float u=(float(q.x)+(float(i)+.5)/8.)*.25,v=(float(q.y)+(float(j)+.5)/8.)*.5,w=cos((v-.5)*3.14159265);sum+=texture(uSkyMap,vec2(u,v)).rgb*w;total+=w;}
+ outColor=vec4(sum/total,1.);}`;
 const skyLUTFS=`#version 300 es
 ${sharedGLSL}
 in vec2 vUV;out vec4 outColor;
@@ -1996,7 +2051,8 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    await this.verifyPrograms();
   },60000);
   await BOOT.run('L40','Geometry and targets',()=>{
-  this.land=this.mesh(terrainGeometry(water));this.props=this.mesh(scenery(water));this.boat=this.mesh(makeBoat(),true);this.gate=this.mesh(makeGate());this.cell=this.mesh(makeCell());
+  // Meshes without baked occlusion read the generic attribute value 1 at location 4.
+  gl.vertexAttrib1f(4,1);{const set=this.sceneryMeshes(water);this.land=set.land;this.props=set.props;}this.boat=this.mesh(makeBoat(),true);this.gate=this.mesh(makeGate());this.cell=this.mesh(makeCell());
   let cargo=new Builder();cargo.box(0,0,0,.27,.25,.29,[.84,.62,.27]);cargo.box(0,.14,0,.19,.06,.21,[1,.91,.53]);this.cargo=this.mesh(cargo);
   this.makeWaterGrid();this.fluidTex=this.texture(gl.RGBA32F,N,N,gl.RGBA,gl.FLOAT,gl.NEAREST);this.wetTex=this.texture(gl.R8,N,N,gl.RED,gl.UNSIGNED_BYTE,gl.LINEAR);
   this.pvao=gl.createVertexArray();gl.bindVertexArray(this.pvao);this.pbuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,this.pbuffer);gl.bufferData(gl.ARRAY_BUFFER,116010*8*4,gl.DYNAMIC_DRAW);
@@ -2024,13 +2080,16 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.worldMeshes=new Map([[C.environment,{land:this.land,props:this.props}]]);let b=new Builder();b.cylinder(0,-.1,0,.15,.15,.2,[1,1,1],12);this.lampMesh=this.mesh(b);
   b=new Builder();b.box(0,0,0,.9,.32,.6,[.94,.45,.08]);b.box(0,.23,0,.5,.14,.42,[.12,.21,.28]);for(const xx of [-.45,.45])b.cylinder(xx,-.2,0,.12,.12,.46,[.27,.37,.38],10);this.droneMesh=this.mesh(b);
  }
- useWorld(id){if(this.activeWorld===id)return;let set=this.worldMeshes.get(id);if(!set){set={land:this.mesh(terrainGeometry(this.water)),props:this.mesh(scenery(this.water))};this.worldMeshes.set(id,set);}this.land=set.land;this.props=set.props;this.activeWorld=id;this.reflectionValid=false;this.shadowReady=false;this.cacheReady=false;this.resetEffects();}
+ useWorld(id){if(this.activeWorld===id)return;let set=this.worldMeshes.get(id);if(!set){set=this.sceneryMeshes(this.water);this.worldMeshes.set(id,set);}this.land=set.land;this.props=set.props;this.activeWorld=id;this.reflectionValid=false;this.shadowReady=false;this.cacheReady=false;this.resetEffects();}
  bindBeacon(p){const gl=this.gl;
-  for(const [name,tex,unit] of [['uSkyMap',this.skyLUT?.color,12],['uLampShadow',this.lampShadow?.depth,13]]){const loc=p.name(name);if(loc!==null){gl.uniform1i(loc,unit);this.texAt(tex||this.fluidTex,unit);}}
+  for(const [name,tex,unit] of [['uSkyMap',this.skyLUT?.color,12],['uLampShadow',this.lampShadow?.depth,13],['uSkyAmbient',this.skyAmbient?.color,14]]){const loc=p.name(name);if(loc!==null){gl.uniform1i(loc,unit);this.texAt(tex||this.fluidTex,unit);}}
  }
  updateSky(game){if(!C.skyCache){this.skyReady=false;return;}const gl=this.gl;if(!this.skyLUT){this.skyLUT=this.makeTarget(512,256,true);this.texAt(this.skyLUT.color,12);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);}
   const sig=[C.dayHour,C.dayCycle,C.daySeconds,C.cloudCover,C.starStrength,C.timeLighting,C.sunX,C.sunY,C.sunZ].join('/'),now=this.water.time;if(this.skyReady&&sig===this.skySignature&&now>=this.skyStamp&&now-this.skyStamp<1/C.skyHz)return;
-  this.skyReady=false;gl.bindFramebuffer(gl.FRAMEBUFFER,this.skyLUT.fbo);gl.viewport(0,0,512,256);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(this.skyLUTProgram,this.vp,this.eye,game);this.full(this.skyLUTProgram);this.skyStamp=now;this.skySignature=sig;this.skyReady=true;gl.enable(gl.DEPTH_TEST);
+  this.skyReady=false;gl.bindFramebuffer(gl.FRAMEBUFFER,this.skyLUT.fbo);gl.viewport(0,0,512,256);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(this.skyLUTProgram,this.vp,this.eye,game);this.full(this.skyLUTProgram);
+  // Hemispheric ambient: average the panorama into 4 azimuth sectors x 2 hemispheres.
+  if(!this.skyAmbient){this.skyAmbient=this.makeTarget(4,2,true);this.skyAmbientProgram=this.program(fullVS,skyAmbientFS);}
+  gl.bindFramebuffer(gl.FRAMEBUFFER,this.skyAmbient.fbo);gl.viewport(0,0,4,2);this.common(this.skyAmbientProgram,this.vp,this.eye,game);this.full(this.skyAmbientProgram);this.skyStamp=now;this.skySignature=sig;this.skyReady=true;gl.enable(gl.DEPTH_TEST);
  }
  updateLampShadows(game){this.lampShadowReady=false;this.lampShadowMapCount=0;if(!C.localShadows||!C.localLights||lights.colors[3]+lights.colors[7]<.001)return;const gl=this.gl,n=C.lampShadowSize;if(this.lampShadow?.h!==n){this.deleteTarget(this.lampShadow);this.lampShadow=this.makeTarget(n*2,n,false);}
   gl.bindFramebuffer(gl.FRAMEBUFFER,this.lampShadow.fbo);gl.viewport(0,0,n*2,n);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.clearColor(1,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1.5,2);const p=this.shadowProgram;gl.useProgram(p.p);
@@ -2074,7 +2133,10 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.frameChecked=true;
  }
 
- mesh(b,keepWet=false){let gl=this.gl,vao=gl.createVertexArray();gl.bindVertexArray(vao);let buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.v),gl.STATIC_DRAW);for(let i=0;i<3;i++){gl.enableVertexAttribArray(i);gl.vertexAttribPointer(i,3,gl.FLOAT,false,36,i*12);}gl.bindVertexArray(null);const m={vao,buffer,count:b.v.length/9,bytes:b.v.length*4,solids:b.solids||[]};if(keepWet)this.attachWetVertices(m,b.v);return m;}
+ mesh(b,keepWet=false){let gl=this.gl,vao=gl.createVertexArray();gl.bindVertexArray(vao);let buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.v),gl.STATIC_DRAW);for(let i=0;i<3;i++){gl.enableVertexAttribArray(i);gl.vertexAttribPointer(i,3,gl.FLOAT,false,36,i*12);}let bytes=b.v.length*4;if(b.ao){const ao=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,ao);gl.bufferData(gl.ARRAY_BUFFER,b.ao,gl.STATIC_DRAW);gl.enableVertexAttribArray(4);gl.vertexAttribPointer(4,1,gl.FLOAT,false,4,0);bytes+=b.ao.byteLength;}
+  gl.bindVertexArray(null);const m={vao,buffer,count:b.v.length/9,bytes,solids:b.solids||[],ao:b.ao||null};if(keepWet)this.attachWetVertices(m,b.v);return m;}
+ // Scenery meshes for one world, with ambient occlusion baked against the bed and all prop shapes.
+ sceneryMeshes(water){const land=terrainGeometry(water),props=scenery(water),solids=[...land.solids,...props.solids];bakeVertexAO(land,water,solids);bakeVertexAO(props,water,solids);return {land:this.mesh(land),props:this.mesh(props)};}
  texture(internal,w,h,format,type,filter){const gl=this.gl,t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.texImage2D(gl.TEXTURE_2D,0,internal,w,h,0,format,type,null);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t;}
  makeTarget(w,h,hdr=false){let gl=this.gl,color=this.texture(hdr&&this.hdr?gl.RGBA16F:gl.RGBA8,w,h,gl.RGBA,hdr&&this.hdr?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,gl.LINEAR),depth=this.texture(gl.DEPTH_COMPONENT24,w,h,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,gl.NEAREST),fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,color,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,depth,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('The graphics device could not create the water render targets.');gl.bindFramebuffer(gl.FRAMEBUFFER,null);return{fbo,color,depth,w,h,bytesPerPixel:hdr&&this.hdr?12:8};}
  deleteTarget(t){if(!t)return;let gl=this.gl;gl.deleteFramebuffer(t.fbo);gl.deleteTexture(t.color);gl.deleteTexture(t.depth);}
@@ -2088,7 +2150,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.frameSet({uTime:t,uGrid:N,uDX:DX,uLevel:this.water.level,
    uSpectral:+(C.spectral&&C.waves),uSpectrumN:spectrum.n,uSpectrumAlpha:spectrum.alpha,uSpectrumHeight:C.fftHeight,uSpectrumShort:C.fftShort,uCacheN:C.cacheSize,uShadowN:C.shadowSize,uShadowSoft:C.shadowSoft,uShadowBias:C.shadowBias,uShadowStrength:C.shadowStrength,uFocusStrength:C.focusStrength,
    uDaylight:lights.day,uNightAmbient:C.nightAmbient,uStars:C.starStrength,uLocalOn:+(C.localLights&&lights.active>0),uLocalSpec:C.localSpecular,uBio:C.bioStrength*(1-lights.day),uLampShadowN:C.lampShadowSize,uLampBias:C.lampShadowBias,
-   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((t/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:oceanSurface(t),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(t,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness,uSprayLight:+C.sprayLighting});
+   uCoastOn:+(C.environment===3&&C.coastalWaves&&C.waves),uReefHeight:C.reefHeight,uReefPeriod:C.reefPeriod,uReefSpeed:C.reefSpeed,uHarbourShelter:C.harbourShelter,uReefWidth:C.reefWidth,uCoastPhase:TAU*((t/C.reefPeriod)%1),uFoamAging:+C.foamAging,uFreshLife:C.freshFoamLife,uWaveShadow:+C.waveShadow,uWaveShadowStrength:C.waveShadowStrength,uOcean:oceanSurface(t),uDepthFade:C.depthFade,uRogueHeight:C.rogueEnabled&&C.waves?C.rogueHeight:0,uRogueCenter:storm.center(t,this.water.rogueOffset),uRogueWidth:C.rogueWidth,uRogueSpeed:C.rogueSpeed,uSunStrength:lights.strength,uAmbient:lights.ambient,uCaustics:+C.caustics,uCausticStrength:C.causticStrength*lights.strength,uCausticSpeed:C.causticSpeed,uCausticScale:C.causticScale,uWetStrength:C.wetStrength,uFog:C.fogDensity,uUnderDensity:C.underDensity*Math.pow(4,1-C.waterClarity/50),uMicro:C.microNormals,uMicroSpeed:C.microSpeed,uRefraction:C.refraction,uReflectionWeight:C.reflection?C.reflectionWeight:0,uReflectionDistortion:C.reflectionDistortion,uFresnel:C.fresnel,uFresnelPower:C.fresnelPower,uSpecPower:C.specPower,uSpecStrength:C.specStrength,uFoam:+C.foam,uFoamWidth:C.foamWidth,uFoamOpacity:C.foamOpacity,uFlowFoam:C.flowFoam,uWakeFoam:C.wakeFoam,uFoamTexture:C.foamTexture,uCloud:C.cloudCover,uSSS:C.sssStrength,uRoughness:C.roughness,uWaveReach:waveReach(),uLightStyle:C.lightStyle,uFarSea:+C.farSeaRoughness,uSprayLight:+C.sprayLighting,uHemiAmbient:+C.hemiAmbient,uVertexAO:+C.vertexAO,uTonemap:C.tonemap});
   this.frameInts[o.uWaveCount]=storm.count;f.set(storm.gpuW,o.uWave);f.set(storm.phases(t),o.uMode);
   this.farSeaTable(f.subarray(o.uFarSeaTable,o.uFarSeaTable+16),f.subarray(o.uWave),f.subarray(o.uMode));
   f.set(lights.positions,o.uLampPos);f.set(lights.colors,o.uLampColor);f.set(lights.directions,o.uLampDir);f.set(lights.packedVP,o.uLampVP);
@@ -3968,7 +4030,7 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting'];
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO'];
 PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
