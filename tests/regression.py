@@ -215,6 +215,18 @@ async def main(args):
     for(let i=pool.tail;i<pool.sent;i++){const s=i%pool.cap;if(a[s*4+3]>0){direct[Math.round(b[s*4+3])&3]++;direct[3]++;}}
     const c=r.gpuCount,ok=ringKept&&issued&&!!c&&c.spray===direct[0]&&c.foam===direct[1]&&c.bubble===direct[2]&&c.total===direct[3]&&direct[3]>0&&g.particleCount()===g.particles.length+direct[3]+pool.pending()&&gl.getError()===0;
     done({ok,ringKept,tries,readback:c,direct,window:pool.windowCount(),reported:g.particleCount()});};setTimeout(poll,10);});''')
+  # The GPU quads use the point path's size law and sprite shading: one cloud drawn both ways matches.
+  await check('GPU particle sprites match the CPU point path', '''const saved={...C},gl=r.gl,pool=r.gpuPool,parts=g.particles.slice(),landings=g.landings.slice();
+   const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);return px;};
+   const sum=(a,b)=>{let t=0;for(let i=0;i<a.length;i+=4)t+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);return t;};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,softParticles:false,timeLighting:false,sunStrength:1.65,cameraMode:3,orbitAuto:false,orbitHeight:6,orbitRadius:24,bloom:false,lensDrops:false});D.storm.sync();r.camera(g,100);
+    const e=r.eye,tg=r.target,d=[tg[0]-e[0],0,tg[2]-e[2]],l=Math.hypot(...d),cloud=[];for(let i=0;i<300;i++)cloud.push({x:e[0]+d[0]/l*6+Math.sin(i*1.7)*1.5,y:e[1]-1+Math.sin(i*2.3),z:e[2]+d[2]/l*6+Math.cos(i*1.3)*1.5,size:.06+.06*Math.abs(Math.sin(i))});
+    g.particles.length=0;C.gpuParticles=true;pool.reset();const bare=grab();
+    for(const c of cloud)g.addParticle(c.x,c.z,{y:c.y,life:5,size:c.size});const gpu=grab(),drawn=r.particleDraw;
+    C.gpuParticles=false;r.render(g,0);for(const c of cloud)g.particles.push({x:c.x,y:c.y,z:c.z,vx:0,vy:0,vz:0,life:5,maxLife:5,size:c.size});const cpu=grab();
+    const signal=sum(cpu,bare),gap=sum(gpu,cpu);
+    return {ok:drawn===300&&signal>0&&gap<.08*signal&&gl.getError()===0,drawn,signal,gap,ratio:+(gap/signal).toFixed(4)};
+   }finally{g.particles.length=0;g.particles.push(...parts);g.landings=landings;Object.assign(C,saved);D.storm.sync();pool.reset();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}
