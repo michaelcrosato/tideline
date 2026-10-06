@@ -180,6 +180,29 @@ async def main(args):
     const halves=sizes.length===4&&sizes.every((s,i)=>s[0]===Math.max(1,w>>(i+1))&&s[1]===Math.max(1,h>>(i+1)));
     return {ok:halves&&count2===2&&diff(four,two)>20&&diff(four,single)>20&&gl.getError()===0,sizes,frame:[w,h],levelChange:diff(four,two),chainChange:diff(four,single),phoneLevels:D.phonePreset.bloomLevels};
    }finally{Object.assign(C,saved);D.storm.sync();}''')
+  # M9: GPU particles land on the full wave surface, bubbles surface as foam, and the water never reads GPU state.
+  await check('GPU spray lands on the full surface; rendering never changes the simulation', '''const saved={...C},gl=r.gl,pool=r.gpuPool;
+   const slotState=s=>{const t=r.particleTargets,a=new Float32Array(4),b=new Float32Array(4),x=s%256,y=Math.floor(s/256);gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[t.read].fbo);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,a);gl.readBuffer(gl.COLOR_ATTACHMENT1);gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);gl.readBuffer(gl.COLOR_ATTACHMENT0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);const m=Math.round(b[3]);return {p:[a[0],a[1],a[2]],life:a[3],kind:m&3,maxLife:(m>>13)/64};};
+   const advance=dt=>{w.time+=dt;D.storm.sync();D.spectrum.sync(w.time);r.render(g,dt);};
+   try{Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,particles:true,gpuParticles:true,waves:true,spectral:true,waveScale:1.6,rogueEnabled:false,sprayWind:0,renderInterpolation:false});D.storm.sync();D.spectrum.sync(w.time,true);r.render(g,0);
+    if(!r.particleActive())return {ok:false,error:'GPU particles inactive',fallback:r.particleFallback};
+    let x=0,z=0;for(const [cx,cz] of [[0,0],[-6,2],[6,-4],[3,6],[-8,-6]])if(w.bilerp(w.h,cx,cz)>1.2){x=cx;z=cz;break;}
+    g.particles.length=0;g.landings.length=0;pool.reset();r.render(g,0);g.sprayCursor=0;
+    // A still drop 0.6 m above the full surface, with the CPU landing ripple predicted at its spawn.
+    const top=w.motion(x,z)[1]+.6,t0=w.time,fast0=w.fastSurface(x,z);g.addParticle(x,z,{y:top,vy:0,life:2,size:.05});const drop=(pool.head-1)%pool.cap,ripple=g.landings[0];
+    g.addParticle(x+.5,z,{bubble:true,y:w.motion(x+.5,z)[1]-.8,vy:.5,life:4,size:.03});const bubble=(pool.head-1)%pool.cap;
+    let prev=null,landed=null,surfaced=null,frames=0;
+    for(let f=0;f<150&&!(landed&&surfaced);f++){advance(1/60);frames++;const d=slotState(drop),b=slotState(bubble);
+     if(!landed){if(d.kind===1){const m=w.motion(x,z);landed={y:d.p[1],prevY:prev.y,prevFull:prev.full,full:m[1],fast:w.fastSurface(x,z),q:[d.p[0],d.p[2]],cpuQ:[m[12],m[13]],t:w.time-t0,life:d.life,maxLife:d.maxLife};}else prev={y:d.p[1],full:w.motion(x,z)[1]};}
+     if(!surfaced&&b.kind===1)surfaced={t:w.time-t0,life:b.life};}
+    // Rendering is the only GPU work: it must not change the simulated state or the predicted landings.
+    const hash=()=>JSON.stringify([g.boat.x,g.boat.y,g.boat.vy,w.time,w.h.reduce((a,b)=>a+b,0),w.rv.reduce((a,b)=>a+b,0),g.landings.length]);let changed=0;
+    let scheduled=0;g.splash(x,z,8,.7);for(let i=0;i<20;i++){scheduled=Math.max(scheduled,g.landings.length);g.step(D.DT);const h=hash();D.storm.sync();D.spectrum.sync(w.time);r.render(g,D.DT);if(hash()!==h)changed++;}
+    // The ripple's flight time uses the CPU surface at the spawn point, as Game.predictLanding does.
+    const fall=Math.max(.12,Math.sqrt(2*(top-fast0)/C.sprayGravity)),ok=!!landed&&!!surfaced&&landed.prevY>=landed.prevFull-.06&&landed.y<=landed.full+.06&&Math.hypot(landed.q[0]-landed.cpuQ[0],landed.q[1]-landed.cpuQ[1])<.08&&landed.life>0&&landed.life<=C.foamLife
+     &&!!ripple&&Math.abs(ripple.t-t0-fall)<1e-6&&Math.hypot(ripple.x-x,ripple.z-z)<1e-6&&surfaced.t>.4&&surfaced.t<2.5&&changed===0&&scheduled>0&&gl.getError()===0;
+    return {ok,frames,fall:+fall.toFixed(3),landed,surfaced,ripple:ripple&&{dt:+(ripple.t-t0).toFixed(3),x:ripple.x-x,z:ripple.z-z},renderChangedState:changed,predictedLandings:scheduled,report:r.surfaceReport().gpuParticles};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

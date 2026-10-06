@@ -6,8 +6,8 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain'];
-PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles'];
+PASS_NAMES.push('wetHistory','particleSim');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU','particleSim');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
  const unique=[],index=new Uint32Array(mesh.count),map=new Map();
@@ -171,10 +171,11 @@ const surfaceMemory=Profiler.prototype.memory;
 Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=0;
  for(const mesh of [renderer.boat,renderer.workboatMesh])if(mesh?.wetValues)for(const k of ['wetPositions','wetIndex','wetSamples','wetValues'])array+=mesh[k].byteLength;
  for(const k of ['bodyWetRead','wakeSourceRead','wakeSegmentData','wakeInfoData'])array+=renderer[k]?.byteLength||0;
- const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0);
+ const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0)+(renderer.particleTargets?.bytes||0)+(renderer.bedTex?N*N*4:0);
+ const pool=renderer.gpuPool;if(pool?.staging)array+=pool.staging.byteLength+pool.birth.byteLength+pool.expiry.byteLength;
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,gpuParticles:{active:this.particleActive(),fallback:this.particleFallback||null,capacity:this.particleTargets?.cap||0,window:this.gpuPool?.windowCount()||0,pending:this.gpuPool?.pending()||0,uploadedLastFrame:this.particleUploads||0,motes:this.particleMotes||0,cpuParticles:game?.particles.length||0,predictedLandings:game?.landings?.length||0},notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;

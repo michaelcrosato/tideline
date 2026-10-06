@@ -745,6 +745,7 @@ num('Boat','pickupRadius','Cargo pickup radius (m)',1.3,.2,4,.1);
 num('Boat','harbourLevel','Maximum delivery level (m)',1.15,.2,3,.05);
 flag('Particles and wakes','particles','Simulate and draw particles',true,'Also controls procedural underwater particles.');
 num('Particles and wakes','particleLimit','Maximum dynamic particles',26000,0,100000,100,'A ceiling, not a target. Only active spray and foam consume update work.');
+flag('Particles and wakes','gpuParticles','Simulate spray on the GPU',true,'Spray, foam and bubbles live in float textures and land on the full wave surface. Drops that hit scenery stay on the CPU. Without float render targets the CPU path runs.');
 num('Particles and wakes','sprayDensity','Splash particle count multiplier',10,1,40,1,'Changes visible droplet count, not the initial water impulse.');
 num('Particles and wakes','wakeDensity','Wake foam count multiplier',8,1,40,1,'Changes foam particle count, not boat thrust or wave height.');
 num('Particles and wakes','particleSize','Dynamic particle size multiplier',1,.1,4,.05);
@@ -1811,13 +1812,12 @@ void main(){vec4 f=fluid(vAnchor);float wetDepth=f.y+vSea.y;
  }
  outColor=vec4(max(col,0.),1.);
 }`;
-const pointVS=`#version 300 es
-${sharedGLSL}
-layout(location=0)in vec3 aPosition;layout(location=1)in vec4 aColor;layout(location=2)in float aSize;
-uniform mat4 uVP;uniform float uScale;uniform vec3 uEye;uniform float uUnder;out vec4 vColor;out float vKind;
+// Spray lighting, shared by the CPU point path and the GPU particle preparation pass.
+// The including shader declares uEye and uUnder first.
+const particleGLSL=`
 // One shadow-map tap per drop; the 3x3 filter would cost nine per vertex.
 float sprayShadow(vec3 p){if(uShadowOn<.5)return 1.;vec4 clip=uSunVP*vec4(p,1.);vec3 q=clip.xyz/clip.w*.5+.5;if(any(lessThan(q,vec3(.001)))||any(greaterThan(q,vec3(.999))))return 1.;return mix(1.,step(q.z-uShadowBias,texture(uShadowMap,q.xy).r),uShadowStrength);}
-void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aPosition.xz);Sea s=sea(aPosition.xz,f.y);pos=vec3(aPosition.x,f.x+.055,aPosition.z)+s.d;}gl_Position=uVP*vec4(pos,1.);gl_PointSize=clamp(abs(aSize)*uScale/max(.15,gl_Position.w),1.,55.);vColor=aColor;
+vec4 particleLight(vec3 pos,vec4 color,float foam){
  vec3 sunLight=uSunTint*uSunStrength*.36,ray=pos-uEye;float dist=length(ray);ray/=max(dist,.001);
  if(uSprayLight>.5){
   // Drops scatter forward: a Henyey-Greenstein lobe (g=.55) from the view ray toward the sun,
@@ -1825,14 +1825,123 @@ void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aP
   float mu=dot(ray,normalize(uSun)),g=.55,hg=(1.-g*g)/pow(1.+g*g-2.*g*mu,1.5);
   sunLight=uSunTint*uSunStrength*(.16+.2*min(hg,8.))*sprayShadow(pos);
  }
- vColor.rgb*=vec3(uAmbient*.48)+sunLight+localDiffuse(pos,vec3(0,1,0))*.45;vColor.rgb+=vec3(.005,.13,.25)*uBio*vKind;
- if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);vColor.rgb=vColor.rgb*tr+uHaze*(1.-tr);}
+ color.rgb*=vec3(uAmbient*.48)+sunLight+localDiffuse(pos,vec3(0,1,0))*.45;color.rgb+=vec3(.005,.13,.25)*uBio*foam;
+ if(uUnder>.5){vec3 tr=exp(-uUnderAbsorb*uUnderDensity*dist);color.rgb=color.rgb*tr+uHaze*(1.-tr);}
  // Above water, spray fades into the same air haze as the scenery and the water.
- else if(uSprayLight>.5){float fog=airFog(dist);if(fog>0.)vColor.rgb=mix(vColor.rgb,skyColor(ray),fog);}}
+ else if(uSprayLight>.5){float fog=airFog(dist);if(fog>0.)color.rgb=mix(color.rgb,skyColor(ray),fog);}
+ return color;
+}
 `;
-const pointFS=`#version 300 es
-precision highp float;precision highp sampler2D;in vec4 vColor;in float vKind;uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
-void main(){vec2 p=gl_PointCoord*2.-1.;float radius=length(p);if(radius>1.)discard;float shell=sqrt(max(0.,1.-radius*radius));vec3 color=vColor.rgb*(.72+.35*shell)+vColor.rgb*.45*pow(max(0.,1.-length(p-vec2(-.22,.24))*1.8),6.);float alpha=vColor.a*(1.-smoothstep(.45,1.,radius));if(uSoftOn>.5){vec2 uv=gl_FragCoord.xy/uPointResolution;float sd=100./(500.1-(texture(uSoftDepth,uv).r*2.-1.)*499.9),pd=100./(500.1-(gl_FragCoord.z*2.-1.)*499.9);alpha*=clamp((sd-pd)/uSoftFade,0.,1.);}outColor=vec4(color,alpha);}`;
+const pointVS=`#version 300 es
+${sharedGLSL}
+layout(location=0)in vec3 aPosition;layout(location=1)in vec4 aColor;layout(location=2)in float aSize;
+uniform mat4 uVP;uniform float uScale;uniform vec3 uEye;uniform float uUnder;out vec4 vColor;out float vKind;
+${particleGLSL}
+void main(){vec3 pos=aPosition;vKind=step(aSize,0.);if(aSize<0.){vec4 f=fluid(aPosition.xz);Sea s=sea(aPosition.xz,f.y);pos=vec3(aPosition.x,f.x+.055,aPosition.z)+s.d;}gl_Position=uVP*vec4(pos,1.);gl_PointSize=clamp(abs(aSize)*uScale/max(.15,gl_Position.w),1.,55.);vColor=particleLight(pos,aColor,vKind);}
+`;
+// Round sprite with a highlight and a soft depth fade. Points use gl_PointCoord (y down);
+// GPU particle quads pass the same corner coordinate as vCorner.
+const spriteFS=quad=>`#version 300 es
+precision highp float;precision highp sampler2D;in vec4 vColor;in float vKind;${quad?'in vec2 vCorner;':''}uniform sampler2D uSoftDepth;uniform vec2 uPointResolution;uniform float uSoftOn,uSoftFade;out vec4 outColor;
+void main(){vec2 p=${quad?'vCorner':'gl_PointCoord*2.-1.'};float radius=length(p);if(radius>1.)discard;float shell=sqrt(max(0.,1.-radius*radius));vec3 color=vColor.rgb*(.72+.35*shell)+vColor.rgb*.45*pow(max(0.,1.-length(p-vec2(-.22,.24))*1.8),6.);float alpha=vColor.a*(1.-smoothstep(.45,1.,radius));if(uSoftOn>.5){vec2 uv=gl_FragCoord.xy/uPointResolution;float sd=100./(500.1-(texture(uSoftDepth,uv).r*2.-1.)*499.9),pd=100./(500.1-(gl_FragCoord.z*2.-1.)*499.9);alpha*=clamp((sd-pd)/uSoftFade,0.,1.);}outColor=vec4(color,alpha);}`;
+const pointFS=spriteFS(false),particleFS=spriteFS(true);
+/* GPU particles (10.2). Spray, foam and bubbles live in two RGBA32F state maps, PARTICLE_ROW
+   slots to a row: (x, y, z, life) and (vx, vy, vz, packed kind | size | max life). Kinds: 0 spray,
+   1 foam (stored at its undisplaced surface point, like the CPU path), 2 bubble. The CPU writes
+   spawn rows; one pass a frame moves every slot, and a second lifts, lights and sizes each live
+   particle once, so the four corners of its quad only read the result. */
+const PARTICLE_ROW=256;
+// Spawn rows and the bed height map, shared by the update and preparation passes.
+const particleMapGLSL=`
+uniform highp sampler2D uState0,uState1,uBed;
+// Bed height, bilinear with clamped coordinates, as Water.bilerp reads it.
+float bedAt(vec2 p){vec2 g=clamp((p+26.)/uDX,vec2(0.),vec2(uGrid-1.001));ivec2 i=ivec2(floor(g));vec2 f=fract(g);
+ return mix(mix(texelFetch(uBed,i,0).r,texelFetch(uBed,i+ivec2(1,0),0).r,f.x),mix(texelFetch(uBed,i+ivec2(0,1),0).r,texelFetch(uBed,i+ivec2(1,1),0).r,f.x),f.y);}
+float rand1(uint n){n=n*747796405u+2891336453u;n=((n>>((n>>28u)+4u))^n)*277803737u;n=(n>>22u)^n;return float(n)/4294967296.;}
+`;
+const particleSimFS=`#version 300 es
+${sharedGLSL}
+${particleMapGLSL}
+uniform highp sampler2D uSpawn;uniform int uCap,uSpawnFirst,uSpawnCount;uniform float uStep,uFoamLife,uGravity,uBubbleRise;uniform vec2 uWind;
+layout(location=0)out vec4 outState0;layout(location=1)out vec4 outState1;
+// The undisplaced surface point under a world position: two fixed-point steps of p = x - d(p).
+vec2 undisplace(vec2 x){vec2 p=x;for(int i=0;i<2;i++){Sea s=sea(p,fluid(p).y);p=x-s.d.xz;}return p;}
+float surfaceAt(vec2 p){vec4 f=fluid(p);return f.x+sea(p,f.y).d.y;}
+void main(){ivec2 c=ivec2(gl_FragCoord.xy);int slot=c.y*${PARTICLE_ROW}+c.x,k=(slot-uSpawnFirst+uCap)%uCap;vec4 s0,s1;float dt=uStep;
+ // A slot spawned this frame starts from its spawn row and moves for the time since its birth.
+ if(k<uSpawnCount){ivec2 t=ivec2(c.x*3,c.y);s0=texelFetch(uSpawn,t,0);s1=texelFetch(uSpawn,t+ivec2(1,0),0);dt=texelFetch(uSpawn,t+ivec2(2,0),0).x;}
+ else{s0=texelFetch(uState0,c,0);s1=texelFetch(uState1,c,0);}
+ if(slot>=uCap||s0.w<=0.){outState0=vec4(0.);outState1=vec4(0.);return;}
+ uint m=uint(s1.w+.5),kind=m&3u;float size=float((m>>2)&2047u)*.001,maxLife=float(m>>13)/64.,life=s0.w-dt;vec3 p=s0.xyz,v=s1.xyz;
+ // Spawn heights come from the CPU surface (fastSurface: 6 Gerstner modes, no horizontal
+ // displacement). Seat new drops above, and new bubbles below, the full surface they collide with.
+ if(k<uSpawnCount&&kind!=1u){float h=surfaceAt(undisplace(p.xz));p.y=kind==0u?max(p.y,h+.04):min(p.y,h-.14);}
+ if(kind==0u){
+  // Spray: exact relaxation toward the wind (rate .8/s) and exact gravity over the step.
+  float e=exp(-.8*dt);vec2 rel=v.xz-uWind;p.xz+=uWind*dt+rel*(1.-e)/.8;v.xz=uWind+rel*e;p.y+=v.y*dt-.5*uGravity*dt*dt;v.y-=uGravity*dt;
+  float bed=bedAt(p.xz);
+  if(p.y<bed+.015){float h=max(.08,uDX*.5);vec3 n=normalize(vec3(bedAt(p.xz-vec2(h,0.))-bedAt(p.xz+vec2(h,0.)),2.*h,bedAt(p.xz-vec2(0.,h))-bedAt(p.xz+vec2(0.,h))));p.y=bed+.025;v-=min(0.,dot(v,n))*n;v.xz*=.3;v.y=min(v.y,0.)*.3;life=min(life,.25);}
+  // Landing on the full displaced surface (all wave modes, FFT field, reef breaker): the drop
+  // becomes foam at the undisplaced point under it.
+  else if(maxLife-life>.12&&fluid(p.xz).y>.035){vec2 q=undisplace(p.xz);if(p.y<surfaceAt(q)){uint seed=uint(slot)*2654435761u^m;kind=1u;life=uFoamLife*(.5+.5*rand1(seed));maxLife=life;v.xz*=.2;size=.065+.095*rand1(seed+1u);p.xz=q;}}
+ }else if(kind==1u){
+  vec4 f=fluid(p.xz);float e=exp(-1.1*dt);vec2 rel=v.xz-f.zw;p.xz+=f.zw*dt+rel*(1.-e)/1.1;v.xz=f.zw+rel*e;if(f.y<.025)life-=dt*5.;
+ }else{
+  vec4 f=fluid(p.xz);float e=exp(-1.5*dt),ey=exp(-dt);vec2 rel=v.xz-f.zw;p.xz+=f.zw*dt+rel*(1.-e)/1.5;v.xz=f.zw+rel*e;
+  p.y+=uBubbleRise*dt+(v.y-uBubbleRise)*(1.-ey);v.y=uBubbleRise+(v.y-uBubbleRise)*ey;
+  vec2 q=undisplace(p.xz);if(p.y>surfaceAt(q)){kind=1u;life=.6;maxLife=.6;size*=1.5;p.xz=q;}
+ }
+ if(any(greaterThan(abs(p.xz),vec2(180.))))life=0.;
+ outState0=vec4(p,life);outState1=vec4(v,float(kind|uint(clamp(round(size*1000.),0.,2047.))<<2u|uint(clamp(round(maxLife*64.),0.,2047.))<<13u));
+}`;
+// Lift, light and size each live particle once. Rows past the state hold the underwater motes.
+const particlePrepFS=`#version 300 es
+${sharedGLSL}
+${particleMapGLSL}
+uniform vec3 uEye;uniform float uUnder;uniform int uRows,uMotes;uniform float uParticleSize,uUnderAlpha,uUnderSize;
+layout(location=0)out vec4 outPosition;layout(location=1)out vec4 outColor;
+${particleGLSL}
+void main(){ivec2 c=ivec2(gl_FragCoord.xy);outPosition=vec4(0.);outColor=vec4(0.);
+ if(c.y<uRows){vec4 s0=texelFetch(uState0,c,0);if(s0.w<=0.)return;
+  uint m=uint(texelFetch(uState1,c,0).w+.5),kind=m&3u;float foam=kind==1u?1.:0.,size=float((m>>2)&2047u)*.001*uParticleSize,alpha=clamp(s0.w/max(float(m>>13)/64.,.001),0.,1.)*(foam>.5?.42:.65);
+  vec3 pos=s0.xyz;if(foam>.5){vec4 f=fluid(pos.xz);Sea s=sea(pos.xz,f.y);pos=vec3(pos.x,f.x+.055,pos.z)+s.d;size=-size;}
+  outColor=particleLight(pos,kind==2u?vec4(.25,.62,.73,alpha):vec4(.72,.88,.95,alpha),foam);outPosition=vec4(pos,size);return;}
+ // Suspended motes around the camera, the CPU path's pattern with hashed phases.
+ int i=(c.y-uRows)*${PARTICLE_ROW}+c.x;if(i>=uMotes)return;uint n=uint(i)*3u;
+ vec3 pos=vec3(uEye.x+sin(6.2831853*rand1(n))*13.,uLevel-3.7+sin(6.2831853*rand1(n+2u)+uTime*.06)*4.8,uEye.z+sin(6.2831853*rand1(n+1u))*13.);
+ if(pos.y>uLevel+.2||pos.y<bedAt(pos.xz))return;
+ outColor=particleLight(pos,vec4(.40,.71,.82,uUnderAlpha),0.);outPosition=vec4(pos,uUnderSize);
+}`;
+// Instanced quads: instances [0,uCount) are the live ring window from uFirst, the rest are motes.
+const particleVS=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform highp sampler2D uPrep0;uniform sampler2D uPrep1;uniform mat4 uVP;uniform float uScale;uniform vec2 uPointResolution;uniform int uFirst,uCount,uCap,uRows;
+out vec4 vColor;out float vKind;out vec2 vCorner;
+void main(){int i=gl_InstanceID,slot=(uFirst+i)%uCap;ivec2 c=i<uCount?ivec2(slot%${PARTICLE_ROW},slot/${PARTICLE_ROW}):ivec2((i-uCount)%${PARTICLE_ROW},uRows+(i-uCount)/${PARTICLE_ROW});
+ vec4 p=texelFetch(uPrep0,c,0);vColor=texelFetch(uPrep1,c,0);vKind=step(p.w,0.);vCorner=vec2(0.);if(p.w==0.){gl_Position=vec4(2.,2.,2.,1.);return;}
+ // The point path's size law: diameter in pixels, clamped to 1-55.
+ vec4 clip=uVP*vec4(p.xyz,1.);float px=clamp(abs(p.w)*uScale/max(.15,clip.w),1.,55.);vec2 corner=vec2(float(gl_VertexID&1),float(gl_VertexID>>1))*2.-1.;
+ clip.xy+=corner*px/uPointResolution*clip.w;gl_Position=clip;vCorner=vec2(corner.x,-corner.y);}`;
+// Kind (2 bits), size in mm (11 bits) and max life in 1/64 s (11 bits): an integer below 2^24, exact in a float.
+const packParticle=(kind,size,maxLife)=>kind+4*Math.min(2047,Math.max(0,Math.round(size*1000)))+8192*Math.min(2047,Math.max(0,Math.round(maxLife*64)));
+/* CPU side of the GPU particles: spawn rows and ring bookkeeping only, no GL calls. Slots are
+   handed out in ring order; a full ring reuses the oldest slot, so particleLimit stays a ceiling.
+   Each slot keeps an upper bound of its expiry. Slots [tail, sent) can be alive and are drawn;
+   [sent, head) wait for the frame that reaches their birth time. Nothing here feeds the simulation. */
+class ParticlePool{
+ constructor(){this.cap=0;this.generation=0;this.reset();}
+ resize(cap){if(cap===this.cap)return;this.cap=cap;this.staging=new Float32Array(Math.ceil(cap/PARTICLE_ROW)*PARTICLE_ROW*12);this.birth=new Float64Array(cap);this.expiry=new Float64Array(cap);this.reset();}
+ reset(){this.head=this.tail=this.sent=0;this.generation++;this.expiry?.fill(0);}
+ // Three texels a slot: (x, y, z, life), (vx, vy, vz, packed), (delay since birth, set at upload).
+ spawn(time,x,y,z,vx,vy,vz,life,kind,size,bound){if(!this.cap)return;const s=this.head%this.cap,o=s*12,a=this.staging;
+  a[o]=x;a[o+1]=y;a[o+2]=z;a[o+3]=life;a[o+4]=vx;a[o+5]=vy;a[o+6]=vz;a[o+7]=packParticle(kind,size,life);a[o+8]=0;this.birth[s]=time;this.expiry[s]=time+bound;
+  this.head++;if(this.head-this.tail>this.cap)this.tail=this.head-this.cap;if(this.head-this.sent>this.cap)this.sent=this.head-this.cap;}
+ // End of the spawns born by time t. Births are in ring order.
+ due(t){let n=this.sent;while(n<this.head&&this.birth[n%this.cap]<=t+1e-9)n++;return n;}
+ advance(t){while(this.tail<this.sent&&this.expiry[this.tail%this.cap]<=t)this.tail++;}
+ windowCount(){return this.sent-this.tail;}
+ pending(){return this.head-this.sent;}
+}
 const fullVS=`#version 300 es
 precision highp float;precision highp sampler2D;out vec2 vUV;void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);vUV=p;gl_Position=vec4(p*2.-1.,0.,1.);}`;
 const foamFS=`#version 300 es
@@ -2075,7 +2184,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
    const err=gl.getError();if(err!==gl.NO_ERROR)throw BootKit.error('GFX-ALLOC','Render allocation failed. GL error '+err+'.');
   },45000);
   await BOOT.run('L50','Light and optics',async()=>{
-   this.initAbyss();this.initBeacon();this.initOptics();await this.verifyPrograms();this.compiling=false;
+   this.initAbyss();this.initBeacon();this.initOptics();this.initParticles();await this.verifyPrograms();this.compiling=false;
    gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.disable(gl.CULL_FACE);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
    BOOT.report.renderer.engine={hdr:this.hdr,traceHierarchy:this.traceSupported,renderSize:[...this.size],shaderPrograms:this.shaderTotal,frameBlock:{bytes:this.frameData.byteLength,members:FRAME.query.length,programs:this.frameBlocks}};
   },60000);
@@ -2221,7 +2330,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  ensureFoam(){const size=Math.round(C.foamResolution);if(this.foamTargets?.[0].w===size)return;if(this.foamTargets)for(const t of this.foamTargets)this.deleteTarget(t);this.foamTargets=[this.colorTarget(size,size),this.colorTarget(size,size)];this.resetEffects();}
  resetEffects(){this.foamRead=0;this.foamEpoch=this.water.epoch;this.foamTime=this.water.time;this.lensWet=0;if(!this.foamTargets)return;const gl=this.gl;for(const t of this.foamTargets){gl.bindFramebuffer(gl.FRAMEBUFFER,t.fbo);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);}gl.bindFramebuffer(gl.FRAMEBUFFER,null);}
  saveEffects(){if(!this.foamTargets)return null;const gl=this.gl,t=this.foamTargets[this.foamRead];this.deleteTarget(this.foamSaved);this.foamSaved=this.colorTarget(t.w,t.h);gl.bindFramebuffer(gl.READ_FRAMEBUFFER,t.fbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,this.foamSaved.fbo);gl.blitFramebuffer(0,0,t.w,t.h,0,0,t.w,t.h,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.bindFramebuffer(gl.FRAMEBUFFER,null);return {time:this.foamTime,epoch:this.foamEpoch,lens:this.lensWet};}
- restoreEffects(state){if(!state||!this.foamSaved){this.resetEffects();return;}this.ensureFoam();const gl=this.gl,s=this.foamSaved,t=this.foamTargets[0];gl.bindFramebuffer(gl.READ_FRAMEBUFFER,s.fbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,t.fbo);gl.blitFramebuffer(0,0,s.w,s.h,0,0,t.w,t.h,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.bindFramebuffer(gl.FRAMEBUFFER,null);this.foamRead=0;this.foamTime=state.time;this.foamEpoch=state.epoch;this.lensWet=state.lens;this.deleteTarget(this.foamSaved);this.foamSaved=null;}
+ restoreEffects(state){this.gpuPool?.reset();if(!state||!this.foamSaved){this.resetEffects();return;}this.ensureFoam();const gl=this.gl,s=this.foamSaved,t=this.foamTargets[0];gl.bindFramebuffer(gl.READ_FRAMEBUFFER,s.fbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,t.fbo);gl.blitFramebuffer(0,0,s.w,s.h,0,0,t.w,t.h,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.bindFramebuffer(gl.FRAMEBUFFER,null);this.foamRead=0;this.foamTime=state.time;this.foamEpoch=state.epoch;this.lensWet=state.lens;this.deleteTarget(this.foamSaved);this.foamSaved=null;}
  full(p){const gl=this.gl;gl.bindVertexArray(this.copyVAO);gl.drawArrays(gl.TRIANGLES,0,3);profiler?.draw(1,0);}
  drawSky(vp,eye,game,reflection=0){const gl=this.gl,p=this.skyProgram;this.common(p,vp,eye,game,reflection);gl.uniformMatrix4fv(p.name('uInverseVP'),false,vp===this.vp&&this.invVP?this.invVP:this.inverse(vp));gl.disable(gl.DEPTH_TEST);gl.depthMask(false);this.full(p);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);}
  updateFoam(game){this.ensureFoam();if(this.water.epoch!==this.foamEpoch||this.water.time<this.foamTime)this.resetEffects();const elapsed=Math.max(0,this.water.time-this.foamTime);this.foamTime=this.water.time;if(!C.persistentFoam||!C.foam||elapsed<=0)return;
@@ -2250,7 +2359,7 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
   this.updateSurfaceDetail(game);
   profiler?.beginPass('shadow');this.updateShadow(game);profiler?.endPass();
   profiler?.beginPass('causticFocus');this.updateFocus(game);profiler?.endPass();
-  profiler?.beginPass('foamField');this.updateFoam(game);profiler?.endPass();gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);
+  profiler?.beginPass('foamField');this.updateFoam(game);profiler?.endPass();profiler?.beginPass('particleSim');this.updateParticleState(game);profiler?.endPass();gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);
   let mirror=Mat.identity();mirror[5]=-1;mirror[13]=2*this.water.level;profiler?.beginPass('reflection');if(!C.waterVisible||!(C.reflectionWeight>0))this.reflectionValid=false;else if(C.reflection&&!this.underwater&&(!this.reflectionValid||this.frame%C.reflectionEvery===0)){const vp=Mat.mul(this.vp,mirror),eye=[this.eye[0],2*this.water.level-this.eye[1],this.eye[2]];gl.bindFramebuffer(gl.FRAMEBUFFER,this.reflect.fbo);gl.viewport(0,0,this.reflect.w,this.reflect.h);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this.drawSky(vp,eye,game,1);this.drawScene(vp,eye,game,1);this.reflectionValid=true;}profiler?.endPass();
   profiler?.beginPass('airScene');this.updateAirScene(game);profiler?.endPass();
   profiler?.beginPass('opaque');gl.bindFramebuffer(gl.FRAMEBUFFER,this.scene.fbo);gl.viewport(0,0,...this.size);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this.drawSky(this.vp,this.eye,game);this.drawScene(this.vp,this.eye,game);profiler?.endPass();
@@ -2265,9 +2374,61 @@ precision highp float;precision highp sampler2D;in vec2 vUV;uniform sampler2D uC
  }
  drawParticles(game){const gl=this.gl,p=this.pointProgram,a=this.pdata;let k=0;
   for(const pt of game.particles){if(k+8>a.length)break;const alpha=clamp(pt.life/pt.maxLife,0,1);a[k++]=pt.x;a[k++]=pt.y;a[k++]=pt.z;a[k++]=pt.bubble?.25:.72;a[k++]=pt.bubble?.62:.88;a[k++]=pt.bubble?.73:.95;a[k++]=alpha*(pt.foam?.42:.65);a[k++]=pt.size*C.particleSize*(pt.foam?-1:1);}
-  if(this.underwater){for(let i=0;i<C.underParticles&&k+8<a.length;i++){const x=this.eye[0]+Math.sin(i*73.31)*13,z=this.eye[2]+Math.sin(i*39.77)*13,y=this.water.level-3.7+Math.sin(i*17.4+this.water.time*.06)*4.8;const bed=this.water.bilerp(this.water.bed,x,z);if(y>this.water.level+.2||y<bed)continue;a[k++]=x;a[k++]=y;a[k++]=z;a[k++]=.40;a[k++]=.71;a[k++]=.82;a[k++]=C.underAlpha;a[k++]=C.underSize;}}
-  if(!k)return;this.common(p,this.vp,this.eye,game);this.texAt(this.scene.depth,3);gl.uniform1i(p.name('uSoftDepth'),3);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.bindVertexArray(this.pvao);gl.bindBuffer(gl.ARRAY_BUFFER,this.pbuffer);gl.bufferSubData(gl.ARRAY_BUFFER,0,a.subarray(0,k));gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);gl.drawArrays(gl.POINTS,0,k/8);profiler?.draw(0,k/8);gl.depthMask(true);gl.disable(gl.BLEND);
+  if(this.underwater&&!this.particleActive()){for(let i=0;i<C.underParticles&&k+8<a.length;i++){const x=this.eye[0]+Math.sin(i*73.31)*13,z=this.eye[2]+Math.sin(i*39.77)*13,y=this.water.level-3.7+Math.sin(i*17.4+this.water.time*.06)*4.8;const bed=this.water.bilerp(this.water.bed,x,z);if(y>this.water.level+.2||y<bed)continue;a[k++]=x;a[k++]=y;a[k++]=z;a[k++]=.40;a[k++]=.71;a[k++]=.82;a[k++]=C.underAlpha;a[k++]=C.underSize;}}
+  if(k){this.common(p,this.vp,this.eye,game);this.texAt(this.scene.depth,3);gl.uniform1i(p.name('uSoftDepth'),3);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.bindVertexArray(this.pvao);gl.bindBuffer(gl.ARRAY_BUFFER,this.pbuffer);gl.bufferSubData(gl.ARRAY_BUFFER,0,a.subarray(0,k));gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);gl.drawArrays(gl.POINTS,0,k/8);profiler?.draw(0,k/8);gl.depthMask(true);gl.disable(gl.BLEND);}
+  this.drawParticleSprites();
  }
+ // GPU particles: programs, maps and the per-frame passes. Without float colour targets the CPU path runs.
+ initParticles(){const gl=this.gl;this.gpuPool=new ParticlePool();this.particleTargets=null;this.particleTime=0;this.particleGeneration=-1;this.particleDraw=0;this.particleMotes=0;this.particleUploads=0;this.bedWorld=-1;
+  this.particleGPU=this.hdr;this.particleFallback=this.hdr?null:'No float colour targets (EXT_color_buffer_float).';if(!this.particleGPU)return;
+  this.particleSimProgram=this.program(fullVS,particleSimFS);this.particlePrepProgram=this.program(fullVS,particlePrepFS);this.particleDrawProgram=this.program(particleVS,particleFS);
+  this.bedTex=this.texture(gl.R32F,N,N,gl.RED,gl.FLOAT,gl.NEAREST);}
+ particleActive(){return !!(this.particleGPU&&C.gpuParticles&&C.particles&&C.particleLimit>=1);}
+ freeParticleMaps(){const t=this.particleTargets;if(!t)return;const gl=this.gl;for(const m of [...t.state,t.prep]){gl.deleteFramebuffer(m.fbo);for(const c of m.colors)gl.deleteTexture(c);}gl.deleteTexture(t.spawn);this.particleTargets=null;}
+ // State ping-pong (2 x RGBA32F), preparation (RGBA32F position + RGBA16F colour, plus mote rows) and spawn rows.
+ particleMaps(){const W=PARTICLE_ROW,cap=Math.max(1,Math.round(C.particleLimit)),rows=Math.ceil(cap/W),motes=Math.ceil(Math.max(0,Math.round(C.underParticles))/W),sig=cap+'/'+motes;
+  if(this.particleTargets?.sig===sig)return this.particleTargets;this.freeParticleMaps();const gl=this.gl,f32=[gl.RGBA32F,gl.FLOAT];
+  const mrt=(formats,h)=>{const fbo=gl.createFramebuffer(),colors=formats.map(([internal,type])=>this.texture(internal,W,h,gl.RGBA,type,gl.NEAREST));gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+   colors.forEach((c,i)=>gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,c,0));gl.drawBuffers(colors.map((_,i)=>gl.COLOR_ATTACHMENT0+i));return {fbo,colors,h,ok:gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE};};
+  const t={sig,cap,rows,motes,state:[mrt([f32,f32],rows),mrt([f32,f32],rows)],prep:mrt([f32,[gl.RGBA16F,gl.HALF_FLOAT]],rows+motes),spawn:this.texture(gl.RGBA32F,W*3,rows,gl.RGBA,gl.FLOAT,gl.NEAREST),read:0};
+  t.bytes=W*rows*(4*16+16*3)+W*(rows+motes)*24;gl.bindFramebuffer(gl.FRAMEBUFFER,null);this.particleTargets=t;
+  if(![...t.state,t.prep].every(m=>m.ok)){this.freeParticleMaps();this.particleGPU=false;this.particleFallback='Float particle targets are incomplete on this device.';this.gpuPool.reset();return null;}
+  this.gpuPool.resize(cap);this.gpuPool.reset();return t;}
+ // One update pass (new spawns, motion, landing) and one preparation pass a frame, before the scene.
+ updateParticleState(game){const pool=this.gpuPool;this.particleDraw=this.particleMotes=0;if(!pool)return;
+  if(!this.particleActive()){if(pool.head)pool.reset();return;}const t=this.particleMaps();if(!t)return;
+  const gl=this.gl,W=PARTICLE_ROW,T=this.renderTime??this.water.time;
+  if(this.bedWorld!==this.water.worldId){this.texAt(this.bedTex,19);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RED,gl.FLOAT,this.water.bed);this.bedWorld=this.water.worldId;}
+  // A reset, a restored snapshot or time running backwards clears the maps. Interpolation starting
+  // or stopping moves the drawn time by up to one step; that only holds the particles still.
+  if(T<this.particleTime-DT-1e-6&&pool.generation===this.particleGeneration)pool.reset();
+  if(pool.generation!==this.particleGeneration){for(const m of t.state){gl.bindFramebuffer(gl.FRAMEBUFFER,m.fbo);gl.clearBufferfv(gl.COLOR,0,ZERO4);gl.clearBufferfv(gl.COLOR,1,ZERO4);}this.particleGeneration=pool.generation;this.particleTime=T;}
+  // Motion is exact over any step; the cap only bounds a long stall without frames.
+  const dt=Math.min(1,Math.max(0,T-this.particleTime)),due=pool.due(T),n=due-pool.sent;this.particleUploads=n;
+  // Slots outside [tail, due) are dead by their bound and nothing reads them, so their rows are skipped.
+  if((dt>0&&pool.sent>pool.tail)||n>0){
+   if(n>0){const a=pool.staging,first=pool.sent%t.cap,last=(due-1)%t.cap,put=(r0,r1)=>gl.texSubImage2D(gl.TEXTURE_2D,0,0,r0,W*3,r1-r0+1,gl.RGBA,gl.FLOAT,a,r0*W*12);
+    for(let i=pool.sent;i<due;i++){const k=i%t.cap;a[k*12+8]=Math.max(0,T-pool.birth[k]);}
+    this.texAt(t.spawn,18);if(n>=t.cap)put(0,t.rows-1);else if(first<=last)put(Math.floor(first/W),Math.floor(last/W));else{put(Math.floor(first/W),t.rows-1);put(0,Math.floor(last/W));}}
+   const src=t.state[t.read],p=this.particleSimProgram;gl.bindFramebuffer(gl.FRAMEBUFFER,t.state[1-t.read].fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);
+   for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uSpawn',t.spawn,18],['uBed',this.bedTex,19]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+   gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uSpawnFirst'),pool.sent%t.cap);gl.uniform1i(p.name('uSpawnCount'),n);gl.uniform1f(p.name('uStep'),dt);gl.uniform1f(p.name('uFoamLife'),C.foamLife);gl.uniform1f(p.name('uGravity'),C.sprayGravity);gl.uniform1f(p.name('uBubbleRise'),C.bubbleRise);gl.uniform2f(p.name('uWind'),storm.table[0]*C.sprayWind,storm.table[1]*C.sprayWind);
+   this.particlePass(p,this.particleRows(t,pool.tail,due));t.read=1-t.read;pool.sent=due;}
+  this.particleTime=Math.max(this.particleTime,T);pool.advance(this.particleTime);
+  const count=pool.windowCount(),motes=this.underwater?Math.min(Math.max(0,Math.round(C.underParticles)),t.motes*W):0;
+  if(count+motes>0){const p=this.particlePrepProgram,src=t.state[t.read];gl.bindFramebuffer(gl.FRAMEBUFFER,t.prep.fbo);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);this.common(p,this.vp,this.eye,game);
+   for(const [name,tex,unit] of [['uState0',src.colors[0],16],['uState1',src.colors[1],17],['uBed',this.bedTex,19]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+   gl.uniform1i(p.name('uRows'),t.rows);gl.uniform1i(p.name('uMotes'),motes);gl.uniform1f(p.name('uParticleSize'),C.particleSize);gl.uniform1f(p.name('uUnderAlpha'),C.underAlpha);gl.uniform1f(p.name('uUnderSize'),C.underSize);this.particlePass(p,[...this.particleRows(t,pool.tail,pool.sent),...(motes?[[t.rows,t.rows+Math.ceil(motes/W)-1]]:[])]);}
+  this.particleDraw=count;this.particleMotes=motes;gl.enable(gl.DEPTH_TEST);
+ }
+ // Rows holding ring positions [from, to): one range, two when the interval wraps, all rows when full.
+ particleRows(t,from,to){const W=PARTICLE_ROW;if(to<=from)return [];if(to-from>=t.cap)return [[0,t.rows-1]];const a=from%t.cap,b=(to-1)%t.cap,r0=Math.floor(a/W),r1=Math.floor(b/W);return a<=b?[[r0,r1]]:[[r0,t.rows-1],[0,r1]];}
+ particlePass(p,ranges){const gl=this.gl;for(const [r0,r1] of ranges){gl.viewport(0,r0,PARTICLE_ROW,r1-r0+1);this.full(p);}}
+ drawParticleSprites(){const n=this.particleDraw+this.particleMotes,t=this.particleTargets;if(!n||!t)return;const gl=this.gl,p=this.particleDrawProgram;gl.useProgram(p.p);
+  gl.uniformMatrix4fv(p.name('uVP'),false,this.vp);gl.uniform1f(p.name('uScale'),this.size[1]*1.25);gl.uniform2fv(p.name('uPointResolution'),this.size);gl.uniform1i(p.name('uFirst'),this.gpuPool.tail%t.cap);gl.uniform1i(p.name('uCount'),this.particleDraw);gl.uniform1i(p.name('uCap'),t.cap);gl.uniform1i(p.name('uRows'),t.rows);
+  for(const [name,tex,unit] of [['uPrep0',t.prep.colors[0],16],['uPrep1',t.prep.colors[1],17],['uSoftDepth',this.scene.depth,3]]){gl.uniform1i(p.name(name),unit);this.texAt(tex,unit);}
+  gl.uniform1f(p.name('uSoftOn'),+C.softParticles);gl.uniform1f(p.name('uSoftFade'),C.softDepth);gl.bindVertexArray(this.copyVAO);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,n);profiler?.draw(0,n);gl.depthMask(true);gl.disable(gl.BLEND);}
  project(x,y,z){const p=Mat.transform(this.vp,[x,y,z]);return{x:(p[0]*.5+.5)*innerWidth,y:(-.5*p[1]+.5)*innerHeight,z:p[2],visible:p[2]>-1&&p[2]<1};}
  pickPlane(sx,sy,level){
   // Ray-plane intersection from the current camera basis; no inverse matrix or
@@ -2476,7 +2637,7 @@ class ContactPhysics{
  if(kind!=='wave')w.impulse(x+nx*.22,z+nz*.22,Math.min(.28,strength*.023),.55);
  const ix=Math.round((x+HALF)/DX),iz=Math.round((z+HALF)/DX);for(let j=iz-1;j<=iz+1;j++)for(let i=ix-1;i<=ix+1;i++)if(i>=0&&j>=0&&i<N&&j<N){w.wet[j*N+i]=255;w.wetAge[j*N+i]=1;}
  for(let i=0;i<count&&this.g.particles.length<C.particleLimit;i++){const angle=rand()*TAU,side=(rand()-.5)*strength*.75,radial=(.3+rand()*.7)*Math.min(2.4,strength*.28),vx=entry?Math.cos(angle)*radial:nx*radial-nz*side,vz=entry?Math.sin(angle)*radial:nz*radial+nx*side;
-  const p=this.g.addParticle(x+nx*.10+(rand()-.5)*.12,z+nz*.10+(rand()-.5)*.12,{y:y+.04+rand()*.10,vx:vx+(b?.vx||0)*.12,vz:vz+(b?.vz||0)*.12,vy:.5+rand()*Math.min(3.6,strength*.40),size:.018+rand()*.035,life:.55+rand()*.85,impulseScale:.01});if(p){p.contactDrop=true;p.collisionMark=0;this.stats.splashParticles++;}}
+  const p=this.g.addParticle(x+nx*.10+(rand()-.5)*.12,z+nz*.10+(rand()-.5)*.12,{y:y+.04+rand()*.10,vx:vx+(b?.vx||0)*.12,vz:vz+(b?.vz||0)*.12,vy:.5+rand()*Math.min(3.6,strength*.40),size:.018+rand()*.035,life:.55+rand()*.85,impulseScale:.01,cpu:true});if(p){p.contactDrop=true;p.collisionMark=0;this.stats.splashParticles++;}}
  const m=w.motion(x+nx*.2,z+nz*.2,this.g.surfaceRead),ax=m[12],az=m[13];for(let i=0;i<Math.min(8,Math.floor(count/5));i++)this.g.addParticle(ax+(rand()-.5)*.45,az+(rand()-.5)*.45,{foam:true,vx:nx*.15,vz:nz*.15,size:.11+rand()*.11,life:1.0+rand()*1.5});
  if(entry&&C.bubbles){for(let i=0;i<Math.min(32,C.bubbleCount);i++)this.g.addParticle(x+(rand()-.5)*.5,z+(rand()-.5)*.5,{bubble:true,y:y-.14-rand()*.25,vy:C.bubbleRise*.7,life:1.3+rand(),size:.018+rand()*.03});}
  }
@@ -2494,7 +2655,7 @@ class ContactPhysics{
 
 class Game{
  constructor(water,renderer,sound){this.flowRead=new Float64Array(3);this.skyClock=0;this.orbitClock=0;this.pool=[];this.sprayClock=0;this.sprayCursor=0;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.surfaceRead=new Float64Array(14);this.waveRead=new Float64Array(14);this.water=water;this.renderer=renderer;this.sound=sound;this.started=false;this.paused=false;this.free=false;this.dive=false;this.showFlow=false;this.result=null;this.elapsed=0;this.gateMoves=0;this.collected=0;this.particles=[];this.uiTick=0;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.frames=0;this.resetState();}
- resetState(){this.skyClock=0;this.orbitClock=0;this.sprayClock=0;this.sprayCursor=0;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.boat={x:-5.1,z:7.65,y:.37,vy:0,vx:0,vz:0,yaw:.15,pitch:0,roll:0,pitchV:0,rollV:0,yawV:0,wetFraction:1,heaveG:1,airborne:false,anchor:false,hull:100,hitCooldown:0,wakeClock:0,distance:0};this.cells=[{x:-11,z:4,got:false},{x:-9,z:-5,got:false},{x:9,z:-7,got:false}];this.home={x:-5.15,z:7.65};this.collected=0;this.elapsed=0;this.gateMoves=0;for(const p of this.particles)this.pool.push(p);this.particles=[];this.result=null;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.water.reset();if(C.environment!==0){const a=WORLD_DEFS[C.environment].boat;this.boat.x=a[0];this.boat.z=a[1];this.home={x:a[0],z:a[1]};}spectrum.sync(0);this.boat.y=this.water.surface(this.boat.x,this.boat.z)+.06;this.rescue=new Rescue(this);this.physics=new ContactPhysics(this);}
+ resetState(){this.skyClock=0;this.orbitClock=0;this.sprayClock=0;this.sprayCursor=0;this.slamCount=0;this.airTime=0;this.airNow=0;this.peakG=1;this.waveMin=0;this.waveMax=0;this.probeClock=0;this.boat={x:-5.1,z:7.65,y:.37,vy:0,vx:0,vz:0,yaw:.15,pitch:0,roll:0,pitchV:0,rollV:0,yawV:0,wetFraction:1,heaveG:1,airborne:false,anchor:false,hull:100,hitCooldown:0,wakeClock:0,distance:0};this.cells=[{x:-11,z:4,got:false},{x:-9,z:-5,got:false},{x:9,z:-7,got:false}];this.home={x:-5.15,z:7.65};this.collected=0;this.elapsed=0;this.gateMoves=0;for(const p of this.particles)this.pool.push(p);this.particles=[];this.landings=[];this.renderer?.gpuPool?.reset();this.result=null;this.hintTick=0;this.lastLevel=.35;this.trend=0;this.water.reset();if(C.environment!==0){const a=WORLD_DEFS[C.environment].boat;this.boat.x=a[0];this.boat.z=a[1];this.home={x:a[0],z:a[1]};}spectrum.sync(0);this.boat.y=this.water.surface(this.boat.x,this.boat.z)+.06;this.rescue=new Rescue(this);this.physics=new ContactPhysics(this);}
  start(free=false){this.resetState();this.started=true;this.paused=false;this.free=free;if(free){this.boat.x=WORLD_DEFS[C.environment].boat[0];this.boat.z=WORLD_DEFS[C.environment].boat[1];applyBasinLevel(WORLD_DEFS[C.environment].level);water.gates.forEach(g=>g.value=g.target=0);this.renderer.resetEffects();}this.dive=false;document.body.classList.remove('prestart','diving');$('intro').classList.add('hidden');for(let id of['help','pause','finish'])$(id).classList.add('hidden');this.sound.toggle(true);clearInput();this.updateTools();this.updateUI();toast(free?'BEACON reset. G sends a rogue wave. B changes the camera. F7 starts the selected test.':'Open intake [1] + close outlet [2] to flood the high shoals.',6);}
  toggleGate(i){if(!this.started||this.paused)return;let g=this.water.gates[i];g.target=g.target>.5?0:1;this.gateMoves++;this.sound.chime('gate');toast((i===0?'Mountain intake':'Ocean outlet')+(g.target?' opening.':' closing.'),2.4);this.updateUI();}
  toggleAnchor(){if(!this.started||this.paused)return;this.boat.anchor=!this.boat.anchor;this.updateTools();toast(this.boat.anchor?'Anchor down. Take a moment. Steer to raise it.':'Anchor raised. Follow the water.',2.3);}
@@ -2515,7 +2676,7 @@ class Game{
   this.physics.step(dt,ix,iz);this.rescue?.step(dt);const speed=Math.hypot(b.vx,b.vz),hit=!!b.contactHit,s=Math.sin(b.yaw),c=Math.cos(b.yaw);
   b.propInput=input;this.advanceSurfaceWakes(dt);b.wakeClock+=dt;if(!C.persistentWakes&&b.wakeClock>C.wakeInterval&&speed>.35&&!hit&&b.wetFraction>.2){b.wakeClock=0;let wx=b.x+s*.76,wz=b.z+c*.76;this.water.impulse(wx,wz,Math.min(1.1,speed*C.wakeImpulse),C.wakeRadius);for(let n=0;n<C.wakeDensity;n++)for(let side of[-1,1])this.addParticle(wx+c*(.29+.14*(n+.5)/C.wakeDensity)*side+s*(n/C.wakeDensity)*.16,wz-s*(.29+.14*(n+.5)/C.wakeDensity)*side+c*(n/C.wakeDensity)*.16,{foam:true,vx:sample.x*.5+c*side*.15,vz:sample.z*.5-s*side*.15,size:.18+speed*.018,life:C.foamLife+rand()*1.4});if(speed>2.3&&rand()<.4)this.splash(wx,wz,2,.35);}
   for(let g of (C.environment===0?this.water.gates:[]))if(g.value>.3){const expected=dt*15*C.spawnRate,emissions=Math.floor(expected)+(rand()<expected%1?1:0);for(let n=0;n<emissions;n++){let ss=this.water.sample(g.x,g.z+.65);if(Math.hypot(ss.x,ss.z)>.45)this.addParticle(g.x+(rand()-.5)*3,g.z+.7,{foam:true,life:2,size:.25,vx:ss.x,vz:ss.z});}}
-  if(C.particles){const p0=performance.now();this.emitBreakers(dt);this.updateParticles(dt);profiler?.add('sprayCPU',performance.now()-p0);}else this.particles.length=0;this.probeSea(dt);
+  if(C.particles){const p0=performance.now();this.emitBreakers(dt);this.updateParticles(dt);this.applyLandings();profiler?.add('sprayCPU',performance.now()-p0);}else{this.particles.length=0;this.landings.length=0;}this.probeSea(dt);
   for(let i=0;i<(C.environment===0?this.cells.length:0);i++){let cell=this.cells[i];if(!cell.got&&Math.hypot(b.x-cell.x,b.z-cell.z)<C.pickupRadius&&this.water.sample(cell.x,cell.z).depth>C.draft){cell.got=true;this.collected++;this.sound.chime();this.splash(cell.x,cell.z,16,.9);toast(this.collected===3?'All lights aboard. Close intake [1], open outlet [2], then head home.':`Tide cell ${String(i+1).padStart(2,'0')} recovered. ${this.collected} / 3 aboard.`,5);this.updateUI();}}
   if(!this.free&&this.collected===3&&Math.hypot(b.x-this.home.x,b.z-this.home.z)<1.65&&this.water.level<=C.harbourLevel)this.finish(true);
   if(!this.free&&b.hull<=0)this.finish(false);
@@ -2523,9 +2684,21 @@ class Game{
  }
  // All environments use the same finite-volume / implicit-damping response.
  buoyancy(dt){const spec=bodySpec(this.boat,this);this.physics.prepare(this.boat,spec);this.physics.hydro(this.boat,spec,dt);}
- addParticle(x,z,opt={}){if(!C.particles||this.particles.length>=C.particleLimit)return null;const p=this.pool.pop()||{},life=opt.life??1.8;
+ addParticle(x,z,opt={}){if(!C.particles||this.particles.length>=C.particleLimit)return null;if(!opt.cpu&&this.renderer?.particleActive?.()){this.spawnGPU(x,z,opt);return null;}const p=this.pool.pop()||{},life=opt.life??1.8;
   p.contactDrop=false;p.castX=p.castY=p.castZ=undefined;p.x=x;p.z=z;p.y=opt.y??(opt.foam?this.water.level+.07:this.water.fastSurface(x,z)+.07);p.vx=opt.vx||0;p.vz=opt.vz||0;p.vy=opt.vy||0;p.foam=!!opt.foam;p.bubble=!!opt.bubble;p.size=opt.size||.07;p.impulseScale=opt.impulseScale??1;p.life=p.maxLife=life;p.age=0;p.tick=this.sprayCursor++%4;this.particles.push(p);return p;
  }
+ // CPU particles plus the GPU slots that can be alive (an upper bound) and the spawns not yet sent.
+ particleCount(){const g=this.renderer?.particleActive?.()?this.renderer.gpuPool:null;return this.particles.length+(g?g.windowCount()+g.pending():0);}
+ // GPU path: the same spawn values as the CPU path, written as a spawn row. The water never reads
+ // GPU state, so every third drop's landing ripple (the CPU path's tick%12 share) is predicted here.
+ spawnGPU(x,z,opt){const life=opt.life??1.8,kind=opt.foam?1:opt.bubble?2:0,y=opt.y??(opt.foam?this.water.level+.07:this.water.fastSurface(x,z)+.07),vx=opt.vx||0,vy=opt.vy||0,vz=opt.vz||0,n=this.sprayCursor++;
+  this.renderer.gpuPool.spawn(this.water.time,x,y,z,vx,vy,vz,life,kind,opt.size||.07,life+(kind===0?C.foamLife:kind===2?.6:0));
+  if(kind===0&&n%3===0)this.predictLanding(x,y,z,vx,vy,vz,life,.018*(opt.impulseScale??1));}
+ // Ballistic flight to the water height under the spawn point, with the drop's wind relaxation.
+ predictLanding(x,y,z,vx,vy,vz,life,amount){const g=C.sprayGravity,wx=storm.table[0]*C.sprayWind,wz=storm.table[1]*C.sprayWind,drop=y-this.water.fastSurface(x,z);
+  const t=Math.max(.12,drop>0?(vy+Math.sqrt(vy*vy+2*g*drop))/g:0);if(t>=life)return;const e=(1-Math.exp(-.8*t))/.8;
+  this.landings.push({t:this.water.time+t,x:x+wx*t+(vx-wx)*e,z:z+wz*t+(vz-wz)*e,amount});}
+ applyLandings(){const w=this.water,a=this.landings;let j=0;for(const l of a){if(l.t>w.time+1e-9){a[j++]=l;continue;}if(w.bilerp(w.h,l.x,l.z)>.035)w.impulse(l.x,l.z,l.amount,.4);}a.length=j;}
  splash(x,z,count=8,power=.7){this.water.impulse(x,z,power,.9);if(!C.particles)return;const y=this.water.surface(x,z)+.12,n=Math.min(C.particleLimit-this.particles.length,Math.round(count*C.sprayDensity));for(let i=0;i<n;i++){const a=rand()*TAU,v=(.3+rand())*power;this.addParticle(x,z,{y,vx:Math.cos(a)*v,vz:Math.sin(a)*v,vy:1+rand()*power*3.5,impulseScale:1/Math.max(1,C.sprayDensity),size:.025+rand()*.055,life:.6+rand()*C.sprayLifetime});}}
 
  emitBubbles(impact){if(!C.bubbles||!C.particles)return;const b=this.boat,n=Math.min(C.bubbleCount,Math.max(0,C.particleLimit-this.particles.length)),surface=this.water.surface(b.x,b.z);
@@ -2541,7 +2714,7 @@ class Game{
    for(let j=0;j<count;j++){const life=(.45+rand()*.55)*C.sprayLifetime;this.addParticle(px+(rand()-.5)*.12,pz+(rand()-.5)*.12,{y:y+rand()*.08,vx:m[6]+windx*.3+(rand()-.5)*1.4,vz:m[8]+windz*.3+(rand()-.5)*1.4,vy:Math.max(0,m[7])*.38+C.sprayLaunch*(.22+rand()*.8),life,size:.018+Math.pow(rand(),2)*.056,impulseScale:.01});}
   }
  }
- updateParticles(dt){const a=this.particles,w=this.water,windx=storm.table[0]*C.sprayWind,windz=storm.table[1]*C.sprayWind,damp=1-Math.exp(-dt*.8);
+ updateParticles(dt){const a=this.particles,w=this.water,windx=storm.table[0]*C.sprayWind,windz=storm.table[1]*C.sprayWind,damp=1-Math.exp(-dt*.8),gpu=this.renderer?.particleActive?.()?this.renderer.gpuPool:null;
   for(let i=a.length-1;i>=0;i--){const p=a[i];p.life-=dt;p.age+=dt;if(p.life<=0||Math.abs(p.x)>180||Math.abs(p.z)>180||i>=C.particleLimit){a[i]=a[a.length-1];a.pop();this.pool.push(p);continue;}
    if(p.bubble){const v=w.flowInto(p.x,p.z,this.flowRead);p.vx=lerp(p.vx,v[1],Math.min(1,dt*1.5));p.vz=lerp(p.vz,v[2],Math.min(1,dt*1.5));p.vy=lerp(p.vy,C.bubbleRise,Math.min(1,dt));p.y+=p.vy*dt;if(p.y>w.fastSurface(p.x,p.z)){p.bubble=false;p.foam=true;p.life=p.maxLife=.6;p.size*=1.5;const m=w.motion(p.x,p.z,this.surfaceRead);p.x=m[12];p.z=m[13];}}
    else if(p.foam){const v=w.flowInto(p.x,p.z,this.flowRead);p.vx=lerp(p.vx,v[1],dt*1.1);p.vz=lerp(p.vz,v[2],dt*1.1);if(v[0]<.025)p.life-=dt*5;}
@@ -2552,6 +2725,8 @@ class Game{
      p.foam=true;p.life=p.maxLife=C.foamLife*(.5+rand()*.5);p.vx*=.2;p.vz*=.2;p.size=.065+rand()*.095;
      // Surface sprites store undisplaced coordinates; the GPU lifts them once.
      const m=w.motion(p.x,p.z,this.surfaceRead);p.x=m[12];p.z=m[13];
+     // With GPU particles, a landed CPU drop continues as GPU foam.
+     if(gpu){gpu.spawn(w.time,p.x,w.level+.07,p.z,p.vx,0,p.vz,p.life,1,p.size,p.life);p.life=0;}
     }
    }
    p.x+=p.vx*dt;p.z+=p.vz*dt;
@@ -2656,14 +2831,14 @@ class Profiler{
   this.active=!!C.monitor&&!this.suspended;this.current=null;this.group=null;if(!this.active){this.poll();return;}
   const p=performance.now();this.poll();const queryPoll=performance.now()-p;this.readMemory(now);
   const cpu=Object.fromEntries(CPU_NAMES.map(k=>[k,0]));cpu.queryPoll=queryPoll;this.frameFFTStart=spectrum.updates;this.frameSlamStart=game.slamCount;
-  const f={id:++this.seq,t:now,frameMs:interval,cpuFrameMs:0,cpu,gpuMs:null,gpuPasses:null,gpuStatus:!this.ext?'unavailable':!C.gpuTiming?'disabled':excluded?'excluded':'not-selected',heapUsed:this.heap.used,heapAllocated:this.heap.total,heapSampleAt:this.heap.at,simSteps:0,simDroppedMs:0,drawCalls:0,triangles:0,points:0,particles:game.particles.length,waterLevel:water.level,simTime:water.time,boatY:game.boat.y,boatVy:game.boat.vy,boatPitch:game.boat.pitch*180/Math.PI,boatRoll:game.boat.roll*180/Math.PI,boatG:game.boat.heaveG,airborne:game.boat.airborne,airTime:game.airTime,slams:game.slamCount,waveMin:game.waveMin,waveMax:game.waveMax,wetFraction:game.boat.wetFraction,boatClamps:game.boat.safetyClamps||0,foamClampedMs:0,excluded:excluded||document.hidden,session:lab?.bench.active?lab.bench.job.id:null};this.current=f;this.startTime=start;
+  const f={id:++this.seq,t:now,frameMs:interval,cpuFrameMs:0,cpu,gpuMs:null,gpuPasses:null,gpuStatus:!this.ext?'unavailable':!C.gpuTiming?'disabled':excluded?'excluded':'not-selected',heapUsed:this.heap.used,heapAllocated:this.heap.total,heapSampleAt:this.heap.at,simSteps:0,simDroppedMs:0,drawCalls:0,triangles:0,points:0,particles:game.particleCount(),waterLevel:water.level,simTime:water.time,boatY:game.boat.y,boatVy:game.boat.vy,boatPitch:game.boat.pitch*180/Math.PI,boatRoll:game.boat.roll*180/Math.PI,boatG:game.boat.heaveG,airborne:game.boat.airborne,airTime:game.airTime,slams:game.slamCount,waveMin:game.waveMin,waveMax:game.waveMax,wetFraction:game.boat.wetFraction,boatClamps:game.boat.safetyClamps||0,foamClampedMs:0,excluded:excluded||document.hidden,session:lab?.bench.active?lab.bench.job.id:null};this.current=f;this.startTime=start;
   if(this.ext&&C.gpuTiming&&gpuSampleSelected(f.id,C.gpuEvery)&&!f.excluded){if(this.pending.length<12){f.gpuStatus='pending';this.group={frame:f,items:[],issued:performance.now()};this.gpuStats.issuedFrames++;}else{this.gpuStats.backpressureFrames++;f.gpuStatus='backpressure';}}
  }
  add(name,ms){if(this.active&&this.current)this.current.cpu[name]=(this.current.cpu[name]||0)+ms;}
  beginPass(name){if(!this.active||!this.current)return;if(this.pass)this.endPass();const p={name,start:performance.now(),q:null};if(this.group){const q=this.gl.createQuery();if(q){this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT,q);p.q=q;this.group.items.push({q,name});}}this.pass=p;}
  endPass(){if(!this.pass)return;const p=this.pass;if(p.q)this.gl.endQuery(this.ext.TIME_ELAPSED_EXT);this.add(p.name,performance.now()-p.start);this.pass=null;}
  draw(triangles,points){if(this.active&&this.current){this.current.drawCalls++;this.current.triangles+=triangles;this.current.points+=points;}}
- end(){if(!this.active||!this.current)return null;this.endPass();const f=this.current;Object.assign(f,{boatY:game.boat.y,boatVy:game.boat.vy,boatPitch:game.boat.pitch*180/Math.PI,boatRoll:game.boat.roll*180/Math.PI,boatG:game.boat.heaveG,airborne:game.boat.airborne,airTime:game.airTime,slams:game.slamCount,boatClamps:game.boat.safetyClamps||0,waveMin:game.waveMin,waveMax:game.waveMax,wetFraction:game.boat.wetFraction,particles:game.particles.length,simTime:water.time,waterLevel:water.level});f.environment=C.environment;f.hour=lights.hour;f.activeLights=lights.active;f.localShadowMaps=renderer.lampShadowMapCount||0;f.lightVolumeActive=renderer.volumeReady;f.fftBuilds=Math.max(0,spectrum.updates-this.frameFFTStart);f.impactDelta=Math.max(0,game.slamCount-this.frameSlamStart);f.hullPressureEnabled=!!C.hullPressure;f.spectrumEnabled=!!C.spectral;f.waveCacheActive=!!renderer.cacheReady;f.cpuFrameMs=performance.now()-this.startTime;f.cpu.boat=Math.max(0,f.cpu.simulation-f.cpu.hydraulics-f.cpu.ripples-f.cpu.buoyancy-f.cpu.sprayCPU-f.cpu.waveProbes-f.cpu.spectrumCPU-f.cpu.hullPressureCPU-f.cpu.rescuePhysics-f.cpu.patchBuoyancy-f.cpu.contactCPU-f.cpu.contactEffectsCPU);if(this.group){if(this.group.items.length)this.pending.push(this.group);else this.gpuStats.issuedFrames--;this.group=null;}if(!f.excluded&&f.frameMs>0){this.live[this.liveIndex]=f;this.liveIndex=(this.liveIndex+1)%this.live.length;this.liveCount=Math.min(this.live.length,this.liveCount+1);}this.active=false;return f;}
+ end(){if(!this.active||!this.current)return null;this.endPass();const f=this.current;Object.assign(f,{boatY:game.boat.y,boatVy:game.boat.vy,boatPitch:game.boat.pitch*180/Math.PI,boatRoll:game.boat.roll*180/Math.PI,boatG:game.boat.heaveG,airborne:game.boat.airborne,airTime:game.airTime,slams:game.slamCount,boatClamps:game.boat.safetyClamps||0,waveMin:game.waveMin,waveMax:game.waveMax,wetFraction:game.boat.wetFraction,particles:game.particleCount(),simTime:water.time,waterLevel:water.level});f.environment=C.environment;f.hour=lights.hour;f.activeLights=lights.active;f.localShadowMaps=renderer.lampShadowMapCount||0;f.lightVolumeActive=renderer.volumeReady;f.fftBuilds=Math.max(0,spectrum.updates-this.frameFFTStart);f.impactDelta=Math.max(0,game.slamCount-this.frameSlamStart);f.hullPressureEnabled=!!C.hullPressure;f.spectrumEnabled=!!C.spectral;f.waveCacheActive=!!renderer.cacheReady;f.cpuFrameMs=performance.now()-this.startTime;f.cpu.boat=Math.max(0,f.cpu.simulation-f.cpu.hydraulics-f.cpu.ripples-f.cpu.buoyancy-f.cpu.sprayCPU-f.cpu.waveProbes-f.cpu.spectrumCPU-f.cpu.hullPressureCPU-f.cpu.rescuePhysics-f.cpu.patchBuoyancy-f.cpu.contactCPU-f.cpu.contactEffectsCPU);if(this.group){if(this.group.items.length)this.pending.push(this.group);else this.gpuStats.issuedFrames--;this.group=null;}if(!f.excluded&&f.frameMs>0){this.live[this.liveIndex]=f;this.liveIndex=(this.liveIndex+1)%this.live.length;this.liveCount=Math.min(this.live.length,this.liveCount+1);}this.active=false;return f;}
  poll(){
   if(!this.ext||!this.pending.length||this.gl.isContextLost())return;const gl=this.gl,now=performance.now();
   if(gl.getParameter(this.ext.GPU_DISJOINT_EXT)){if(!this.disjoint)this.note('gpu-disjoint','Pending GPU samples discarded.');this.disjoint=true;this.gpuStats.disjointFrames+=this.pending.length;for(const g of this.pending){g.frame.gpuStatus='disjoint';for(const q of g.items)gl.deleteQuery(q.q);}this.pending.length=0;return;}this.disjoint=false;
@@ -2700,9 +2875,9 @@ class Benchmark{
  constructor(owner){this.owner=owner;this.active=false;this.automatic=false;this.finishing=false;this.stage='idle';this.queue=[];this.current=null;this.job=null;this.saved=null;this.samplesTotal=0;this.sceneTime=0;this.stressClock=0;this.a=recall((MOBILE_BRANCH?'tideline.touch.baseline.v1':'tideline.breakwater.baseline.v4'),null);if(this.a?.schema!==2)this.a=null;}
  get locked(){return this.active&&this.automatic||this.finishing||this.owner.diagnostic||this.owner.resultHeld;}
  snapshot(){const w={arrays:{},numbers:{},gates:cloneJSON(water.gates)};for(const [k,v]of Object.entries(water)){if(ArrayBuffer.isView(v)&&!['bed','neighbors','edgeGate'].includes(k))w.arrays[k]=new v.constructor(v);else if(typeof v==='number')w.numbers[k]=v;}
-  return{water:w,rescue:game.rescue?.snapshot(),game:{boat:cloneJSON(game.boat),cells:cloneJSON(game.cells),values:Object.fromEntries(Object.entries(game).filter(([k,v])=>typeof v==='number'||typeof v==='boolean'||typeof v==='string'||v===null)),particles:cloneJSON(game.particles),home:{...game.home}},effects:renderer.saveEffects(),settings:{...C},seed,eye:[...renderer.eye],target:[...renderer.target],body:document.body.className,modals:Object.fromEntries(['help','pause','finish','intro'].map(k=>[k,$(k).classList.contains('hidden')])),sound:sound.enabled};
+  return{water:w,rescue:game.rescue?.snapshot(),game:{boat:cloneJSON(game.boat),cells:cloneJSON(game.cells),values:Object.fromEntries(Object.entries(game).filter(([k,v])=>typeof v==='number'||typeof v==='boolean'||typeof v==='string'||v===null)),particles:cloneJSON(game.particles),landings:cloneJSON(game.landings),home:{...game.home}},effects:renderer.saveEffects(),settings:{...C},seed,eye:[...renderer.eye],target:[...renderer.target],body:document.body.className,modals:Object.fromEntries(['help','pause','finish','intro'].map(k=>[k,$(k).classList.contains('hidden')])),sound:sound.enabled};
  }
- restore(){if(!this.saved)return;const s=this.saved;Object.assign(C,s.settings);DT=1/C.simHz;seed=s.seed;storm.sync();water.setWorld(C.environment);renderer.useWorld(C.environment);renderer.restoreEffects(s.effects);for(const[k,v]of Object.entries(s.water.arrays))water[k].set(v);Object.assign(water,s.water.numbers);renderer.fluidDirty=true;water.gates.forEach((g,i)=>Object.assign(g,s.water.gates[i]));spectrum.sync(water.time,true);Object.assign(game,s.game.values);game.boat=s.game.boat;game.cells=s.game.cells;game.particles=s.game.particles;game.home=s.game.home;game.rescue=new Rescue(game);if(s.rescue)game.rescue.restore(s.rescue);game.physics=new ContactPhysics(game);lights.update(game,water);renderer.skyReady=false;renderer.eye=s.eye;renderer.target=s.target;renderer.reflectionValid=false;document.body.className=s.body;for(const [k,hidden]of Object.entries(s.modals))$(k).classList.toggle('hidden',hidden);sound.enabled=s.sound;sound.updateButton();game.updateTools();game.updateUI();clearInput();accumulator=0;this.saved=null;this.owner.syncAll();}
+ restore(){if(!this.saved)return;const s=this.saved;Object.assign(C,s.settings);DT=1/C.simHz;seed=s.seed;storm.sync();water.setWorld(C.environment);renderer.useWorld(C.environment);renderer.restoreEffects(s.effects);for(const[k,v]of Object.entries(s.water.arrays))water[k].set(v);Object.assign(water,s.water.numbers);renderer.fluidDirty=true;water.gates.forEach((g,i)=>Object.assign(g,s.water.gates[i]));spectrum.sync(water.time,true);Object.assign(game,s.game.values);game.boat=s.game.boat;game.cells=s.game.cells;game.particles=s.game.particles;game.landings=s.game.landings||[];game.home=s.game.home;game.rescue=new Rescue(game);if(s.rescue)game.rescue.restore(s.rescue);game.physics=new ContactPhysics(game);lights.update(game,water);renderer.skyReady=false;renderer.eye=s.eye;renderer.target=s.target;renderer.reflectionValid=false;document.body.className=s.body;for(const [k,hidden]of Object.entries(s.modals))$(k).classList.toggle('hidden',hidden);sound.enabled=s.sound;sound.updateButton();game.updateTools();game.updateUI();clearInput();accumulator=0;this.saved=null;this.owner.syncAll();}
  options(){const raw=Number($('benchBudget').value),totalSeconds=[10,15,30,60].includes(raw)?raw:60,mode=$('benchMode').value;return{totalSeconds,activeSeconds:totalSeconds-BENCH_RESERVE_MS/1000,warmup:totalSeconds>=60?1.25:.5,seconds:4,repeats:['ab','audit','cache','verify','lighting','lightAudit','skyCache'].includes(mode)?2:1,scene:$('benchScene').value,mode};}
  variants(mode,base){if(mode==='lightAudit')return[{name:'Local lights off',settings:{...base,localLights:false}},{name:'Local lights on',settings:{...base,localLights:true}}];if(mode==='skyCache')return[{name:'Sky reuse off',settings:{...base,skyCache:false}},{name:'Sky reuse on',settings:{...base,skyCache:true}}];if(mode==='audit'){const off={...base,slamDamping:0};UPGRADE_KEYS.forEach(k=>off[k]=false);return[{name:'Base',settings:off},{name:'Upgrade',settings:base}];}if(mode==='cache')return[{name:'Cache off',settings:{...base,waveCache:false}},{name:'Cache on',settings:{...base,waveCache:true}}];if(mode==='ab')return[{name:'A',settings:this.a?.settings||base},{name:'B',settings:base}];if(mode==='effects'){const v=[{name:'Reference',settings:base}];for(const[k,name]of[['localFog','Light beams off'],['localShadows','Local shadows off'],['localLights','Local lights off'],['skyCache','Sky reuse off'],['spectral','FFT waves off'],['sunShadows','Shadows off'],['focusedCaustics','Focused light off'],['hullPressure','Hull pressure off'],['quadraticDrag','Quadratic drag off'],['softParticles','Soft particles off'],['ssr','SSR off'],['persistentFoam','Foam history off'],['bloom','Bloom off'],['reflection','Reflection off'],['particles','Particles off'],['caustics','Caustics off'],['foam','Foam off'],['simulation','Water solver off'],['waterVisible','Water surface off']])if(base[k])v.push({name,settings:{...base,[k]:false}});return v;}if(mode==='pixels')return[.5,.75,1,1.25].map(x=>({name:'Scale ×'+x,settings:{...base,renderScale:clamp(base.renderScale*x,.4,2)}}));if(mode==='simulation')return[1,2,4,8].map(x=>({name:x+' water substep'+(x===1?'':'s'),settings:{...base,solverSubsteps:x}}));return[{name:'Current',settings:base}];}
  start(automatic=true){
@@ -2772,7 +2947,7 @@ class Benchmark{
   if(this.active&&now>=this.activeDeadline)this.stop('Complete');
   if(this.active)this.updateProgress(now);
  }
- finishRun(now,status){if(!this.current)return;this.current.endedAt=now;this.current.simEnd=water.time;const volume=water.volume(),volumeStart=this.current.volumeStart??volume,boundary=water.boundaryVolume-(this.current.boundaryStart??water.boundaryVolume);this.current.physics={volumeStart,volumeEnd:volume,boundaryTransfer:boundary,residualVolume:volume-volumeStart-boundary,relativeVolumeResidual:Math.abs(volume-volumeStart-boundary)/Math.max(1,volumeStart),finiteDepth:water.h.every(Number.isFinite),minimumDepth:water.h.reduce((a,b)=>Math.min(a,b),Infinity),scope:'Transport volume only. Gerstner/FFT displacement and foam do not carry this volume.'};this.current.status=status;this.current.settingsAtEnd=settingsCopy();this.current.renderSize=[...renderer.size];this.current.reflectionSize=[renderer.reflect.w,renderer.reflect.h];this.current.memoryAtEnd=profiler.memory();this.current.finalState={environment:C.environment,hour:lights.hour,localLights:lights.active,localShadowMaps:renderer.lampShadowMapCount||0,beamSize:renderer.volumeReady?[renderer.volumeTarget.w,renderer.volumeTarget.h]:null,level:water.level,particles:game.particles.length,boat:{...game.boat},boundaryVolume:water.boundaryVolume};if(!this.current.frames.length)this.current.status='partial';this.job.runs.push(this.current);this.current=null;}
+ finishRun(now,status){if(!this.current)return;this.current.endedAt=now;this.current.simEnd=water.time;const volume=water.volume(),volumeStart=this.current.volumeStart??volume,boundary=water.boundaryVolume-(this.current.boundaryStart??water.boundaryVolume);this.current.physics={volumeStart,volumeEnd:volume,boundaryTransfer:boundary,residualVolume:volume-volumeStart-boundary,relativeVolumeResidual:Math.abs(volume-volumeStart-boundary)/Math.max(1,volumeStart),finiteDepth:water.h.every(Number.isFinite),minimumDepth:water.h.reduce((a,b)=>Math.min(a,b),Infinity),scope:'Transport volume only. Gerstner/FFT displacement and foam do not carry this volume.'};this.current.status=status;this.current.settingsAtEnd=settingsCopy();this.current.renderSize=[...renderer.size];this.current.reflectionSize=[renderer.reflect.w,renderer.reflect.h];this.current.memoryAtEnd=profiler.memory();this.current.finalState={environment:C.environment,hour:lights.hour,localLights:lights.active,localShadowMaps:renderer.lampShadowMapCount||0,beamSize:renderer.volumeReady?[renderer.volumeTarget.w,renderer.volumeTarget.h]:null,level:water.level,particles:game.particleCount(),boat:{...game.boat},boundaryVolume:water.boundaryVolume};if(!this.current.frames.length)this.current.status='partial';this.job.runs.push(this.current);this.current=null;}
  updateProgress(now){
   if(!this.job)return;now=performance.now();const elapsed=now-this.job.startTime,progress=clamp(elapsed/(this.job.options.activeSeconds*1000),0,1);
   $('benchProgress').value=progress;$('flightProgress').value=progress;
@@ -2935,7 +3110,7 @@ class Lab{
   const frames=profiler.window(now),s=summarize(frames);this.lastSummary=s;
   const state=this.bench.active?(this.bench.stage==='warmup'?'WARM-UP':'RECORDING'):game.paused?'PAUSED':C.monitor?'FREE SAIL':'MONITOR OFF';$('liveState').textContent=state;$('labFootState').textContent=state+' · '+N+' × '+N;
   $('liveFPS').textContent=C.monitor?fmt(s.fps,1):'OFF';$('liveFrame').textContent=fmt(s.frame.p95);$('liveCPU').textContent=fmt(s.cpu.p95);$('liveGPU').textContent=fmt(s.gpu.p95);$('gpuState').textContent=!profiler.ext?'Unavailable in this browser':!C.gpuTiming?'GPU sampling off':s.gpu.n?`${s.gpu.n} samples · ${Math.round(s.gpuCoverage*100)}% coverage`:'Waiting for valid GPU samples';
-  const memory=profiler.memory();$('liveMemory').textContent='JS heap ≈ '+mib(memory.heap.used)+' · not process RAM';$('liveDraws').textContent=`${fmt(s.drawCalls.mean,0)} draws · ${fmt(s.triangles.mean/1000,1)}k triangles · ${game.particles.length} particles`;
+  const memory=profiler.memory();$('liveMemory').textContent='JS heap ≈ '+mib(memory.heap.used)+' · not process RAM';$('liveDraws').textContent=`${fmt(s.drawCalls.mean,0)} draws · ${fmt(s.triangles.mean/1000,1)}k triangles · ${game.particleCount()} particles`;
   $('liveHeadroom').textContent=`${C.targetFPS} FPS budget: ${fmt(s.budgetMs)} ms. Reserve: ${C.reservePct}%. Main allowance: ${fmt(s.cpuAllowanceMs)} ms. GPU: ${fmt(s.gpuAllowanceMs)} ms. Not hardware use %.`;
   if(this.hudVisible)this.drawGraph(frames,s.budgetMs);
   if(this.panelOpen&&this.activeTab==='monitor'){
@@ -2948,7 +3123,7 @@ class Lab{
   if(this.panelOpen&&this.activeTab==='controls'&&$('stateDetails').open)this.inspectState();
  }
  drawGraph(frames,budget){const canvas=$('perfGraph'),ctx=canvas.getContext('2d'),w=canvas.width,h=canvas.height,a=frames.slice(-180),max=Math.max(34,budget*2,Math.min(160,Math.max(...a.map(f=>f.frameMs),0)));ctx.clearRect(0,0,w,h);ctx.strokeStyle='#c0cebb';ctx.setLineDash([5,5]);const y=h-budget/max*(h-8)-4;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();ctx.setLineDash([]);for(const [key,color]of[['frameMs','#3d7869'],['cpuFrameMs','#c78349'],['gpuMs','#6984ba']]){ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();let have=false;for(let i=0;i<a.length;i++){const value=a[i][key];if(!Number.isFinite(value))continue;const x=i/Math.max(1,a.length-1)*w,y=h-clamp(value/max,0,1)*(h-8)-4;if(!have)ctx.moveTo(x,y);else ctx.lineTo(x,y);have=true;}ctx.stroke();}$('graphLimit').textContent='0–'+Math.ceil(max)+' ms';}
- inspectState(){const arrays={};for(const[k,v]of Object.entries(water))if(ArrayBuffer.isView(v))arrays[k]={type:v.constructor.name,length:v.length,bytes:v.byteLength};$('stateInspector').textContent=JSON.stringify({build:BUILD,settingsHash:hashSettings(settingsCopy()),fixed:{worldSizeMetres:SIZE,gridSide:N,cells:COUNT,cellSizeMetres:DX,nearPlane:.1,farPlane:210,maxAccumulatorSeconds:.15,maxTextureDimension:renderer.maxDimension,maxGPUFramesInFlight:12,maxRecordedFrames:120000,maxFramesPerSegment:60000,maxFullReports:3},boat:game.boat,water:{time:water.time,level:water.level,previousLevel:water.previousLevel,boundaryVolume:water.boundaryVolume,gates:water.gates},game:{elapsed:game.elapsed,frames:game.frames,collected:game.collected,free:game.free,paused:game.paused,particles:game.particles.length,cells:game.cells},renderer:{eye:renderer.eye,target:renderer.target,renderSize:renderer.size,underwater:renderer.underwater},buffers:arrays,gpuQueryStats:profiler.gpuStats},null,2);}
+ inspectState(){const arrays={};for(const[k,v]of Object.entries(water))if(ArrayBuffer.isView(v))arrays[k]={type:v.constructor.name,length:v.length,bytes:v.byteLength};$('stateInspector').textContent=JSON.stringify({build:BUILD,settingsHash:hashSettings(settingsCopy()),fixed:{worldSizeMetres:SIZE,gridSide:N,cells:COUNT,cellSizeMetres:DX,nearPlane:.1,farPlane:210,maxAccumulatorSeconds:.15,maxTextureDimension:renderer.maxDimension,maxGPUFramesInFlight:12,maxRecordedFrames:120000,maxFramesPerSegment:60000,maxFullReports:3},boat:game.boat,water:{time:water.time,level:water.level,previousLevel:water.previousLevel,boundaryVolume:water.boundaryVolume,gates:water.gates},game:{elapsed:game.elapsed,frames:game.frames,collected:game.collected,free:game.free,paused:game.paused,particles:game.particleCount(),cells:game.cells},renderer:{eye:renderer.eye,target:renderer.target,renderSize:renderer.size,underwater:renderer.underwater},buffers:arrays,gpuQueryStats:profiler.gpuStats},null,2);}
  readNotes(){const number=(id,max)=>{const input=$(id);if(!input||input.value==='')return null;const n=Number(input.value);return Number.isFinite(n)?clamp(n,0,max):null;};return{source:'external/manual',toolAndScope:$('externalSource')?.value.trim()||'',cpuPct:number('externalCPU',10000),gpuPct:number('externalGPU',100),ramMiB:number('externalRAM',1000000),vramMiB:number('externalVRAM',1000000),hardwareNotes:$('hardwareNotes')?.value||'',testNotes:$('reportNotes')?.value||'',attachedAt:new Date().toISOString()};}
  loadNotes(){const r=this.report(),n=r?.external||recall('tideline.lab.notes.v2',{});for(const[id,k]of[['externalSource','toolAndScope'],['externalCPU','cpuPct'],['externalGPU','gpuPct'],['externalRAM','ramMiB'],['externalVRAM','vramMiB'],['hardwareNotes','hardwareNotes'],['reportNotes','testNotes']])$(id).value=n[k]??'';}
  attachNotes(){const notes=this.readNotes(),r=this.report();if(r)r.external=notes;store('tideline.lab.notes.v2',notes);$('notesStatus').textContent=r?'External/manual notes attached to '+r.id+'.':'Notes saved for the next capture. External values are not browser measurements.';}
@@ -2966,7 +3141,7 @@ class Lab{
  async checkWater(){if(this.bench.active||this.bench.finishing||this.diagnostic)return;this.diagnostic=true;profiler.suspended=true;profiler.active=false;const paused=game.paused;game.paused=true;this.lockUI();let test;try{test=new Water();test.gates.forEach(g=>g.value=g.target=0);const before=test.volume();for(let i=0;i<600;i++){test.step(DT,true);if(i%20===19){$('checkResult').textContent=`Closed-domain numerical check: ${i+1} / 600 steps.`;await new Promise(requestAnimationFrame);}}const after=test.volume(),finite=test.h.every(Number.isFinite),min=Math.min(...test.h),relativeDrift=Math.abs(after-before)/Math.max(1,before);this.lastCheck={at:new Date().toISOString(),grid:N,steps:600,dt:DT,settings:settingsCopy(),before,after,relativeDrift,minDepth:min,finite,pass:finite&&min>=0&&relativeDrift<1e-5};$('checkResult').textContent=`${this.lastCheck.pass?'PASS':'FAIL'} · volume drift ${relativeDrift.toExponential(3)} · minimum depth ${min.toFixed(6)} m. This checks bookkeeping, not physical accuracy.`;}catch(e){$('checkResult').textContent='Numerical check failed: '+e.message;profiler.note('numerical-error',e.message);}finally{test=null;game.paused=paused;this.diagnostic=false;profiler.suspended=false;profiler.clearLive();accumulator=0;this.lockUI();}}
  handleFailure(error){this.fatalMessage=String(error?.message||error);profiler.note('fatal-error',this.fatalMessage);if(this.bench.active)this.bench.stop('Runtime error: '+this.fatalMessage);this.pendingExport=this.queuedExport=null;try{profiler.endPass();}catch(e){}profiler.active=false;profiler.suspended=true;const groups=[...profiler.pending];if(profiler.group)groups.push(profiler.group);for(const g of groups){g.frame.gpuStatus=renderer.gl.isContextLost()?'context-lost':'aborted';for(const q of g.items)profiler.gl.deleteQuery(q.q);}profiler.pending.length=0;profiler.group=null;if(this.bench.finishing)this.bench.drain(performance.now(),true);game.paused=true;$('errorSave')?.classList.remove('hidden');}
  saveDiagnostic(){const data={schema:'tideline.diagnostic.v1',build:BUILD,createdAt:new Date().toISOString(),error:this.fatalMessage,settings:settingsCopy(),events:profiler.events,benchmark:this.report()};downloadBlob(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),'tideline-diagnostic-'+Date.now()+'.json');}
- liveReport(){const frames=profiler.window().map(f=>({...f,cpu:{...f.cpu},gpuPasses:f.gpuPasses?{...f.gpuPasses}:null}));const s=settingsCopy(),id='TL-live-'+Date.now();return{schema:'tideline.benchmark.v2',build:BUILD,id,createdAt:new Date().toISOString(),savedAt:new Date().toISOString(),kind:'live-window',status:'exploratory',stopReason:'Live rolling window. No warm-up, fixture reset, or repeat control.',hardware:profiler.hardware(),settingsAtStart:s,settingsHash:hashSettings(s),measurementDefinitions:METRICS,external:this.readNotes(),events:profiler.events.slice(),gpuQueryStats:{...profiler.gpuStats},integrityCheck:this.lastCheck,pageMemorySample:this.pageMemoryResult??null,runs:[{id:id+'-1',scene:'live',sceneLabel:game.dive?'Live underwater':'Live play',variant:'Current',repeat:1,status:'exploratory',settings:s,settingsHash:hashSettings(s),renderSize:[...renderer.size],reflectionSize:[renderer.reflect.w,renderer.reflect.h],frames,summary:summarize(frames),memoryAtEnd:profiler.memory(),finalState:{boat:{...game.boat},level:water.level,particles:game.particles.length},longTasks:profiler.longTasks.filter(e=>e.startTime>performance.now()-10000),longAnimationFrames:profiler.longFrames.filter(e=>e.startTime>performance.now()-10000)}]};}
+ liveReport(){const frames=profiler.window().map(f=>({...f,cpu:{...f.cpu},gpuPasses:f.gpuPasses?{...f.gpuPasses}:null}));const s=settingsCopy(),id='TL-live-'+Date.now();return{schema:'tideline.benchmark.v2',build:BUILD,id,createdAt:new Date().toISOString(),savedAt:new Date().toISOString(),kind:'live-window',status:'exploratory',stopReason:'Live rolling window. No warm-up, fixture reset, or repeat control.',hardware:profiler.hardware(),settingsAtStart:s,settingsHash:hashSettings(s),measurementDefinitions:METRICS,external:this.readNotes(),events:profiler.events.slice(),gpuQueryStats:{...profiler.gpuStats},integrityCheck:this.lastCheck,pageMemorySample:this.pageMemoryResult??null,runs:[{id:id+'-1',scene:'live',sceneLabel:game.dive?'Live underwater':'Live play',variant:'Current',repeat:1,status:'exploratory',settings:s,settingsHash:hashSettings(s),renderSize:[...renderer.size],reflectionSize:[renderer.reflect.w,renderer.reflect.h],frames,summary:summarize(frames),memoryAtEnd:profiler.memory(),finalState:{boat:{...game.boat},level:water.level,particles:game.particleCount()},longTasks:profiler.longTasks.filter(e=>e.startTime>performance.now()-10000),longAnimationFrames:profiler.longFrames.filter(e=>e.startTime>performance.now()-10000)}]};}
  copyScene(){const w=Math.min(1440,renderer.canvas.width),h=Math.max(1,Math.round(w*renderer.canvas.height/renderer.canvas.width)),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');if(renderer.gl.isContextLost()){x.fillStyle='#193e3a';x.fillRect(0,0,w,h);x.fillStyle='#edf4df';x.font='16px Arial';x.fillText('Scene unavailable: graphics context lost.',15,35);}else{x.drawImage(renderer.canvas,0,0,w,h);x.drawImage($('marks'),0,0,w,h);}return c;}
  export(type,live=false){if(this.diagnostic||this.exportBusy){this.message('Finish the active diagnostic or export first.');return;}if(this.bench.active||this.bench.finishing){this.queuedExport={type,live:false};$('exportStatus').textContent='Capture/export queued for after the test. It will not affect timed frames.';return;}this.pendingExport={type,live};$('exportStatus').textContent='Preparing local evidence file.';if(this.resultHeld)this.afterRender();}
  processQueuedExport(){if(this.queuedExport){this.pendingExport=this.queuedExport;this.queuedExport=null;}}
@@ -4056,8 +4231,8 @@ const SURFACE_FEATURES=['naturalFoam','waveWetness','filteredHighlights','persis
 // lightStyle: 0 Glow keeps the teal crest light, 1 Natural filters the sun through the water.
 const LIGHT_STYLES=['Glow','Natural'];
 // Surface 10.2 switches. Each milestone that adds a feature appends it; upgradeAudit compares all off and all on.
-const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain'];
-PASS_NAMES.push('wetHistory');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU');
+const UPGRADE_FEATURES=['farSeaRoughness','sprayLighting','hemiAmbient','vertexAO','bloomChain','gpuParticles'];
+PASS_NAMES.push('wetHistory','particleSim');CPU_NAMES.push('wetHistory','wetBodiesCPU','wakeSourcesCPU','particleSim');
 
 Renderer.prototype.attachWetVertices=function(mesh,vertices){
  const unique=[],index=new Uint32Array(mesh.count),map=new Map();
@@ -4221,10 +4396,11 @@ const surfaceMemory=Profiler.prototype.memory;
 Profiler.prototype.memory=function(){const m=surfaceMemory.call(this);let array=0;
  for(const mesh of [renderer.boat,renderer.workboatMesh])if(mesh?.wetValues)for(const k of ['wetPositions','wetIndex','wetSamples','wetValues'])array+=mesh[k].byteLength;
  for(const k of ['bodyWetRead','wakeSourceRead','wakeSegmentData','wakeInfoData'])array+=renderer[k]?.byteLength||0;
- const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0);
+ const targets=[...(renderer.surfaceWetTargets||[]),renderer.surfaceWetSaved].filter(Boolean).reduce((n,t)=>n+t.w*t.h*4,0)+(renderer.particleTargets?.bytes||0)+(renderer.bedTex?N*N*4:0);
+ const pool=renderer.gpuPool;if(pool?.staging)array+=pool.staging.byteLength+pool.birth.byteLength+pool.expiry.byteLength;
  m.ownedArrayBytes+=array;m.trackedGPUBytes+=targets;m.gpuTargetBytes+=targets;return m;
 };
-Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
+Renderer.prototype.surfaceReport=function(){return {features:Object.fromEntries(SURFACE_FEATURES.map(k=>[k,C[k]])),lightStyle:LIGHT_STYLES[C.lightStyle]||'Glow',renderInterpolation:!!C.renderInterpolation,upgradeFeatures:Object.fromEntries(UPGRADE_FEATURES.map(k=>[k,C[k]])),wetHistorySize:this.surfaceWetTargets?.[0].w||0,wetHistoryReady:!!this.surfaceWetReady,bodyWetHz:C.bodyWetHz,hullSamples:(this.boat?.wetSamples?.length||0)/2,workboatSamples:(this.workboatMesh?.wetSamples?.length||0)/2,wakeSources:this.water.wakeSources||0,wakeNetError:this.water.wakeNetError||0,gpuParticles:{active:this.particleActive(),fallback:this.particleFallback||null,capacity:this.particleTargets?.cap||0,window:this.gpuPool?.windowCount()||0,pending:this.gpuPool?.pending()||0,uploadedLastFrame:this.particleUploads||0,motes:this.particleMotes||0,cpuParticles:game?.particles.length||0,predictedLandings:game?.landings?.length||0},notes:'Column wet marks and vertex moisture are approximate. Wakes inject balanced local surface velocity, not complete ship-wave energy. No mesh or particle-limit increase.'};};
 const surfaceLiveReport=Lab.prototype.liveReport;
 Lab.prototype.liveReport=function(){const report=surfaceLiveReport.call(this);if(report.runs[0])report.runs[0].surfaceDetail=renderer.surfaceReport();return report;};
 const surfaceFinish=Benchmark.prototype.finishRun;
@@ -4345,7 +4521,7 @@ try{
  // Debug tools are opt-in and are not used to drive gameplay. They make the
  // shipped single file directly inspectable in a browser or automated test.
  window.__tideline={surfaceFeatures:SURFACE_FEATURES,renderInterpolated,upgradeFeatures:UPGRADE_FEATURES,quickLook:{controls:QUICK_LOOK,set:lookSet,reset:resetLook,sync:()=>{gallerySync();lookSync(mobileUI?.root);},pane:showLookPane},ContactPhysics,ContactWorld,bodySpec,contactStudy,mobile:mobileUI,uiBranch:MOBILE_BRANCH?'mobile':'desktop',surfaceStudy,wallWaveCheck,Rescue,coastalSample,rescueTerrain,lights,WORLD_DEFS,chooseWorld,testScenes,drawAbyssCard,water,game,renderer,storm,spectrum,OceanSpectrum,analyzeReport,framesCSV,UPGRADE_KEYS,Sound,Water,DT,terrainHeight,lab,profiler,settings:C,parameters:PARAMS,build:BUILD,profiles:WORKLOAD_PROFILES,phonePreset:PHONE_PRESET,phonePresetReport,limits:{BENCH_MAX_MS,BENCH_RESERVE_MS},summarize,distribution,gpuSampleSelected,
-  stats:()=>({level:water.level,time:game.elapsed,volume:water.volume(),boundaryVolume:water.boundaryVolume,boat:{...game.boat},cells:game.cells.map(c=>({...c,depth:water.sample(c.x,c.z).depth,bed:terrainHeight(c.x,c.z)})),gates:water.gates.map(g=>({...g})),collected:game.collected,paused:game.paused,free:game.free,result:game.result,frames:game.frames,particles:game.particles.length,error:renderer.gl.getError()}),
+  stats:()=>({level:water.level,time:game.elapsed,volume:water.volume(),boundaryVolume:water.boundaryVolume,boat:{...game.boat},cells:game.cells.map(c=>({...c,depth:water.sample(c.x,c.z).depth,bed:terrainHeight(c.x,c.z)})),gates:water.gates.map(g=>({...g})),collected:game.collected,paused:game.paused,free:game.free,result:game.result,frames:game.frames,particles:game.particleCount(),error:renderer.gl.getError()}),
   conservationCheck:(steps=180)=>{let test=new Water();test.gates[1].value=test.gates[1].target=0;let before=test.volume();for(let i=0;i<steps;i++)test.step(DT,true);let after=test.volume();return{before,after,relativeDrift:Math.abs(after-before)/before,minDepth:test.h.reduce((a,b)=>Math.min(a,b),Infinity),finite:test.h.every(Number.isFinite)};}
  };
  BOOT.readyToRun(BOOT.hooks);
