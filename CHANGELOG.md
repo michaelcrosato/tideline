@@ -1,6 +1,29 @@
 # Changes
 
-## Surface 10.2 — TL-SURFACE-20261006.1
+## Surface 10.2 phase 2 — TL-SURFACE-20261006.2
+
+Phase 2 of the Surface 10.2 upgrade plan (`docs/upgrade-plan.md`, M9–M13): richer spray, foam and light. Every effect has a switch in Advanced settings and joins the **Surface 10.2 comparison**. The phone preset keeps them light or off. There is still no automatic FPS-based quality change.
+
+### Spray
+
+- **GPU particles:** spray, foam, bubbles and mist live in float textures and move on the GPU. Drops land on the full wave surface (every swell mode, the FFT field and the reef breaker) and turn to foam where they land; bubbles surface as foam. Drops that hit scenery stay on the CPU. Spray CPU time per physics step fell from about 2.1 to 0.55 ms. Without float render targets the 10.1 CPU path runs.
+- **Streaks:** drops and bubbles stretch along their screen motion; still drops stay round.
+- **Mist:** breaking crests, hull slams and waves striking walls release large, faint, soft puffs that drift with the wind. Mist never changes the simulation. Off in the phone preset.
+- **Bow spray:** each bow corner throws a sheet of drops along the hull flare from the water rushing past it; hard slams add a burst and mist. It shares the contact drop cap and the particle limit.
+
+### Foam
+
+- **Foam material:** foam has its own surface: a normal from the foam density, a rough sheen, wrap lighting for light scattered through the layer, light through thin foam from behind, and darker, thinner edges. The water and the reef crest sheet share one foam colour.
+
+### Light
+
+- **Stable beams:** lamp-beam samples move each frame and a history pass reprojects them, so beams no longer crawl with a screen-locked dither. Against a 32-sample reference, the error of an 8-sample beam falls from 14% to 2% once settled. Underwater light shafts share the pass (at beam resolution instead of full resolution). Phone preset: 8 beam samples.
+
+### Tests
+
+- New regression checks for each item: landing on the full surface, rendering never changing the simulation, the live count, streak length, mist determinism, bow spray budgets, a foam material probe, and beam history convergence and reprojection.
+
+## Surface 10.2 phase 1 — TL-SURFACE-20261006.1
 
 Phase 1 of the Surface 10.2 upgrade plan (`docs/upgrade-plan.md`, M0–M8): foundations, lighting fixes and cheap visual wins. New features have switches in Advanced settings and join the **Surface 10.2 comparison** (prior / new / new / prior). There is still no automatic FPS-based quality change.
 
