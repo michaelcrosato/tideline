@@ -284,6 +284,24 @@ async def main(args):
      &&slam.slams===2&&slam.drops>=2*Math.min(C.contactSprayBurst,20)&&slam.spawns.some(p=>p.kind===3)&&off.drops===0&&r.gl.getError()===0;
     return {ok,rest:rest.drops,astern:astern.drops,ahead:ahead.drops,hard:hard.drops,cap:30*2*cap,slam:{drops:slam.drops,slams:slam.slams,mist:slam.spawns.filter(p=>p.kind===3).length},off:off.drops,fwd,sides,out};
    }finally{Object.assign(b,pose);Object.assign(C,saved);D.storm.sync();pool.reset();g.particles.length=0;}''')
+  # Foam material: one shader function for the water and the crest sheet, probed directly.
+  await check('Foam material wraps light, lets light through thin foam and thins its edges', '''const saved={...C};
+   try{C.foamMaterial=true;C.sunStrength=1.65;C.timeLighting=false;r.render(g,0);const lum=c=>.2126*c[0]+.7152*c[1]+.0722*c[2],up=[0,1,0],low=[0,.3,-.95];
+    const front=[0,1,.2],back=[0,.3,.95],side=[.95,.3,0];
+    const o=r.probeFoam([{n:up,v:front,l:up,density:.9},{n:up,v:front,l:[0,-.17,.98],density:.9},{n:up,v:front,l:[0,-.6,.8],density:.9},{n:up,v:front,l:up,density:.9,shade:0},
+     {n:up,v:front,l:up,density:.15},{n:up,v:back,l:low,density:.15},{n:up,v:side,l:low,density:.15},{n:up,v:back,l:low,density:.9}]),o2=r.probeFoam([{n:up,v:side,l:low,density:.9}]);
+    if(!o||!o2)return {ok:false,error:'no float probe'};const L=o.map(lum),denseSide=lum(o2[0]);
+    // Wrap: light 10 degrees below the horizon still lights dense foam; 37 degrees below adds nothing to the ambient.
+    // Thin foam is darker under front light, and gains more than dense foam from light behind it (the sheen is the same for both).
+    const wrap=L[1]>L[3]*1.05&&Math.abs(L[2]-L[3])<1e-3,thin=L[4]<L[0]*.8,through=(L[5]-L[6])-(L[7]-denseSide)>.01,cover=o[4][3]<o[0][3]&&Math.abs(o[0][3]-1)<1e-3;
+    return {ok:wrap&&thin&&through&&cover&&r.gl.getError()===0,lum:L.map(v=>+v.toFixed(4)),denseSide:+denseSide.toFixed(4),cover:o.map(c=>+c[3].toFixed(3)),wrap,thin,through,coverOk:cover};
+   }finally{Object.assign(C,saved);}''')
+  await check('Foam material renders on and off on the reef', '''const saved={...C},gl=r.gl;
+   try{l.resultHeld=false;D.chooseWorld(3);l.resultHeld=true;Object.assign(C,{renderScale:.4,visualGrid:65,sprayRate:0,underParticles:0,waveScale:2.2,rogueEnabled:false,cameraMode:3,orbitAuto:false,orbitHeight:5,orbitRadius:14});D.storm.sync();r.camera(g,100);
+    const grab=()=>{r.render(g,0);r.render(g,0);const [w,h]=r.size,px=new Uint8Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);let s=0;for(let i=0;i<px.length;i+=4)s+=px[i]+px[i+1]+px[i+2];return {px,mean:s/(px.length*.75)};};
+    for(let i=0;i<60;i++)g.step(D.DT);D.storm.sync();D.spectrum.sync(w.time);C.foamMaterial=false;const off=grab();C.foamMaterial=true;const on=grab();let diff=0;for(let i=0;i<on.px.length;i++)if(Math.abs(on.px[i]-off.px[i])>4)diff++;
+    return {ok:diff>0&&Math.abs(on.mean-off.mean)<.15*off.mean&&gl.getError()===0,changed:diff,meanOff:+off.mean.toFixed(1),meanOn:+on.mean.toFixed(1)};
+   }finally{Object.assign(C,saved);D.storm.sync();}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

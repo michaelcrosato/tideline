@@ -26,6 +26,8 @@ engine=(ROOT/'src/engine.js').read_text(encoding='utf-8')
 shared=[re.search(r'const '+name+r'=`(.*?)`;',engine,re.S) for name in ['sharedGLSL','surfaceGLSL']]
 plain=[t for m in shared if m for t in re.findall(r'\buniform\s+(?:(?:highp|mediump|lowp)\s+)?(\w+)',m.group(1)) if not t.startswith('sampler')]
 check('Shared shader values are declared only in the Frame block',all(shared) and '${FRAME.glsl}' in shared[0].group(1) and not plain)
+crest=re.search(r'const crestFS=`(.*?)`;',engine,re.S);water=re.search(r'const waterFS=`(.*?)`;',engine,re.S)
+check('Water and crest sheet share the foam material',bool(crest and water) and 'foamLight(' in crest.group(1) and 'foamLight(' in water.group(1) and 'vec3 foamLight(' in shared[0].group(1))
 if shutil.which('node'):
     for name in ['bootkit.js','engine.js','surface.js','launch.js']:
         result=subprocess.run(['node','--check',str(ROOT/'src'/name)],capture_output=True,text=True)
