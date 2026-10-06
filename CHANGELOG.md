@@ -1,5 +1,34 @@
 # Changes
 
+## Surface 10.2 — TL-SURFACE-20261006.1
+
+Phase 1 of the Surface 10.2 upgrade plan (`docs/upgrade-plan.md`, M0–M8): foundations, lighting fixes and cheap visual wins. New features have switches in Advanced settings and join the **Surface 10.2 comparison** (prior / new / new / prior). There is still no automatic FPS-based quality change.
+
+### Phones and CPU
+
+- **Phone preset:** the first touch-interface run with no saved settings applies an explicit Phone preset (0.9 MP, DPR 1.5, visual grid 257, half-scale SSR, reflections every 2nd frame, 256 foam map, 8,000 particles, 2 bloom levels). Reports record it; your own changes override it.
+- **Shared uniform block:** per-frame shared shader values moved into one std140 `Frame` block, sent once per frame. GL calls per frame fell by about 55%.
+
+### Light and water
+
+- **Light style:** new Glow / Natural choice in Advanced settings and Quick Look. Glow keeps the teal crest light (default). Natural filters the sun through the water, so crests turn gold at dawn and dusk.
+- **Lighting fixes (both styles):** sun shadow no longer dims reflections, specular or crest glow twice; the water reflects the sun only as its highlight, not also as a sky disc; sun and moon cross-fade near the horizon instead of switching; the water body and underwater haze follow the sun's tint and strength.
+- **Crest sheets** use the water's Fresnel settings, air fog and shadow, no longer write depth, and fade with depth like the surface wave.
+- **Far-sea roughness:** outside the basin the slope energy of the waves the LOD fades out widens the highlight, so the far sea no longer looks mirror-flat or sparkly. Scenery, water and crest sheets share one fog start.
+- **Reef breaker:** no step at the basin edge (the reef reads the coast bed outside the grid), outer rings no longer alias it, its trough is flat, and its slope includes the depth and breakwater fades. CPU and GPU stay identical.
+- **Spray** scatters light forward toward the sun, takes sun shadow and fades into the air haze.
+- **Ambient and AO:** scenery ambient takes its colour and direction from the sky (brighter from above, a ground bounce below), and per-vertex ambient occlusion is baked once per scene.
+- **Final image:** exact sRGB encoding, vignette after the tone curve, an optional AgX-style tone curve (ACES stays the default), and a smooth dual-filter bloom chain from half resolution in place of the blocky single pass.
+
+### Motion
+
+- **Livelier boats:** lighter hull damping lets boats bob and rock again; a 0.3 m heave offset rings about twice. Drop and tow checks still pass.
+- **Render interpolation:** frames blend body poses and the analytic waves between the last two physics steps. It is render-only and off in benchmarks, held results and contact tests.
+
+### Tests
+
+- New regression checks for each item above, including CPU-vs-GPU reef samples across the basin edge and a check that rendering never changes the simulated state.
+
 ## Surface 10.1 — TL-SURFACE-20261005.1
 
 A correctness and cost pass over water, rendering and boat physics. Defaults, quick controls, the mesh, transport grid and particle ceiling are unchanged.

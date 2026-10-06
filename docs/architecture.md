@@ -4,7 +4,7 @@
 
 BootKit owns the initial canvas and capability checks. Game CSS, markup, and code are held as inert text in the single HTML file. The launch adapter activates them after the player selects a start mode. The first-frame graphics check completes before the main loop starts. Failures keep their stage, error code, and report controls visible.
 
-The game uses one fixed-step simulation loop. Rendering follows browser animation callbacks. The parameter registry provides validation, defaults, developer controls, persistence, and hashes for reports. The five quick controls remain a simpler view of this state. Desktop and mobile input remain separate.
+The game uses one fixed-step simulation loop. Rendering follows browser animation callbacks. The parameter registry provides validation, defaults, developer controls, persistence, and hashes for reports. The six quick controls remain a simpler view of this state. Desktop and mobile input remain separate.
 
 ## Water layers
 
@@ -52,6 +52,26 @@ The foam pass adds a short segment between successive stern positions for each o
 The additional world-wetness pass runs after wave-cache generation. Hull-moisture sampling has a separate CPU scope. History targets and per-vertex data are included in tracked allocations. GPU time is asynchronous; CPU time measures elapsed callback work, not processor utilization.
 
 The default mesh, transport grid, and particle limit did not increase. There is no hidden dynamic quality setting. New features have independent switches in Advanced settings and in the Surface comparison plan.
+
+"## Surface 10.2 additions
+
+### Frame uniform block
+
+Values every shared program reads (settings, light rig, wave modes, lamps, the sun shadow matrix and the surface switches) live in one std140 block, `Frame`, generated from `FRAME_FIELDS`. The renderer fills it once per frame and sends it with one `bufferSubData`. The preparation passes switch readiness flags and `uSunVP` within a frame, so those fields sit in a short tail that is re-sent only when one changes. Per-pass values (`uVP`, `uEye`, `uReflect`, `uUnder`, `uClipLevel`, `uAirCapture`) and samplers stay plain uniforms. A new shader value is a `FRAME_FIELDS` entry set in a `frameValues()` wrapper. Per-frame tables can live there too: the far-sea roughness table (`uFarSeaTable`) is filled on the CPU each frame.
+
+### Light
+
+`LightRig` cross-fades sun and moon over a band of solar altitude, weighting direction and tint by each source's light. `waterLight` (sky light plus sun tint and strength) scales the water body and underwater haze. `skyColor(r, disc)` leaves the sun and moon discs out of reflections; the GGX highlight is the reflected sun. The light style (`lightStyle`) is one uniform branch in `crestLight()`.
+
+Scenery ambient comes from a 4×2 average of the cached sky panorama (four azimuth sectors, two hemispheres), evaluated per vertex. Ambient occlusion is baked once per world mesh from short rays against the bed and the props' collision shapes, into its own vertex attribute.
+
+### Motion and interpolation
+
+Each fixed step records the poses it starts from. A frame blends the previous and current poses by the accumulator fraction and draws the analytic waves at the matching time (`renderer.renderTime`). The poses are restored after the frame, so the simulation, benchmark hashes and `water.time` never see them. Interpolation is off in benchmarks, held results, contact fixtures, after resets and when paused.
+
+### Final image
+
+The highlight glow is a dual-filter chain: a thresholded half-resolution pass, further halving passes, and additive tent upsamples back to half resolution. Its depth is `bloomLevels` (the phone preset uses 2). The post pass tone-maps (ACES fit or an AgX-style curve), applies the vignette, then encodes exact sRGB.
 
 ## Restore and export
 
