@@ -324,6 +324,17 @@ async def main(args):
     C.stableBeams=false;r.render(g,D.DT);const off={ready:r.volumeReady,rays:r.volumeRays};
     return {ok:on.under&&on.ready&&on.rays&&on.valid&&!off.rays&&r.gl.getError()===0,on,off};
    }finally{g.dive=false;Object.assign(C,saved);D.storm.sync();}''')
+  # Showcase areas: each enters its world, applies its staging and shows its effect; leaving clears it.
+  await check('Showcase areas stage their effects and clear on a scene change', '''const saved={...C},out={};
+   try{for(const s of D.showcases){l.resultHeld=false;const entered=D.enterShowcase(s.id);l.resultHeld=true;Object.assign(C,{renderScale:.4,visualGrid:65,underParticles:0});
+     const P=g.physics,b0=P.stats.bowDrops,c=g.autopilot?.center;let mist=0,ring=0;const mb=g.mistBurst;g.mistBurst=function(...a){const n=mb.apply(this,a);mist+=n;return n;};
+     try{for(let i=0;i<300;i++){g.step(D.DT);if(c&&i>=180)ring=Math.max(ring,Math.abs(Math.hypot(g.boat.x-c[0],g.boat.z-c[1])-g.autopilot.radius));if(i%10===9){D.storm.sync();D.spectrum.sync(w.time);r.camera(g,D.DT*10);r.render(g,D.DT);}}}finally{g.mistBurst=mb;}
+     out[s.id]={entered,world:C.environment===s.world,look:Object.entries(s.look).every(([k,v])=>C[k]===v),showcase:g.showcase===s.id,mist,bowDrops:P.stats.bowDrops-b0,ring:c?+ring.toFixed(2):null,autopilot:!!g.autopilot,under:r.underwater,rays:r.volumeRays,beams:r.volumeReady&&r.beamValid,err:r.gl.getError()};}
+    const o=out,gpu=r.particleActive(),base=Object.values(o).every(v=>v.entered&&v.world&&v.look&&v.showcase&&v.err===0);
+    const ok=base&&(!gpu||o.reefStorm.mist>0)&&o.bowRun.autopilot&&o.bowRun.ring<2.5&&o.bowRun.bowDrops>0&&o.beaconNight.beams&&o.underReef.under&&o.underReef.rays;
+    l.resultHeld=false;D.chooseWorld(1);l.resultHeld=true;const cleared=g.autopilot===null&&g.showcase===null&&r.focus===null;
+    return {ok:ok&&cleared,cleared,showcases:o};
+   }finally{Object.assign(C,saved);D.storm.sync();g.dive=false;}''')
   await check('Both sluice gates gate transport faces','const save=C.environment;C.environment=0;let t;try{t=new D.Water();}finally{C.environment=save;}const n=[0,0];for(const g of t.edgeGate)if(g>=0)n[g]++;return {ok:n[0]>0&&n[1]>0,edges:n};')
   await check('Water transport stays finite and conservative','const q=D.conservationCheck(120);return {ok:q.finite&&q.minDepth>=0&&q.relativeDrift<1e-5,...q};')
   await check('Calm-water drop still settles without relaunch', '''l.resultHeld=false;D.contactStudy('drop');l.resultHeld=true;let entries=0,airAfterEntry=0,entered=false,maxUp=0;for(let i=0;i<600;i++){g.step(1/60);if(g.boat.wetFraction>.2)entered=true;if(entered){maxUp=Math.max(maxUp,g.boat.vy);if(g.boat.airborne)airAfterEntry++;}}

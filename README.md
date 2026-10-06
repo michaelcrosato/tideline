@@ -36,6 +36,7 @@ Surface 10.2 phase 2 adds richer spray, foam and light:
 - **Spray on the GPU:** spray, foam and bubbles move on the GPU and land on the full wave surface, so drops no longer fall through the swell. Fast drops streak, breakers and slams release soft mist, and the bow throws spray as the boat drives into the water.
 - **Foam material:** foam has relief, a soft sheen, light through thin edges, and one colour on the water and the reef crest.
 - **Stable beams:** lamp beams and underwater light shafts no longer crawl with a fixed dither pattern.
+- **Showcase:** *Change scene* (Places → Showcase on touch screens) opens four staged views of these effects: **Storm reef** (spray, mist and foam off the breakers at low sun), **Bow run** (the tug on an autopilot loop into crossing swell), **Beacon night** (lamps, beacon and searchlight under a circling camera) and **Under the breakers** (light shafts and bubbles beneath the reef). Steering takes over from the autopilot.
 
 Surface 10.2 phase 1 fixed the remaining lighting and reef issues and added cheap visual upgrades:
 

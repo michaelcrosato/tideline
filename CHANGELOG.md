@@ -19,6 +19,10 @@ Phase 2 of the Surface 10.2 upgrade plan (`docs/upgrade-plan.md`, M9–M13): ric
 
 - **Stable beams:** lamp-beam samples move each frame and a history pass reprojects them, so beams no longer crawl with a screen-locked dither. Against a 32-sample reference, the error of an 8-sample beam falls from 14% to 2% once settled. Underwater light shafts share the pass (at beam resolution instead of full resolution). Phone preset: 8 beam samples.
 
+### Showcase
+
+- **Showcase areas:** four staged views in the scene picker — Storm reef, Bow run, Beacon night and Under the breakers — each set up to show one group of these effects. The bow and beacon views drive the boat on an autopilot loop until you steer. They respect your effect switches.
+
 ### Tests
 
 - New regression checks for each item: landing on the full surface, rendering never changing the simulation, the live count, streak length, mist determinism, bow spray budgets, a foam material probe, and beam history convergence and reprojection.

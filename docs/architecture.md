@@ -87,6 +87,10 @@ Bow spray samples each bow corner on the hull flare once a step: the hull-relati
 
 With `stableBeams`, the lamp-beam march (and underwater light shafts, moved from the post pass) jitter their samples by a golden-ratio step each frame. A history pass reprojects the previous result through the point where each pixel's ray ends, rejects it where last frame's ray ended elsewhere, and clamps it to the current neighbourhood. History restarts on size, world or beam-setting changes, time jumps and large eye jumps.
 
+### Showcase
+
+`SHOWCASES` stages the existing worlds: `enterShowcase` enters the world with its preset, then applies its own settings, an optional orbit focus (`renderer.focus`), boat pose, dive state and autopilot. The autopilot is pure pursuit around a circle and lives in `Game.steer`; any player input clears it. A scene change clears all showcase state. Showcases never change effect switches.
+
 ## Restore and export
 
 Benchmark snapshots include water arrays, scalar counters, body state, old foam/optics state, world wetness, boat moisture, previous stern positions and the predicted spray landings. GPU particles and the beam history restart empty after a restore. Returning from a result restores the voyage and history. Resetting a scene clears old marks so they cannot leak between environments.
